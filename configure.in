@@ -456,6 +456,7 @@ AC_CHECK_HEADERS( \
 string.h \
 limits.h \
 unistd.h \
+time.h \
 sys/socket.h \
 pwd.h \
 grp.h \
@@ -519,6 +520,7 @@ getpwnam \
 getgrnam \
 initgroups \
 bindprocessor \
+clock_gettime \
 prctl \
 procctl \
 pthread_getthreadid_np \

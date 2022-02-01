@@ -73,6 +73,9 @@
 #ifdef HAVE_SYS_PROCESSOR_H
 #include <sys/processor.h>      /* for bindprocessor() */
 #endif
+#ifdef HAVE_TIME_H
+#include <time.h>               /* for clock_gettime() */
+#endif
 
 #if !APR_HAS_THREADS
 #error The Event MPM requires APR threads, but they are unavailable.
@@ -390,6 +393,22 @@ static APR_INLINE const char *cs_state_str(event_conn_state_t *cs)
  */
 static event_conn_state_t *volatile defer_linger_chain;
 
+/* A monotonic timestamp: CLOCK_MONOTONIC (POSIX, also macOS >= 10.12) is the
+ * clock the kernel times the poll timeouts with, NTP never makes it jump (it
+ * only slews its rate), and it's fast (vDSO) where it matters.
+ */
+static apr_time_t event_time_now(void)
+{
+#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return apr_time_from_sec(ts.tv_sec) + ts.tv_nsec / 1000;
+#else
+    /* XXX: not monotonic, still some platform to care about? */
+    return apr_time_now();
+#endif
+}
+
 APR_RING_HEAD(timeout_head_t, event_conn_state_t);
 struct timeout_queue {
     struct timeout_head_t head;
@@ -432,7 +451,7 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
     ap_assert(q && !cs->q);
 
     cs->q = q;
-    cs->queue_timestamp = apr_time_now();
+    cs->queue_timestamp = event_time_now();
     APR_RING_INSERT_TAIL(&q->head, cs, event_conn_state_t, timeout_list);
     ++*q->total;
     ++q->count;
@@ -1903,7 +1922,7 @@ static timer_event_t *get_timer_event(apr_time_t timeout,
                                       apr_array_header_t *pfds)
 {
     timer_event_t *te;
-    apr_time_t now = (timeout < 0) ? 0 : apr_time_now();
+    apr_time_t now = (timeout < 0) ? 0 : event_time_now();
     int wakeup = 0;
 
     /* oh yeah, and make locking smarter/fine grained. */
@@ -2280,7 +2299,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
     int have_idle_worker = 0;
     apr_time_t last_log;
 
-    last_log = apr_time_now();
+    last_log = event_time_now();
     free(ti);
 
 #if HAVE_SERF
@@ -2329,7 +2348,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         }
 
         if (APLOGtrace6(ap_server_conf)) {
-            now = apr_time_now();
+            now = event_time_now();
             /* trace log status every second */
             if (now - last_log > apr_time_from_sec(1)) {
                 ap_log_error(APLOG_MARK, APLOG_TRACE6, 0, ap_server_conf,
@@ -2358,7 +2377,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          * the next expiring timer or queue entry. If there are none, the
          * listener can poll() indefinitely until a wake up occurs.
          */
-        now = apr_time_now();
+        now = event_time_now();
         timeout = -1;
 
         /* Push expired timers to a worker, the first remaining one (if any)
@@ -2447,7 +2466,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
         if (APLOGtrace7(ap_server_conf)) {
             apr_time_t old_now = now;
-            now = apr_time_now();
+            now = event_time_now();
 
             ap_log_error(APLOG_MARK, APLOG_TRACE7, rc, ap_server_conf,
                          "pollset: have #%i time=%" APR_TIME_T_FMT "/%" APR_TIME_T_FMT
@@ -2679,7 +2698,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          */
         next_expiry = queues_next_expiry;
 do_maintenance:
-        if (next_expiry && next_expiry <= (now = apr_time_now())) {
+        if (next_expiry && next_expiry <= (now = event_time_now())) {
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "queues maintenance: expired=%" APR_TIME_T_FMT,
                          next_expiry > 0 ? now - next_expiry : -1);
@@ -3376,7 +3395,7 @@ static void child_main(int child_num_arg, int child_bucket)
     }
 
     /* For rand() users (e.g. skiplist). */
-    srand((unsigned int)apr_time_now());
+    srand((unsigned int)event_time_now());
 
     ap_run_child_init(pchild, ap_server_conf);
 
@@ -4180,7 +4199,7 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
         }
 
         if (ap_graceful_shutdown_timeout) {
-            cutoff = apr_time_now() +
+            cutoff = event_time_now() +
                      apr_time_from_sec(ap_graceful_shutdown_timeout);
         }
 
@@ -4202,7 +4221,7 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
                 }
             }
         } while (!retained->mpm->shutdown_pending && active_children &&
-                 (!ap_graceful_shutdown_timeout || apr_time_now() < cutoff));
+                 (!ap_graceful_shutdown_timeout || event_time_now() < cutoff));
 
         /* We might be here because we received SIGTERM, either
          * way, try and make sure that all of our processes are
