@@ -30,7 +30,6 @@
 #include "util_mutex.h"
 #include "ap_provider.h"
 #include "http_config.h"
-#include "mpm_common.h" /* for the input_pending hook */
 
 #include "mod_proxy.h" /* for proxy_hook_section_post_config() */
 
@@ -765,7 +764,7 @@ static int ssl_hook_input_pending(conn_rec *c)
     SSLConnRec *sslconn = myConnConfig(c);
 
     if (sslconn && sslconn->ssl && SSL_pending(sslconn->ssl) > 0) {
-        return OK;
+        return AGAIN;
     }
     return DECLINED;
 }
