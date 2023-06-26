@@ -111,8 +111,14 @@ of the <directive>AsyncRequestWorkerFactor</directive>.</p>
             <dd>Sometimes the MPM needs to perform a lingering close, namely sending back an early error to the client while it is still transmitting data to httpd.
             Sending the response and then closing the connection immediately is not the correct thing to do since the client (still trying to send the rest of the
 	    request) would get a connection reset and could not read the httpd's response.
-	    The lingering close is time-bounded, but it can take a relatively long
-	    time, so it's offloaded to a worker thread (including the shutdown hooks and real socket close).
+	    The lingering close doesn't hold a worker thread while it waits: the
+	    output still pending is flushed, then what the client sends is read
+	    and discarded, as the socket is ready (the shutdown hooks and the
+	    real socket close also run in a worker thread). It is time-bounded:
+	    2 seconds at most between two reads and 30 seconds in total, 2
+	    seconds in total for a connection that timed out (or with
+	    <module>mod_reqtimeout</module>'s shortened lingering) and while the
+	    child process is stopping.
 	    From 2.4.28 onward, this is also the
             case when connections finally timeout (the listener thread never handles connections besides waiting for and dispatching their events).
             </dd>
