@@ -461,8 +461,8 @@ static const char *alloc_listener(process_rec *process, const char *addr,
                                   apr_pool_t *temp_pool, apr_uint32_t flags)
 {
     ap_listen_rec *last;
+    apr_sockaddr_t *sa, *next_sa;
     apr_status_t status;
-    apr_sockaddr_t *sa;
 
     /* see if we've got a listener for this address:port, which is an error */
     if (find_listeners(&ap_listeners, NULL, addr, port, scope_id, temp_pool)) {
@@ -493,7 +493,7 @@ static const char *alloc_listener(process_rec *process, const char *addr,
         last = last->next;
     }
 
-    while (sa) {
+    for (; sa; sa = next_sa) {
         ap_listen_rec *new;
         int sock_proto = 0;
 
@@ -502,16 +502,17 @@ static const char *alloc_listener(process_rec *process, const char *addr,
             sock_proto = IPPROTO_MPTCP;
 #endif
 
+        /* Each listener has its own (unlinked) address */
+        next_sa = sa->next;
+        sa->next = NULL;
+
         /* this has to survive restarts */
         new = apr_palloc(process->pool, sizeof(ap_listen_rec));
         new->active = 0;
-        new->next = 0;
+        new->next = NULL;
         new->bind_addr = sa;
         new->protocol = apr_pstrdup(process->pool, proto);
         new->flags = flags;
-
-        /* Go to the next sockaddr. */
-        sa = sa->next;
 
         status = apr_socket_create(&new->sd, new->bind_addr->family,
                                     SOCK_STREAM, sock_proto, process->pool);
@@ -866,37 +867,37 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
         lr = ap_listeners;
         while (lr) {
             ap_listen_rec *duplr;
-            char *hostname;
-            apr_port_t port;
-            apr_sockaddr_t *sa;
             int sock_proto = 0;
 #ifdef HAVE_SYSTEMD
             if (use_systemd) {
                 int thesock;
                 apr_os_sock_get(&thesock, lr->sd);
                 if ((stat = alloc_systemd_listener(s->process, thesock,
-                    lr->protocol, &duplr)) != APR_SUCCESS) {
+                                                   lr->protocol, &duplr))) {
                     return stat;
                 }
             }
             else
 #endif
             {
-                duplr = apr_palloc(p, sizeof(ap_listen_rec));
-                duplr->slave = NULL;
+                duplr = apr_pcalloc(p, sizeof(ap_listen_rec));
                 duplr->protocol = apr_pstrdup(p, lr->protocol);
-                hostname = apr_pstrdup(p, lr->bind_addr->hostname);
-                port = lr->bind_addr->port;
-                stat = apr_sockaddr_info_get(&sa, hostname, APR_UNSPEC, port, 0, p);
+                duplr->flags = lr->flags;
+#if APR_VERSION_AT_LEAST(1,6,0)
+                stat = apr_sockaddr_info_copy(&duplr->bind_addr,
+                                              lr->bind_addr, p);
+#else
+                stat = apr_sockaddr_info_get(&duplr->bind_addr,
+                                             lr->bind_addr->hostname,
+                                             lr->bind_addr->family,
+                                             lr->bind_addr->port, 0, p);
+#endif
                 if (stat != APR_SUCCESS) {
                     ap_log_perror(APLOG_MARK, APLOG_CRIT, stat, p, APLOGNO(10397)
-                                  "failure looking up %s to duplicate "
-                                  "listening socket", hostname);
+                                  "failure duplicating address %pI for "
+                                  "listening socket", lr->bind_addr);
                     return stat;
                 }
-                duplr->bind_addr = sa;
-                duplr->next = NULL;
-                duplr->flags = lr->flags;
 #ifdef IPPROTO_MPTCP
                 if (duplr->flags & AP_LISTEN_MPTCP)
                     sock_proto = IPPROTO_MPTCP;
