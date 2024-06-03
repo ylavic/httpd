@@ -170,6 +170,9 @@
 #define LINGER_READ_TIMEOUT     apr_time_from_sec(SECONDS_TO_LINGER)
 #define LINGER_READS_PER_PASS   4
 
+/* Update scoreboard stats at this period */
+#define STATS_UPDATE_TIMEOUT    apr_time_from_msec(1000)
+
 /* Prevent extra poll/wakeup calls for timeouts close in the future (queues
  * have the granularity of a second anyway).
  * XXX: Wouldn't 0.5s (instead of 0.1s) be "enough"?
@@ -1050,6 +1053,15 @@ static void event_note_child_stopped(int slot, pid_t pid, ap_generation_t gen)
                      server_limit, ps->quiescing);
         ps->not_accepting = 0;
         ps->quiescing = 0;
+        /* No stale counts for the next child of this slot (update_stats()) */
+        apr_atomic_set32(&ps->connections, 0);
+        apr_atomic_set32(&ps->backlog, 0);
+        apr_atomic_set32(&ps->wait_io, 0);
+        apr_atomic_set32(&ps->write_completion, 0);
+        apr_atomic_set32(&ps->keep_alive, 0);
+        apr_atomic_set32(&ps->shutdown, 0);
+        apr_atomic_set32(&ps->lingering_close, 0);
+        apr_atomic_set32(&ps->suspended, 0);
         ps->pid = 0;
     }
     else {
@@ -2548,15 +2560,52 @@ static APR_INLINE void shrink_timeout_queue(struct timeout_queue *queue,
     }
 }
 
+static void update_stats(process_score *ps, apr_time_t now,
+                         apr_time_t *when, int force)
+{
+    int expired = (*when <= now);
+
+    if (expired || force) {
+        apr_atomic_set32(&ps->wait_io, apr_atomic_read32(waitio_q->total));
+        apr_atomic_set32(&ps->write_completion, apr_atomic_read32(write_completion_q->total));
+        apr_atomic_set32(&ps->keep_alive, apr_atomic_read32(keepalive_q->total));
+        apr_atomic_set32(&ps->shutdown, apr_atomic_read32(shutdown_q->total));
+        apr_atomic_set32(&ps->lingering_close, apr_atomic_read32(linger_q->total));
+        apr_atomic_set32(&ps->backlog, apr_atomic_read32(backlog_q->total));
+        apr_atomic_set32(&ps->suspended, apr_atomic_read32(&suspended_count));
+        apr_atomic_set32(&ps->connections, apr_atomic_read32(&connection_count));
+    }
+
+    if (expired) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
+                     "child: idlers:%i conns:%u backlog:%u "
+                     "waitio:%u write:%u keepalive:%u shutdown:%u linger:%u "
+                     "timers:%u suspended:%u (%u/%u workers shutdown)",
+                     ap_queue_info_idlers_count(worker_queue_info),
+                     apr_atomic_read32(&connection_count),
+                     apr_atomic_read32(backlog_q->total),
+                     apr_atomic_read32(waitio_q->total),
+                     apr_atomic_read32(write_completion_q->total),
+                     apr_atomic_read32(keepalive_q->total),
+                     apr_atomic_read32(shutdown_q->total),
+                     apr_atomic_read32(linger_q->total),
+                     apr_atomic_read32(&timers_count),
+                     apr_atomic_read32(&suspended_count),
+                     apr_atomic_read32(&threads_shutdown),
+                     threads_per_child);
+
+        *when = now + STATS_UPDATE_TIMEOUT;
+    }
+}
+
 static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 {
     apr_status_t rc;
     proc_info *ti = dummy;
     int process_slot = ti->pslot;
     process_score *ps = ap_get_scoreboard_process(process_slot);
-    apr_time_t last_log;
+    apr_time_t next_stats_time = 0;
 
-    last_log = event_time_now();
     free(ti);
 
 #if HAVE_SERF
@@ -2573,7 +2622,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         apr_int32_t num = 0;
         apr_time_t next_expiry = -1;
         apr_interval_time_t timeout = -1;
-        int above_limit = 0;
+        int above_limit = 0, force_stats = 0;
         event_conn_state_t *expired = NULL;
         socket_callback_baton_t *user_chain;
         const apr_pollfd_t *out_pfd;
@@ -2606,22 +2655,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                  */
                 goto do_maintenance; /* with next_expiry == -1 */
             }
-        }
-
-        /* trace log status every second */
-        if (APLOGtrace6(ap_server_conf) && now - last_log > apr_time_from_sec(1)) {
-            ap_log_error(APLOG_MARK, APLOG_TRACE6, 0, ap_server_conf,
-                         "connections: %u (waitio:%d write:%d keepalive:%d "
-                         "lingering:%d suspended:%u), workers: %u/%u shutdown",
-                         apr_atomic_read32(&connection_count),
-                         apr_atomic_read32(waitio_q->total),
-                         apr_atomic_read32(write_completion_q->total),
-                         apr_atomic_read32(keepalive_q->total),
-                         apr_atomic_read32(linger_q->total),
-                         apr_atomic_read32(&suspended_count),
-                         apr_atomic_read32(&threads_shutdown),
-                         threads_per_child);
-            last_log = now;
         }
 
 #if HAVE_SERF
@@ -2692,11 +2725,31 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             timeout = next_expiry > now ? next_expiry - now : 0;
         }
 
+        /* So long as there are connections, wake up at most every
+         * STATS_UPDATE_TIMEOUT to refresh the scoreboard stats.
+         */
+        if (timeout < 0 || timeout > STATS_UPDATE_TIMEOUT) {
+            if (timeout > 0
+                || apr_atomic_read32(&connection_count)) {
+                timeout = next_stats_time - now;
+                if (timeout <= 0 || timeout > STATS_UPDATE_TIMEOUT) {
+                    timeout = STATS_UPDATE_TIMEOUT;
+                }
+            }
+            else {
+                /* No connections and entering infinite poll(),
+                 * clear the stats first.
+                 */
+                force_stats = 1;
+            }
+        }
+        update_stats(ps, now, &next_stats_time, force_stats);
+
+        /* apr_pollset_poll() might round down the timeout to
+         * milliseconds, let's forcibly round up here to never
+         * return before the timeout.
+         */
         if (timeout > 0) {
-            /* apr_pollset_poll() might round down the timeout to
-             * milliseconds, let's forcibly round up here to never
-             * return before the timeout.
-             */
             timeout = apr_time_from_msec(
                 apr_time_as_msec(timeout + apr_time_from_msec(1) - 1)
             );
@@ -2987,15 +3040,6 @@ do_maintenance:
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "queues maintained: next timeout=%" APR_TIME_T_FMT,
                          next_expiry ? next_expiry - now : -1);
-
-            ps->wait_io = apr_atomic_read32(waitio_q->total);
-            ps->write_completion = apr_atomic_read32(write_completion_q->total);
-            ps->keep_alive = apr_atomic_read32(keepalive_q->total);
-            ps->shutdown = apr_atomic_read32(shutdown_q->total);
-            ps->lingering_close = apr_atomic_read32(linger_q->total);
-            ps->backlog = apr_atomic_read32(backlog_q->total);
-            ps->suspended = apr_atomic_read32(&suspended_count);
-            ps->connections = apr_atomic_read32(&connection_count);
         }
     } /* listener main loop */
 
