@@ -110,11 +110,19 @@ typedef struct {
     SSLConnRec         *config;
 } ssl_filter_ctx_t;
 
+/* How a BIO flush writes what's pending, see bio_filter_out_flush() */
+typedef enum {
+    BIO_FLUSH_BLOCK = 0, /* a FLUSH bucket, blocking */
+    BIO_FLUSH_PENDING,   /* a WC bucket, what's pending left to the MPM */
+    BIO_FLUSH_RETRY      /* a WC bucket, a write retry while pending */
+} bio_flush_mode_e;
+
 typedef struct {
     ssl_filter_ctx_t *filter_ctx;
     conn_rec *c;
     apr_bucket_brigade *bb;    /* Brigade used as a buffer. */
     apr_status_t rc;
+    bio_flush_mode_e flush_mode;
 } bio_filter_out_ctx_t;
 
 static bio_filter_out_ctx_t *bio_filter_out_ctx_new(ssl_filter_ctx_t *filter_ctx,
@@ -125,6 +133,7 @@ static bio_filter_out_ctx_t *bio_filter_out_ctx_new(ssl_filter_ctx_t *filter_ctx
     outctx->filter_ctx = filter_ctx;
     outctx->c = c;
     outctx->bb = apr_brigade_create(c->pool, c->bucket_alloc);
+    outctx->flush_mode = BIO_FLUSH_BLOCK;
 
     return outctx;
 }
@@ -145,22 +154,49 @@ static int bio_filter_out_pass(bio_filter_out_ctx_t *outctx)
     return (outctx->rc == APR_SUCCESS) ? 1 : -1;
 }
 
-/* Send a FLUSH bucket down the output filter stack; returns 1 on
- * success, -1 on failure. */
+/* Write what's pending down the output filter stack (a BIO flush): with a
+ * FLUSH bucket, blocking (BIO_FLUSH_BLOCK), or else with a WC (write
+ * completion) bucket, the core writing what it can without blocking and
+ * leaving the rest pending: to the MPM (BIO_FLUSH_PENDING, e.g. the
+ * close_notify before the lingering close), or for the caller to wait for
+ * the connection to be writable (BIO_FLUSH_RETRY, a nonblocking handshake):
+ * then while some is pending this fails with a write retry, so that OpenSSL
+ * reports SSL_ERROR_WANT_WRITE and flushes again once called again. Returns
+ * 1 on success, -1 on failure (or retry). */
 static int bio_filter_out_flush(BIO *bio)
 {
     bio_filter_out_ctx_t *outctx = (bio_filter_out_ctx_t *)BIO_get_data(bio);
     apr_bucket *e;
 
+    BIO_clear_retry_flags(bio);
+
     ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, outctx->c,
-                  "bio_filter_out_write: flush");
+                  "bio_filter_out_write: flush%s",
+                  (outctx->flush_mode == BIO_FLUSH_BLOCK) ? ""
+                                                          : " (nonblocking)");
 
     AP_DEBUG_ASSERT(APR_BRIGADE_EMPTY(outctx->bb));
 
-    e = apr_bucket_flush_create(outctx->bb->bucket_alloc);
+    if (outctx->flush_mode == BIO_FLUSH_BLOCK) {
+        e = apr_bucket_flush_create(outctx->bb->bucket_alloc);
+    }
+    else {
+        e = ap_bucket_wc_create(outctx->bb->bucket_alloc);
+    }
     APR_BRIGADE_INSERT_TAIL(outctx->bb, e);
 
-    return bio_filter_out_pass(outctx);
+    if (bio_filter_out_pass(outctx) < 0) {
+        return -1;
+    }
+    if (outctx->flush_mode == BIO_FLUSH_RETRY
+        && ap_filter_should_yield(outctx->filter_ctx->pOutputFilter->next)) {
+        ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, outctx->c,
+                      "bio_filter_out_write: flush pending, retry");
+        BIO_set_retry_write(bio);
+        outctx->rc = APR_EAGAIN;
+        return -1;
+    }
+    return 1;
 }
 
 static int bio_filter_create(BIO *bio)
@@ -292,6 +328,7 @@ typedef struct {
 } char_buffer_t;
 
 typedef struct {
+    conn_rec *c;
     SSL *ssl;
     BIO *bio_out;
     ap_filter_t *f;
@@ -730,6 +767,32 @@ static apr_status_t ssl_io_input_read(bio_filter_in_ctx_t *inctx,
                  * (This is usually the case when the client forces an SSL
                  * renegotiation which is handled implicitly by OpenSSL.)
                  */
+                if (inctx->c->cs) {
+                    inctx->c->cs->sense = CONN_SENSE_WANT_READ;
+                }
+                inctx->rc = APR_EAGAIN;
+
+                if (*len > 0) {
+                    inctx->rc = APR_SUCCESS;
+                    break;
+                }
+                if (inctx->block == APR_NONBLOCK_READ) {
+                    break;
+                }
+                continue;  /* Blocking and nothing yet?  Try again. */
+            }
+            if (ssl_err == SSL_ERROR_WANT_WRITE) {
+                /*
+                 * If OpenSSL wants to write during read, and we were
+                 * nonblocking, report as an EAGAIN.  Otherwise loop,
+                 * pulling more data from network filter.
+                 *
+                 * (This is usually the case when the client forces an SSL
+                 * renegotiation which is handled implicitly by OpenSSL.)
+                 */
+                if (inctx->c->cs) {
+                    inctx->c->cs->sense = CONN_SENSE_WANT_WRITE;
+                }
                 inctx->rc = APR_EAGAIN;
 
                 if (*len > 0) {
@@ -895,7 +958,9 @@ static apr_status_t ssl_filter_write(ap_filter_t *f,
              * (This is usually the case when the client forces an SSL
              * renegotiation which is handled implicitly by OpenSSL.)
              */
-            outctx->c->cs->sense = CONN_SENSE_WANT_READ;
+            if (outctx->c->cs) {
+                outctx->c->cs->sense = CONN_SENSE_WANT_READ;
+            }
             outctx->rc = APR_EAGAIN;
             ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, outctx->c,
                           "Want read during nonblocking write");
@@ -950,10 +1015,6 @@ static apr_status_t ssl_filter_write(ap_filter_t *f,
                                sizeof(HTTP_ON_HTTPS_PORT) - 1, \
                                alloc)
 
-/* Custom apr_status_t error code, used when a plain HTTP request is
- * received on an SSL port. */
-#define MODSSL_ERROR_HTTP_ON_HTTPS (APR_OS_START_USERERR + 0)
-
 /* Custom apr_status_t error code, used when the proxy cannot
  * establish an outgoing SSL connection. */
 #define MODSSL_ERROR_BAD_GATEWAY (APR_OS_START_USERERR + 1)
@@ -989,7 +1050,7 @@ static apr_status_t ssl_io_filter_error(bio_filter_in_ctx_t *inctx,
             f->c->keepalive = AP_CONN_CLOSE;
             if (is_init) {
                 sslconn->non_ssl_request = NON_SSL_SEND_REQLINE;
-                return AP_FILTER_ERROR;
+                return MODSSL_ERROR_HTTP_ON_HTTPS;
             }
             sslconn->non_ssl_request = NON_SSL_SEND_HDR_SEP;
 
@@ -1118,7 +1179,18 @@ static void ssl_filter_io_shutdown(ssl_filter_ctx_t *filter_ctx,
         SSL_set_quiet_shutdown(ssl, 1);
     }
     SSL_set_shutdown(ssl, shutdown_type);
-    modssl_smart_shutdown(ssl);
+    if (!abortive && !c->outgoing && modssl_mpm_can_waitio && c->cs) {
+        /* The MPM's lingering close writes what the close_notify leaves
+         * pending, without blocking: no need to flush it here.
+         */
+        bio_filter_out_ctx_t *outctx = BIO_get_data(filter_ctx->pbioWrite);
+        outctx->flush_mode = BIO_FLUSH_PENDING;
+        modssl_smart_shutdown(ssl);
+        outctx->flush_mode = BIO_FLUSH_BLOCK;
+    }
+    else {
+        modssl_smart_shutdown(ssl);
+    }
 
     /* and finally log the fact that we've closed the connection */
     if (APLOG_CS_IS_LEVEL(c, mySrvFromConn(c), loglevel)) {
@@ -1440,10 +1512,25 @@ static apr_status_t ssl_io_filter_handshake(ssl_filter_ctx_t *filter_ctx)
         }
         else if (ssl_err == SSL_ERROR_WANT_READ) {
             /*
-             * This is in addition to what was present earlier. It is
-             * borrowed from openssl_state_machine.c [mod_tls].
-             * TBD.
+             * Call us back when ready to read *\/
              */
+            ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, outctx->c,
+                          "Want read during nonblocking accept");
+            if (outctx->c->cs) {
+                outctx->c->cs->sense = CONN_SENSE_WANT_READ;
+            }
+            outctx->rc = APR_EAGAIN;
+            return APR_EAGAIN;
+        }
+        else if (ssl_err == SSL_ERROR_WANT_WRITE) {
+            /*
+             * Call us back when ready to write *\/
+             */
+            ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, outctx->c,
+                          "Want write during nonblocking accept");
+            if (outctx->c->cs) {
+                outctx->c->cs->sense = CONN_SENSE_WANT_WRITE;
+            }
             outctx->rc = APR_EAGAIN;
             return APR_EAGAIN;
         }
@@ -1613,8 +1700,21 @@ static apr_status_t ssl_io_filter_input(ap_filter_t *f,
      * ap_hook_process_connection but would still need to call it for
      * AP_MODE_INIT for protocols that may upgrade the connection
      * rather than have SSLEngine On configured.
+     *
+     * A nonblocking AP_MODE_INIT read doesn't block on the handshake's
+     * flushes either: its caller waits for the connection to be writable
+     * when it gets EAGAIN with output pending (ap_check_output_pending()).
      */
-    if ((status = ssl_io_filter_handshake(inctx->filter_ctx)) != APR_SUCCESS) {
+    if (is_init && block == APR_NONBLOCK_READ) {
+        bio_filter_out_ctx_t *outctx = BIO_get_data(inctx->bio_out);
+        outctx->flush_mode = BIO_FLUSH_RETRY;
+        status = ssl_io_filter_handshake(inctx->filter_ctx);
+        outctx->flush_mode = BIO_FLUSH_BLOCK;
+    }
+    else {
+        status = ssl_io_filter_handshake(inctx->filter_ctx);
+    }
+    if (status != APR_SUCCESS) {
         return ssl_io_filter_error(inctx, bb, status, is_init);
     }
 
@@ -1958,9 +2058,33 @@ static apr_status_t ssl_io_filter_output(ap_filter_t *f,
     /* When we are the writer, we must initialize the inctx
      * mode so that we block for any required ssl input, because
      * output filtering is always nonblocking.
+     * OpenSSL reads while writing only for a renegotiation in progress
+     * (TLS <= 1.2), which is rare (the server's are done before the
+     * response, the client's refused), so the read stays blocking.
      */
     inctx->mode = AP_MODE_READBYTES;
     inctx->block = APR_BLOCK_READ;
+
+    /* A client connection closed before its handshake completed (e.g. the
+     * client stalled and its wait timed out, or the MPM is stopping): abort
+     * the TLS layer rather than complete the handshake here, reading in
+     * blocking mode for up to Timeout again.
+     */
+    if (!f->c->outgoing && !SSL_is_init_finished(filter_ctx->pssl)) {
+        apr_bucket *e;
+        for (e = APR_BRIGADE_FIRST(bb);
+             e != APR_BRIGADE_SENTINEL(bb);
+             e = APR_BUCKET_NEXT(e)) {
+            if (AP_BUCKET_IS_EOC(e)) {
+                ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
+                              "SSL handshake not completed at close, "
+                              "aborting");
+                ssl_filter_io_shutdown(filter_ctx, f->c, 1);
+                apr_brigade_cleanup(bb);
+                return APR_ECONNABORTED;
+            }
+        }
+    }
 
     if ((status = ssl_io_filter_handshake(filter_ctx)) != APR_SUCCESS) {
         return ssl_io_filter_error(inctx, bb, status, 0);
@@ -2018,8 +2142,17 @@ static apr_status_t ssl_io_filter_output(ap_filter_t *f,
             status = apr_bucket_read(bucket, &data, &len, rblock);
 
             if (APR_STATUS_IS_EAGAIN(status)) {
-                /* No data available: flush... */
-                if (bio_filter_out_flush(filter_ctx->pbioWrite) < 0) {
+                /* No data available: flush... When the MPM can wait for
+                 * the connection, only write what can be without blocking,
+                 * as the core does before its blocking read.
+                 */
+                int rc;
+                if (modssl_mpm_can_waitio && f->c->cs) {
+                    outctx->flush_mode = BIO_FLUSH_PENDING;
+                }
+                rc = bio_filter_out_flush(filter_ctx->pbioWrite);
+                outctx->flush_mode = BIO_FLUSH_BLOCK;
+                if (rc < 0) {
                     status = outctx->rc;
                     break;
                 }
@@ -2269,6 +2402,7 @@ static apr_status_t ssl_io_input_add_filter(ssl_filter_ctx_t *filter_ctx, conn_r
     }
     BIO_set_data(filter_ctx->pbioRead, (void *)inctx);
 
+    inctx->c = c;
     inctx->ssl = ssl;
     inctx->bio_out = filter_ctx->pbioWrite;
     inctx->f = filter_ctx->pInputFilter;
