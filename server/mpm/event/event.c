@@ -199,7 +199,6 @@ static volatile int listener_may_exit = 0;
 static apr_uint32_t connection_count = 0;   /* Number of open connections */
 static apr_uint32_t lingering_count = 0;    /* Number of connections in lingering close */
 static apr_uint32_t suspended_count = 0;    /* Number of suspended connections */
-static apr_uint32_t clogged_count = 0;      /* Number of threads processing ssl conns */
 static apr_uint32_t threads_shutdown = 0;   /* Number of threads that have shutdown
                                                early during graceful termination */
 static int had_healthy_child = 0;
@@ -680,8 +679,7 @@ static void disable_listensocks(void)
         if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(10381)
                          "Suspend listening sockets: idlers:%i conns:%u "
-                         "waitio:%u write:%u keepalive:%u linger:%u/%u "
-                         "suspended:%u clogged:%u",
+                         "waitio:%u write:%u keepalive:%u linger:%u/%u suspended:%u",
                          ap_queue_info_num_idlers(worker_queue_info),
                          apr_atomic_read32(&connection_count),
                          apr_atomic_read32(waitio_q->total),
@@ -689,8 +687,7 @@ static void disable_listensocks(void)
                          apr_atomic_read32(keepalive_q->total),
                          apr_atomic_read32(linger_q->total),
                          apr_atomic_read32(short_linger_q->total),
-                         apr_atomic_read32(&suspended_count),
-                         apr_atomic_read32(&clogged_count));
+                         apr_atomic_read32(&suspended_count));
         }
     }
 
@@ -714,8 +711,7 @@ static void enable_listensocks(void)
         if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(00457)
                          "Resume listening sockets: idlers:%i conns:%u "
-                         "waitio:%u write:%u keepalive:%u linger:%u/%u "
-                         "suspended:%u clogged:%u",
+                         "waitio:%u write:%u keepalive:%u linger:%u/%u suspended:%u",
                          ap_queue_info_num_idlers(worker_queue_info),
                          apr_atomic_read32(&connection_count),
                          apr_atomic_read32(waitio_q->total),
@@ -723,8 +719,7 @@ static void enable_listensocks(void)
                          apr_atomic_read32(keepalive_q->total),
                          apr_atomic_read32(linger_q->total),
                          apr_atomic_read32(short_linger_q->total),
-                         apr_atomic_read32(&suspended_count),
-                         apr_atomic_read32(&clogged_count));
+                         apr_atomic_read32(&suspended_count));
         }
     }
 
@@ -1420,7 +1415,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
 {
     conn_rec *c = cs->c;
     long conn_id = ID_FROM_CHILD_THREAD(my_child_num, my_thread_num);
-    int rc = OK, processed = 0, clogging;
+    int rc = OK, processed = 0;
 
     if (!c) { /* This is a new connection */
         cs->bucket_alloc = apr_bucket_alloc_create(p);
@@ -1479,14 +1474,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
  process_connection:
         processed = 1;
         cs->pub.state = CONN_STATE_PROCESSING;
-        clogging = c->clogging_input_filters;
-        if (clogging) {
-            apr_atomic_inc32(&clogged_count);
-        }
         rc = ap_run_process_connection(c);
-        if (clogging) {
-            apr_atomic_dec32(&clogged_count);
-        }
         /*
          * The process_connection hooks should set the appropriate connection
          * state upon return, for event MPM to either:
@@ -2322,15 +2310,13 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             if (now - last_log > apr_time_from_sec(1)) {
                 ap_log_error(APLOG_MARK, APLOG_TRACE6, 0, ap_server_conf,
                              "connections: %u (waitio:%u write:%u keepalive:%u "
-                             "lingering:%u suspended:%u clogged:%u), "
-                             "workers: %u/%u shutdown",
+                             "lingering:%u suspended:%u), workers: %u/%u shutdown",
                              apr_atomic_read32(&connection_count),
                              apr_atomic_read32(waitio_q->total),
                              apr_atomic_read32(write_completion_q->total),
                              apr_atomic_read32(keepalive_q->total),
                              apr_atomic_read32(&lingering_count),
                              apr_atomic_read32(&suspended_count),
-                             apr_atomic_read32(&clogged_count),
                              apr_atomic_read32(&threads_shutdown),
                              threads_per_child);
                 last_log = now;
