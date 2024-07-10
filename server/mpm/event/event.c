@@ -1742,7 +1742,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
                 goto process_connection;
             }
         }
-        if (pending != OK || listener_may_exit) {
+        if (pending != OK) {
             cs->pub.state = CONN_STATE_LINGER;
             goto lingering_close;
         }
@@ -2896,14 +2896,7 @@ do_maintenance:
 
             process_timeout_queue(waitio_q, now);
             process_timeout_queue(write_completion_q, now);
-
-            /* The keepalive queue can be shrinked any time under pressure */
-            if (above_limit || dying) {
-                shrink_timeout_queue(keepalive_q, now);
-            }
-            else {
-                process_timeout_queue(keepalive_q, now);
-            }
+            process_timeout_queue(keepalive_q, now);
 
             if (dying && linger_q->timeout > short_linger_q->timeout) {
                 /* Dying, force short timeout for normal lingering close */
@@ -2948,13 +2941,6 @@ do_maintenance:
             ps->backlog = apr_atomic_read32(backlog_q->total);
             ps->suspended = apr_atomic_read32(&suspended_count);
             ps->connections = apr_atomic_read32(&connection_count);
-        }
-        else if ((above_limit || dying)
-                 && apr_atomic_read32(keepalive_q->total)) {
-            apr_thread_mutex_lock(timeout_mutex);
-            shrink_timeout_queue(keepalive_q, now);
-            apr_thread_mutex_unlock(timeout_mutex);
-            ps->keep_alive = 0;
         }
     } /* listener main loop */
 
