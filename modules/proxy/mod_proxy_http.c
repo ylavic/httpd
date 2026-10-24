@@ -1515,6 +1515,16 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                           major, minor, proxy_status_line);
 
             if (do_send_body) {
+                if (proxy_status == HTTP_CONTINUE) {
+                    /* If the client still waits for a 100 Continue (the
+                     * backend's not forwarded, e.g. "proxy-interim-response
+                     * Suppress"), HTTP_IN sends it when reading the body, but
+                     * only with a successful r->status: restore the original
+                     * one, the next (final) response sets its own.
+                     */
+                    r->status = original_status;
+                    r->status_line = original_status_line;
+                }
                 status = send_continue_body(req);
                 if (status != OK) {
                     return status;
