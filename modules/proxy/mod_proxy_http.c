@@ -1492,9 +1492,13 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
              * "Connection: close" or HTTP < 1.1, and either let the core
              * discard it or the caller try another balancer member with the
              * same body (given status 503, though not implemented yet).
+             * Nor if the client waits for a 100 Continue (end-to-end), which
+             * won't come with a final response: its body can't be read, so
+             * the backend connection is closed instead (below).
              */
             int do_send_body = (proxy_status == HTTP_CONTINUE
-                                || (!toclose && major > 0 && minor > 0));
+                                || (!toclose && major > 0 && minor > 0
+                                    && !r->expecting_100));
 
             /* Reset to old timeout iff we've adjusted it. */
             if (worker->s->ping_timeout_set) {
@@ -1526,7 +1530,11 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                  * we do is leaving r->expecting_100 alone, ap_set_keepalive()
                  * will do the right thing according to the final response and
                  * any later update of r->expecting_100.
+                 *
+                 * The backend connection is out of sync if the backend keeps
+                 * it for the body that we don't send, so close it.
                  */
+                backend->close = 1;
             }
 
             /* Once only! */
