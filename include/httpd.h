@@ -2345,6 +2345,7 @@ AP_DECLARE(int) ap_parse_strict_length(apr_off_t *len, const char *str);
  * The unit of the time interval is given as postfix string to the numeric
  * string. Currently the following units are understood (case insensitive):
  *
+ * us    : microseconds
  * ms    : milliseconds
  * s     : seconds
  * mi[n] : minutes
