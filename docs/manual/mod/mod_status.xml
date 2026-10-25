@@ -119,6 +119,11 @@ performance</description>
     <code>log_server_status</code>, which you will find in the
     <code>/support</code> directory of your Apache HTTP Server installation.</p>
 
+    <p>With <module>event</module>, <code>ConnsAsyncClosing</code> counts the
+    connections in lingering close, and <code>ConnsAsyncShutdown</code> those
+    still flushing their last output before it (both counted as closing in
+    the previous versions).</p>
+
 </section>
 
 <section id="troubleshoot">
