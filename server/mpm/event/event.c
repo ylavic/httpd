@@ -1237,6 +1237,24 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
 {
     ap_assert(!cs->q && !cs->te);
 
+    if (!in_backlog && cs->c && cs->pub.state == CONN_STATE_ASYNC_WAITIO && !cs->pub.timed_out) {
+        /* The wait for I/O timed out: give the process_connection hooks one
+         * last pass to answer the timeout (e.g. a 408), without waiting again.
+         */
+        {
+            static log_ratelimit_t rl;
+            if (LOG_RATELIMIT(&rl, APLOG_TRACE4, 0, NULL, cs->c)) {
+                ap_log_cerror(APLOG_MARK, APLOG_TRACE4, 0, cs->c,
+                              "timed out connection in %s: last processing",
+                              cs_state_str(cs));
+            }
+        }
+        cs->pub.timed_out = 1;
+        cs->pub.state = CONN_STATE_PROCESSING;
+        push2worker(cs, NULL, now, NULL);
+        return;
+    }
+
     if (cs->c) {
         int expiry = 0;
         switch (cs->pub.state) {
@@ -1708,6 +1726,13 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         }
         else if (c->aborted) {
             cs->pub.state = CONN_STATE_LINGER;
+        }
+        if (cs->pub.timed_out) {
+            /* The last pass after a timed out wait: no waiting again */
+            if (cs->pub.state == CONN_STATE_ASYNC_WAITIO) {
+                cs->pub.state = CONN_STATE_LINGER;
+            }
+            cs->pub.timed_out = 0;
         }
         if (cs->pub.state == CONN_STATE_LINGER) {
             goto lingering_close;
