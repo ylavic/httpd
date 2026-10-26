@@ -569,6 +569,41 @@ static void proxy_http_async_finish(proxy_http_req_t *req, int status)
 static int proxy_http_response_preread(proxy_http_req_t *req);
 static int proxy_http_response_suspend(proxy_http_req_t *req);
 
+/* Poll sock synchronously for up to ProxyAsyncDelay (when > 0) before waiting
+ * in the MPM. This is called after a nonblocking read (or write) said it would
+ * block, so there is nothing left to read in the filters. Returns non-zero if
+ * the caller goes on without waiting: sock becomes ready within the delay,
+ * has an error that the next read or write will report, or the poll itself
+ * fails (e.g. EINTR, which must not fail the request), anything but a
+ * timeout.
+ */
+static int proxy_http_ready_within_delay(proxy_http_req_t *req,
+                                         apr_socket_t *sock,
+                                         apr_int16_t events)
+{
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+    apr_status_t rv;
+
+    if (req->dconf->async_delay <= 0) {
+        return 0;
+    }
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = req->r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = sock;
+    pfd.reqevents = events;
+    rv = apr_poll(&pfd, 1, &nready, req->dconf->async_delay);
+    if (APR_STATUS_IS_TIMEUP(rv)) {
+        return 0;
+    }
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, rv, req->r,
+                      "proxy %s: polling failed, going on", req->proto);
+    }
+    return 1;
+}
+
 /* The continuation of proxy_http_response_head_wait(), called when the
  * backend's response is available (or on timeout or error): read its head,
  * process it and finish the request.
@@ -618,31 +653,16 @@ static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
     proxy_http_async_finish(req, status);
 }
 
-/* Wait for the backend's response without holding the thread: synchronously
- * for ProxyAsyncDelay, then in the MPM (ap_mpm_register_wait()).
- * Returns OK if the response can be read now, or SUSPENDED if it's waited for
- * asynchronously (proxy_http_response_head_continuation() is called then).
+/* Wait for the backend's response without holding the thread: read its head
+ * without blocking (proxy_http_response_preread(), which waits for the rest
+ * as needed), so that anything the filters already hold is read before any
+ * poll. Returns OK if the response can be read now, or SUSPENDED if it's
+ * waited for asynchronously (proxy_http_response_head_continuation() is
+ * called then).
  */
 static int proxy_http_response_head_wait(proxy_http_req_t *req)
 {
-    request_rec *r = req->r;
-    proxy_conn_rec *backend = req->backend;
-    apr_pollfd_t pfd;
-    apr_int32_t nready = 0;
-    apr_status_t rv;
-
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.p = r->pool;
-    pfd.desc_type = APR_POLL_SOCKET;
-    pfd.desc.s = backend->sock;
-    pfd.reqevents = APR_POLLIN;
-    rv = apr_poll(&pfd, 1, &nready, req->dconf->async_delay);
-    if (!APR_STATUS_IS_TIMEUP(rv)) {
-        /* Readable (or an error the read will report): read the head */
-        return proxy_http_response_preread(req);
-    }
-
-    return proxy_http_response_suspend(req);
+    return proxy_http_response_preread(req);
 }
 
 /* Suspend until the backend is readable, then read its response head in
@@ -740,6 +760,10 @@ static int proxy_http_response_preread(proxy_http_req_t *req)
                             &req->head_state, req->p);
         apr_brigade_cleanup(req->head_bb);
         if (APR_STATUS_IS_EAGAIN(rv)) {
+            if (proxy_http_ready_within_delay(req, backend->sock,
+                                              APR_POLLIN)) {
+                continue;
+            }
             if (proxy_http_response_suspend(req) == SUSPENDED) {
                 return SUSPENDED;
             }
@@ -1679,26 +1703,12 @@ static int proxy_http_response_body_wait(proxy_http_req_t *req,
     apr_pollfd_t *pfd;
     apr_status_t rv;
 
-    if (req->dconf->async_delay > 0) {
-        apr_pollfd_t dpfd;
-        apr_int32_t nready = 0;
-
-        memset(&dpfd, 0, sizeof(dpfd));
-        dpfd.p = r->pool;
-        dpfd.desc_type = APR_POLL_SOCKET;
-        if (for_client) {
-            dpfd.desc.s = ap_get_conn_socket(c);
-            dpfd.reqevents = APR_POLLOUT;
-        }
-        else {
-            dpfd.desc.s = req->backend->sock;
-            dpfd.reqevents = APR_POLLIN;
-        }
-        rv = apr_poll(&dpfd, 1, &nready, req->dconf->async_delay);
-        if (!APR_STATUS_IS_TIMEUP(rv)) {
-            /* Ready (or an error the next read/write will report) */
-            return AGAIN;
-        }
+    if (for_client
+            ? proxy_http_ready_within_delay(req, ap_get_conn_socket(c),
+                                            APR_POLLOUT)
+            : proxy_http_ready_within_delay(req, req->backend->sock,
+                                            APR_POLLIN)) {
+        return AGAIN;
     }
 
     if (req->async_pool) {
