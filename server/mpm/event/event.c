@@ -462,6 +462,8 @@ struct event_conn_state_t {
      *  in cs->p, until released */
     struct kept_pfd *kept[EVENT_KEPT_MAX];
     int nkept;
+    /** the released ones, to reuse once their drain epoch passed (FIFO) */
+    APR_RING_HEAD(kept_pfd_ring, kept_pfd) kept_free;
 
     /*
      * when queued to workers
@@ -812,6 +814,7 @@ struct user_wait {
 #define KEPT_READY   4u
 
 struct kept_pfd {
+    APR_RING_ENTRY(kept_pfd) free_link; /* in cs->kept_free once released */
     apr_pollfd_t pfd;         /* registered (NOCOPY), client_data = &pt */
     listener_poll_type pt;    /* PT_KEPT, baton = this */
     /*atomic*/ apr_uint32_t state; /* KEPT_* */
@@ -819,6 +822,7 @@ struct kept_pfd {
     apr_int16_t latched;      /* the rtnevents of KEPT_READY */
     event_conn_state_t *cs;   /* its connection */
     struct kept_anchor *anchor; /* its descriptor's, if any */
+    apr_uint32_t free_epoch;  /* the drain epoch of its release */
 };
 
 /* A descriptor's link to its kept pfd, attached once to the socket or file
@@ -2345,6 +2349,7 @@ static event_conn_state_t *make_conn_state(apr_pool_t *p, apr_socket_t *csd)
     event_conn_state_t *cs = apr_pcalloc(p, sizeof(*cs));
     listener_poll_type *pt;
 
+    APR_RING_INIT(&cs->kept_free, kept_pfd, free_link);
     cs->pfd.desc_type = APR_POLL_SOCKET;
     cs->pfd.desc.s = cs_se(cs)->sd = csd;
     cs->pfd.client_data = pt = apr_pcalloc(p, sizeof(*pt));
@@ -2777,6 +2782,8 @@ static struct kept_anchor *kept_anchor_of(const apr_pollfd_t *pfd, int create)
     return anchor;
 }
 
+static /*atomic*/ apr_uint32_t drain_epoch;
+static int drain_epoch_passed(apr_uint32_t epoch);
 static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
                                       const apr_pollfd_t *pfd)
 {
@@ -2803,7 +2810,24 @@ static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
         AP_DEBUG_ASSERT(0);
         return NULL;
     }
-    kept = apr_pcalloc(cs->p, sizeof(*kept));
+    /* Reuse a released one when no poller can hold an event for it anymore
+     * (the drain epochs), so that the connection's pool doesn't grow with
+     * its requests keeping pfds.
+     */
+    kept = NULL;
+    if (!APR_RING_EMPTY(&cs->kept_free, kept_pfd, free_link)) {
+        kept = APR_RING_FIRST(&cs->kept_free);
+        if (drain_epoch_passed(kept->free_epoch)) {
+            APR_RING_REMOVE(kept, free_link);
+            memset(kept, 0, sizeof(*kept));
+        }
+        else {
+            kept = NULL;
+        }
+    }
+    if (!kept) {
+        kept = apr_pcalloc(cs->p, sizeof(*kept));
+    }
     kept->pfd = *pfd;
     kept->pfd.p = cs->p;
     kept->pt.type = PT_KEPT;
@@ -2931,6 +2955,10 @@ static apr_status_t release_kept_pfd(event_conn_state_t *cs, int i)
         apr_pool_cleanup_kill(cs->p, kept, kept_pfd_cleanup);
     }
     cs->kept[i] = cs->kept[--cs->nkept];
+
+    /* Reusable once the pollers moved past this epoch (make_kept_pfd()) */
+    kept->free_epoch = apr_atomic_inc32(&drain_epoch);
+    APR_RING_INSERT_TAIL(&cs->kept_free, kept, kept_pfd, free_link);
     return rc;
 }
 

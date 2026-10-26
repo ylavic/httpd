@@ -333,6 +333,9 @@ typedef struct {
     apr_pool_t *async_pool;
     apr_interval_time_t idle_timeout;
 
+    /* The waits registered by the request (proxy_http_wait_flags()) */
+    unsigned int waits;
+
     /* The response body's streaming state (proxy_http_response_body()) */
     apr_bucket_brigade *response_bb, *response_pass_bb;
     apr_read_type_e response_mode;
@@ -409,6 +412,21 @@ static proxy_http_req_t *proxy_http_req(request_rec *r)
     proxy_http_rctx_t *rctx = ap_get_module_config(r->request_config,
                                                    &proxy_http_module);
     return rctx ? rctx->req : NULL;
+}
+
+/* The flags of a wait registered by the request in the MPM: from its
+ * second registered wait, keep the sockets registered across the next ones
+ * (AP_MPM_WAIT_KEEP_PFDS), the backend's until its connection is given up
+ * (mod_proxy releases it then), the client's until the request is done. A
+ * request registering a single wait doesn't keep, it would pay a release
+ * for nothing.
+ */
+static unsigned int proxy_http_wait_flags(proxy_http_req_t *req)
+{
+    if (req->waits++ == 0) {
+        return 0;
+    }
+    return AP_MPM_WAIT_KEEP_PFDS;
 }
 
 /* A response head line pre-read by proxy_http_response_preread() */
@@ -629,7 +647,8 @@ static int proxy_http_response_suspend(proxy_http_req_t *req)
                                && req->worker->s->ping_timeout_set)
                               ? req->worker->s->ping_timeout
                               : req->idle_timeout,
-                              NULL, 0, proxy_http_response_head_continuation, req);
+                              NULL, proxy_http_wait_flags(req),
+                              proxy_http_response_head_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                       "proxy %s: can't wait for the response asynchronously",
@@ -829,7 +848,8 @@ static int proxy_http_request_forward_wait(proxy_http_req_t *req,
         timeout = proxy_http_request_read_timeout(r);
         break;
     }
-    rv = ap_mpm_register_wait(c, req->async_pool, pfds, timeout, NULL, 0,
+    rv = ap_mpm_register_wait(c, req->async_pool, pfds, timeout, NULL,
+                              proxy_http_wait_flags(req),
                               proxy_http_request_forward_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
@@ -1865,7 +1885,8 @@ static int proxy_http_response_body_wait(proxy_http_req_t *req,
     rv = ap_mpm_register_wait(c, req->async_pool, pfds,
                               for_client ? r->server->timeout
                                             : req->idle_timeout,
-                              NULL, 0, proxy_http_response_body_continuation, req);
+                              NULL, proxy_http_wait_flags(req),
+                              proxy_http_response_body_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                       "proxy %s: can't wait for the %s asynchronously",
