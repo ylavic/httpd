@@ -111,6 +111,10 @@ struct ap_queue_event_t
 
     /* link in container when queued (for internal use) */
     fd_queue_elem_t *elem;
+
+    /* when it was pushed and its class, for the MPM's stats */
+    apr_time_t queued_at;
+    int qclass;
 };
 typedef struct ap_queue_event_t ap_queue_event_t;
 

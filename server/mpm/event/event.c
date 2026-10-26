@@ -797,7 +797,175 @@ static apr_socket_t **worker_sockets;
  */
 static /*atomic*/ apr_uint32_t listensocks_off = 0;
 
-static int disable_listensocks(void)
+/* Instrumentation of the workers' backlog: how long the entries wait there
+ * for a worker (their sojourn), by class, and how often (and how long) the
+ * listener stops accepting. Reported and reset with the periodic stats, at
+ * trace2 (backlog_stats_report()).
+ */
+typedef enum {
+    BACKLOG_TIMER = 0,  /* timer callbacks */
+    BACKLOG_CONTINUATION, /* the continuations of completed waits */
+    BACKLOG_WRITE,      /* write completion */
+    BACKLOG_LINGER,     /* lingering close */
+    BACKLOG_WAITIO,     /* back from CONN_STATE_ASYNC_WAITIO */
+    BACKLOG_KEEPALIVE,  /* back from keepalive (the next request) */
+    BACKLOG_NEW,        /* newly accepted connections */
+    BACKLOG_CLASSES
+} backlog_class_e;
+
+static const char *const backlog_class_names[BACKLOG_CLASSES] = {
+    "timer",
+    "continuation",
+    "write",
+    "linger",
+    "waitio",
+    "keepalive",
+    "new"
+};
+
+/* Slot k of the histogram counts the sojourns of less than 2^k us (and at
+ * least 2^(k-1) us), the last one everything above.
+ */
+#define BACKLOG_HIST_SLOTS 25
+
+/* The sum of the sojourns (backlog_stats_t.sum_us): 64-bit atomics need
+ * APR 1.7, before a 32-bit sum saturating at APR_UINT32_MAX (~71min per
+ * period) does.
+ */
+#if APR_VERSION_AT_LEAST(1,7,0)
+typedef apr_uint64_t backlog_sum_t;
+#define backlog_sum_add(sum, us) apr_atomic_add64((sum), (us))
+#define backlog_sum_take(sum)    apr_atomic_xchg64((sum), 0)
+#else
+typedef apr_uint32_t backlog_sum_t;
+static APR_INLINE void backlog_sum_add(volatile apr_uint32_t *sum,
+                                       apr_uint32_t us)
+{
+    apr_uint32_t old, val;
+    do {
+        old = apr_atomic_read32(sum);
+        val = (us > APR_UINT32_MAX - old) ? APR_UINT32_MAX : old + us;
+    } while (apr_atomic_cas32(sum, val, old) != old);
+}
+#define backlog_sum_take(sum)    apr_atomic_xchg32((sum), 0)
+#endif
+
+typedef struct {
+    /*atomic*/ apr_uint32_t count;
+    /*atomic*/ apr_uint32_t max_us;
+    /*atomic*/ backlog_sum_t sum_us;
+    /*atomic*/ apr_uint32_t hist[BACKLOG_HIST_SLOTS];
+} backlog_stats_t;
+
+static backlog_stats_t backlog_stats[BACKLOG_CLASSES];
+
+/* Whether the stats are recorded, only when they are reported (trace2):
+ * the workers would otherwise all write the same cache lines for nothing.
+ * Set by the child at startup.
+ */
+static int backlog_stats_on;
+
+/* Changed by the listener only (see above) */
+static apr_uint32_t listensocks_toggles;
+static apr_time_t listensocks_off_since, listensocks_off_time;
+
+/* The backlog's connections shut down for their timeout (listener only) */
+static apr_uint32_t backlog_dropped;
+
+/* Account for an entry popped from the backlog (any thread) */
+static void backlog_stats_record(int qclass, apr_time_t sojourn)
+{
+    backlog_stats_t *st = &backlog_stats[qclass];
+    apr_uint32_t us, max;
+    int slot = 0;
+
+    if (sojourn <= 0) {
+        us = 0;
+    }
+    else if (sojourn >= APR_UINT32_MAX) {
+        us = APR_UINT32_MAX;
+    }
+    else {
+        us = (apr_uint32_t)sojourn;
+    }
+    while (slot < BACKLOG_HIST_SLOTS - 1 && (us >> slot)) {
+        slot++;
+    }
+
+    apr_atomic_inc32(&st->count);
+    backlog_sum_add(&st->sum_us, us);
+    apr_atomic_inc32(&st->hist[slot]);
+    for (;;) {
+        max = apr_atomic_read32(&st->max_us);
+        if (us <= max || apr_atomic_cas32(&st->max_us, us, max) == max) {
+            break;
+        }
+    }
+}
+
+/* The bound (in us) of the histogram slot reaching the given percentile */
+static apr_uint32_t backlog_hist_bound(const apr_uint32_t *hist,
+                                       apr_uint32_t count, int pct)
+{
+    apr_uint64_t want = ((apr_uint64_t)count * pct + 99) / 100, cum = 0;
+    int slot;
+
+    for (slot = 0; slot < BACKLOG_HIST_SLOTS - 1; slot++) {
+        cum += hist[slot];
+        if (cum >= want) {
+            break;
+        }
+    }
+    return (apr_uint32_t)1 << slot;
+}
+
+/* Log the backlog stats of the last period and reset them (listener) */
+static void backlog_stats_report(apr_time_t now)
+{
+    char buf[1024];
+    apr_size_t len = 0;
+    apr_time_t off;
+    apr_uint32_t toggles;
+    int i, j;
+
+    for (i = 0; i < BACKLOG_CLASSES; i++) {
+        backlog_stats_t *st = &backlog_stats[i];
+        apr_uint32_t hist[BACKLOG_HIST_SLOTS], count, max;
+        apr_uint64_t sum;
+
+        count = apr_atomic_xchg32(&st->count, 0);
+        max = apr_atomic_xchg32(&st->max_us, 0);
+        sum = backlog_sum_take(&st->sum_us);
+        for (j = 0; j < BACKLOG_HIST_SLOTS; j++) {
+            hist[j] = apr_atomic_xchg32(&st->hist[j], 0);
+        }
+        if (count && len < sizeof(buf)) {
+            len += apr_snprintf(buf + len, sizeof(buf) - len,
+                                " %s:n=%u,avg=%" APR_UINT64_T_FMT "us,"
+                                "p50<%uus,p99<%uus,max=%uus",
+                                backlog_class_names[i], count, sum / count,
+                                backlog_hist_bound(hist, count, 50),
+                                backlog_hist_bound(hist, count, 99), max);
+        }
+    }
+
+    off = listensocks_off_time;
+    if (listensocks_off_since) {
+        off += now - listensocks_off_since;
+        listensocks_off_since = now;
+    }
+    listensocks_off_time = 0;
+    toggles = listensocks_toggles;
+    listensocks_toggles = 0;
+
+    ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
+                 "backlog sojourn:%s; dropped %u; accept off %u times, %"
+                 APR_TIME_T_FMT "ms", len ? buf : " none", backlog_dropped,
+                 toggles, apr_time_as_msec(off));
+    backlog_dropped = 0;
+}
+
+static int disable_listensocks(apr_time_t now)
 {
     volatile process_score *ps;
     int i;
@@ -805,6 +973,8 @@ static int disable_listensocks(void)
     if (apr_atomic_cas32(&listensocks_off, 1, 0) != 0) {
         return 0;
     }
+    listensocks_toggles++;
+    listensocks_off_since = now;
 
     {
         static log_ratelimit_t rl;
@@ -835,7 +1005,7 @@ static int disable_listensocks(void)
     return 1;
 }
 
-static int enable_listensocks(void)
+static int enable_listensocks(apr_time_t now)
 {
     volatile process_score *ps;
     int i;
@@ -843,6 +1013,10 @@ static int enable_listensocks(void)
     if (apr_atomic_read32(&dying)
         || apr_atomic_cas32(&listensocks_off, 0, 1) != 1) {
         return 0;
+    }
+    if (listensocks_off_since) {
+        listensocks_off_time += now - listensocks_off_since;
+        listensocks_off_since = 0;
     }
 
     {
@@ -1309,7 +1483,8 @@ static void kill_connection_at(event_conn_state_t *cs, apr_status_t status,
 /* forward declare */
 static void set_conn_state_sense(event_conn_state_t *cs, int sense);
 static void push2worker(event_conn_state_t *cs, timer_event_t *te,
-                        apr_time_t now, int *busy);
+                        backlog_class_e qclass, apr_time_t now,
+                        int *above_limit);
 static void cancel_timer_event(timer_event_t *te);
 
 /* Shutdown the connection in case of timeout, error or resources shortage.
@@ -1322,6 +1497,10 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
                                 int in_backlog)
 {
     ap_assert(!cs->q && !cs->te);
+
+    if (in_backlog) {
+        backlog_dropped++;
+    }
 
     if (!in_backlog && cs->c && cs->pub.state == CONN_STATE_ASYNC_WAITIO && !cs->pub.timed_out) {
         /* The wait for I/O timed out: give the process_connection hooks one
@@ -1337,7 +1516,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
         }
         cs->pub.timed_out = 1;
         cs->pub.state = CONN_STATE_PROCESSING;
-        push2worker(cs, NULL, now, NULL);
+        push2worker(cs, NULL, BACKLOG_WAITIO, now, NULL);
         return;
     }
 
@@ -1385,7 +1564,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
                 cs->linger_since = now;
             }
             cs->pub.state = CONN_STATE_LINGER;
-            push2worker(cs, NULL, now, NULL);
+            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL);
         }
         else if (!in_backlog && !cs->linger_shutdown) {
             /* Its output timed out (shutdown_q): abort it and let a worker
@@ -1396,7 +1575,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
              */
             cs->c->aborted = 1;
             cs->linger_since = now;
-            push2worker(cs, NULL, now, NULL);
+            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL);
         }
         else {
             /* Closed by the listener: no worker's scoreboard slot */
@@ -2265,7 +2444,7 @@ static void set_child_dying(void)
     ps->quiescing = 1;
 
     apr_atomic_set32(&dying, 1);
-    disable_listensocks(); /* definitively with dying = 1 */
+    disable_listensocks(event_time_now()); /* definitively with dying = 1 */
     ap_close_listeners_ex(my_bucket->listeners);
 
 #if 0
@@ -2404,7 +2583,8 @@ static void timer_event_backlog_cb(void *baton, int pushed)
  * this function may only be called by the listener
  */
 static void push2worker(event_conn_state_t *cs, timer_event_t *te,
-                        apr_time_t now, int *above_limit)
+                        backlog_class_e qclass, apr_time_t now,
+                        int *above_limit)
 {
     ap_queue_event_t *qe;
     apr_status_t rc;
@@ -2419,7 +2599,7 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
          * test for should_enable_listensocks() to recover (when suitable).
          */
         if (connections_above_limit(NULL)) {
-            disable_listensocks();
+            disable_listensocks(now);
             if (above_limit) {
                 *above_limit = 1;
             }
@@ -2460,6 +2640,8 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
         qe = cs_qe(cs);
         qe->cb = conn_state_backlog_cb;
     }
+    qe->qclass = (te) ? BACKLOG_TIMER : qclass;
+    qe->queued_at = now; /* the listener's, when the event was polled */
 
     rc = ap_queue_push_event(worker_queue, qe, 0);
     if (rc != APR_SUCCESS) {
@@ -2890,6 +3072,9 @@ static void update_stats(process_score *ps, apr_time_t now,
                      apr_atomic_read32(&suspended_count),
                      apr_atomic_read32(&threads_shutdown),
                      threads_per_child);
+        if (backlog_stats_on) {
+            backlog_stats_report(now);
+        }
 
         *when = now + STATS_UPDATE_TIMEOUT;
     }
@@ -3040,7 +3225,8 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     cs = NULL;
                 }
 
-                push2worker(cs, te, now, &above_limit);
+                /* A timed out wait completes, else a timer */
+                push2worker(cs, te, BACKLOG_CONTINUATION, now, &above_limit);
             }
             if (te) {
                 next_expiry = te->when;
@@ -3093,7 +3279,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
         /* Unpause listening sockets before poll()ing if possible */
         if (should_enable_listensocks()) {
-            enable_listensocks();
+            enable_listensocks(now);
         }
 
         ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
@@ -3148,6 +3334,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         for (user_chain = NULL; num > 0; --num, ++out_pfd) {
             listener_poll_type *pt = out_pfd->client_data;
             struct user_wait *user_wait;
+            backlog_class_e qclass = BACKLOG_NEW;
 
             switch (pt->type) {
             case PT_CSD:
@@ -3159,10 +3346,18 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
                 switch (cs->pub.state) {
                 case CONN_STATE_KEEPALIVE:
-                case CONN_STATE_ASYNC_WAITIO:
+                    qclass = BACKLOG_KEEPALIVE;
                     cs->pub.state = CONN_STATE_PROCESSING;
+                    break;
+                case CONN_STATE_ASYNC_WAITIO:
+                    qclass = BACKLOG_WAITIO;
+                    cs->pub.state = CONN_STATE_PROCESSING;
+                    break;
                 case CONN_STATE_WRITE_COMPLETION:
+                    qclass = BACKLOG_WRITE;
+                    break;
                 case CONN_STATE_LINGER:
+                    qclass = BACKLOG_LINGER;
                     break;
 
                 default:
@@ -3174,7 +3369,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 }
 
                 if (pollset_del(cs, 0)) {
-                    push2worker(cs, NULL, now, &above_limit);
+                    push2worker(cs, NULL, qclass, now, &above_limit);
                 }
                 else {
                     /* Can't go anywhere, kill (and log) and next. */
@@ -3235,7 +3430,8 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                          */
                         ap_assert(csd != NULL);
                         cs = make_conn_state(ptrans, csd);
-                        push2worker(cs, NULL, now, &above_limit);
+                        push2worker(cs, NULL, BACKLOG_NEW, now,
+                                    &above_limit);
                     }
                     else {
                         if (rc == APR_EGENERAL) {
@@ -3332,7 +3528,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             cs->user_wait = NULL;
 
             /* Schedule ap_run_resume_connection() */
-            push2worker(cs, NULL, now, &above_limit);
+            push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit);
         }
 
         /* We process the timeout queues here only when the global
@@ -3541,6 +3737,7 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         }
 
         is_idler = 0; /* event consumed */
+        backlog_stats_record(qe->qclass, event_time_now() - qe->queued_at);
         ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                      "worker thread %i/%i busy (idlers %i)",
                      thread_slot, threads_per_child,
@@ -3648,6 +3845,8 @@ static void setup_threads_runtime(void)
                                      (unsigned int)num_listensocks +
                                      POLLSET_RESERVE_SIZE);
     int pollset_flags;
+
+    backlog_stats_on = APLOGtrace2(ap_server_conf);
 
     /* Event's skiplist operations will happen concurrently with other modules'
      * runtime so they need their own pool for allocations, and its lifetime
