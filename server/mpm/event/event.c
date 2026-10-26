@@ -386,6 +386,10 @@ struct event_conn_state_t {
     /** a wait (ap_mpm_register_wait()) to arm once no thread runs the
      *  connection anymore */
     struct user_wait *pending_wait;
+    /** the connection's wait (cs->p), reused by all its waits so that a
+     *  fired event's pfd/pt/wait stay valid as long as the connection;
+     *  user_wait/pending_wait point to it */
+    struct user_wait *wait;
     /** the continuation to run on resume, and its arguments */
     ap_mpm_continuation_fn_t *resume_fn;
     void *resume_baton;
@@ -674,9 +678,12 @@ typedef struct
 } listener_poll_type;
 
 struct user_wait {
-    apr_pool_t *pool;
+    apr_pool_t *pool; /* the registrant's (cleanup registered there) */
     event_conn_state_t *cs;
-    apr_array_header_t *pfds;
+    apr_array_header_t *pfds; /* pfds_buf[pfds_cur] */
+    apr_array_header_t *pfds_buf[2]; /* alternated by the waits (cs->p) */
+    unsigned int pfds_cur;
+    listener_poll_type pt_buf[2]; /* pfds_buf[i]'s client_data */
     apr_thread_mutex_t *mutex; /* pfds added/removed atomically */
     timer_event_t *timer; /* the timer of its timeout if any (also cs->te) */
     struct user_wait *next; /* chaining */
@@ -684,7 +691,7 @@ struct user_wait {
     apr_interval_time_t timeout; /* the timeout to arm with */
     ap_mpm_continuation_fn_t *fn; /* the continuation (ap_mpm_register_wait()), if any */
     void *fn_baton;
-    struct user_watch_wakeup *notifier; /* the wait's wakeup, if any (constant) */
+    struct user_watch_wakeup *notifier; /* the wait's notifier, if any */
     int wait_notified; /* resume with AP_MPM_WAIT_NOTIFIED (listener only) */
 };
 
@@ -695,19 +702,18 @@ struct user_wait {
  */
 struct user_watch_wakeup {
     APR_RING_ENTRY(user_watch_wakeup) link; /* in notified_user_waits */
-    struct user_wait *baton;         /* the wait it resumes (constant) */
+    struct user_wait *baton;               /* the wait it fires (once used) */
     unsigned int used     :1, /* given to ap_mpm_register_wait() */
                  notified :1, /* ap_mpm_notify() was called */
                  armed    :1, /* its wait armed (pollset or timer) */
                  queued   :1; /* in notified_user_waits */
 };
 
-/* A wakeup is the wait it resumes (see event_notify()), created before it's
- * given to ap_mpm_register_wait() so that it can be called before.
+/* A wakeup resumes the wait it's given to (see event_notify()), created
+ * before it's given to ap_mpm_register_wait() so that it can be called before.
  */
 struct ap_mpm_notifier_t {
-    struct user_wait baton; /* baton.wakeup = &state */
-    struct user_watch_wakeup state;
+    struct user_watch_wakeup state; /* state.baton = the connection's wait */
 };
 
 /* The waits notified while armed, to be woken up by the
@@ -2370,10 +2376,10 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
 }
 
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
-                                              apr_pool_t *p,
-                                              const apr_array_header_t *user_pfds,
-                                              apr_interval_time_t timeout,
-                                              struct user_wait *user_wait);
+                                        apr_pool_t *p,
+                                        const apr_array_header_t *user_pfds,
+                                        apr_interval_time_t timeout,
+                                        struct user_watch_wakeup *notifier);
 static apr_status_t arm_user_wait(event_conn_state_t *cs,
                                   struct user_wait *user_wait);
 static void arm_pending_wait(event_conn_state_t *cs);
@@ -2393,11 +2399,11 @@ static apr_status_t user_wait_cleanup(void *data)
     int i;
 
     /* All the pollfds should be added/removed atomically, so synchronize
-     * with register_user_poll().
+     * with arm_user_wait().
      */
     apr_thread_mutex_lock(user_wait->mutex);
     for (i = 0; i < pfds->nelts; i++) {
-        apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
+        apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
         if (pfd->client_data) {
 #ifdef APR_POLLONESHOT
             if (pfd->rtnevents && (pfd->reqevents & APR_POLLONESHOT)
@@ -2431,6 +2437,7 @@ static apr_status_t user_wait_cleanup(void *data)
         }
         notifier->armed = 0;
         apr_thread_mutex_unlock(notifiers_mutex);
+        user_wait->notifier = NULL;
     }
 
     if (final_rc) {
@@ -2443,24 +2450,51 @@ static apr_status_t user_wait_cleanup(void *data)
     return final_rc;
 }
 
-/* A wait of a SUSPENDED connection, to be armed by arm_user_wait(), in
- * user_wait if not NULL (a wakeup's, whose own fields are kept).
+/* A wait of a SUSPENDED connection, to be armed by arm_user_wait(), in the
+ * connection's wait: its memory (pt, pfds) lives in cs->p so that an event
+ * fired for it stays readable as long as the connection, whichever thread
+ * got it. The pfds are copied into the other array than the previous
+ * wait's, which may be the one given to the continuation running this.
  */
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                         apr_pool_t *p,
                                         const apr_array_header_t *user_pfds,
                                         apr_interval_time_t timeout,
-                                        struct user_wait *user_wait)
+                                        struct user_watch_wakeup *notifier)
 {
+    struct user_wait *user_wait = cs->wait;
+    apr_array_header_t *pfds;
+    int i;
+
     if (!user_wait) {
-        user_wait = apr_pcalloc(p, sizeof(*user_wait));
+        user_wait = apr_pcalloc(cs->p, sizeof(*user_wait));
+        apr_thread_mutex_create(&user_wait->mutex, APR_THREAD_MUTEX_DEFAULT,
+                                cs->p);
+        user_wait->pfds_buf[0] = apr_array_make(cs->p, 2, sizeof(apr_pollfd_t));
+        user_wait->pfds_buf[1] = apr_array_make(cs->p, 2, sizeof(apr_pollfd_t));
+        user_wait->pt_buf[0].type = user_wait->pt_buf[1].type = PT_USER;
+        user_wait->pt_buf[0].baton = user_wait->pt_buf[1].baton = user_wait;
+        user_wait->cs = cs;
+        cs->wait = user_wait;
     }
-    apr_thread_mutex_create(&user_wait->mutex, APR_THREAD_MUTEX_DEFAULT, p);
-    user_wait->pfds = user_pfds ? apr_array_copy(p, user_pfds)
-                                 : apr_array_make(p, 0, sizeof(apr_pollfd_t));
+
+    user_wait->pfds_cur ^= 1;
+    pfds = user_wait->pfds_buf[user_wait->pfds_cur];
+    apr_array_clear(pfds);
+    for (i = 0; user_pfds && i < user_pfds->nelts; i++) {
+        APR_ARRAY_PUSH(pfds, apr_pollfd_t) =
+            APR_ARRAY_IDX(user_pfds, i, apr_pollfd_t);
+    }
+    user_wait->pfds = pfds;
     user_wait->pool = p;
-    user_wait->cs = cs;
     user_wait->timeout = timeout;
+    user_wait->timer = NULL;
+    user_wait->next = NULL;
+    user_wait->chained = 0;
+    user_wait->fn = NULL;
+    user_wait->fn_baton = NULL;
+    user_wait->wait_notified = 0;
+    user_wait->notifier = notifier;
     return user_wait;
 }
 
@@ -2472,17 +2506,13 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
     apr_array_header_t *pfds = user_wait->pfds;
     apr_interval_time_t timeout = user_wait->timeout;
     apr_status_t rc, final_rc = APR_SUCCESS;
-    listener_poll_type *pt;
+    listener_poll_type *pt = &user_wait->pt_buf[user_wait->pfds_cur];
     int i;
 
     cs->pub.state = CONN_STATE_SUSPENDED;
     cs->user_wait = user_wait;
 
     apr_pool_pre_cleanup_register(p, user_wait, user_wait_cleanup);
-
-    pt = apr_pcalloc(p, sizeof(*pt));
-    pt->baton = user_wait;
-    pt->type = PT_USER;
 
     if (timeout >= 0) {
         /* Prevent the timer from firing before the pollset is updated */
@@ -2558,8 +2588,6 @@ static apr_status_t event_notifier_create(ap_mpm_notifier_t **notifier,
         return APR_ENOTIMPL; /* not a connection of this MPM */
     }
     *notifier = apr_pcalloc(p, sizeof(**notifier));
-    (*notifier)->baton.notifier = &(*notifier)->state;
-    (*notifier)->state.baton = &(*notifier)->baton;
     return APR_SUCCESS;
 }
 
@@ -2590,17 +2618,17 @@ static int event_notify(ap_mpm_notifier_t *notifier)
     return OK;
 }
 
-/* Suspend a request until some pfds are ready, its wakeup is called or a
- * timeout (ap_mpm_register_wait()). The wait is armed once no thread runs the
- * connection anymore, i.e. when the handler has returned SUSPENDED
- * (enter_suspended()) or when the continuation of a previous wait has returned
- * (process_socket()).
+/* Suspend a request until some pfds are ready, its notifier is notified or a
+ * timeout (ap_mpm_register_wait()). The wait is armed once no thread runs
+ * the connection anymore, i.e. when the handler has returned SUSPENDED
+ * (enter_suspended()) or when the continuation of a previous wait has
+ * returned (process_socket()).
  */
 static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
-                                       const apr_array_header_t *pfds,
-                                       apr_interval_time_t timeout,
-                                       ap_mpm_notifier_t *notifier,
-                                       ap_mpm_continuation_fn_t *fn, void *baton)
+                                        const apr_array_header_t *pfds,
+                                        apr_interval_time_t timeout,
+                                        ap_mpm_notifier_t *notifier,
+                                        ap_mpm_continuation_fn_t *fn, void *baton)
 {
     event_conn_state_t *cs;
     struct user_wait *user_wait;
@@ -2632,7 +2660,11 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     }
 
     user_wait = make_user_wait(cs, p, pfds, timeout,
-                                notifier ? &notifier->baton : NULL);
+                               notifier ? &notifier->state : NULL);
+    if (notifier) {
+        /* Read by event_notify() once armed (under notifiers_mutex) */
+        notifier->state.baton = user_wait;
+    }
     user_wait->fn = fn;
     user_wait->fn_baton = baton;
     cs->pending_wait = user_wait;
@@ -3569,11 +3601,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     AP_DEBUG_ASSERT(cs->user_wait->pfds != NULL);
                     apr_pool_cleanup_run(cs->user_wait->pool, cs->user_wait,
                                          user_wait_cleanup);
-#ifdef AP_DEBUG
-                    if (!cs->user_wait->notifier) { /* can still be called */
-                        memset(cs->user_wait, 0, sizeof(*cs->user_wait));
-                    }
-#endif
                     cs->user_wait = NULL;
 
                     AP_DEBUG_ASSERT(cs->suspended);
@@ -3953,11 +3980,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             /* Remove all user pollfds from the pollset */
             apr_pool_cleanup_run(user_wait->pool, user_wait,
                                  user_wait_cleanup);
-#ifdef AP_DEBUG
-            if (!user_wait->notifier) { /* can still be called */
-                memset(user_wait, 0, sizeof(*user_wait));
-            }
-#endif
             cs->user_wait = NULL;
 
             /* Schedule ap_run_resume_connection() */
