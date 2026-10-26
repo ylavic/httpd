@@ -1929,6 +1929,13 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
     ap_assert(cs->q == NULL && cs->te == NULL);
 
     set_conn_state_sense(cs, sense);
+#ifdef APR_POLLONESHOT
+    /* One-shot: kept registered once added (disarmed when it fires or is
+     * removed), so the next add is a re-arm (one epoll_ctl() instead of an
+     * add per arming and a remove per completion), see pollset_del_at().
+     */
+    cs->pfd.reqevents |= APR_POLLONESHOT;
+#endif
 
     if (q) {
         apr_thread_mutex_lock(timeout_mutex);
@@ -1981,7 +1988,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
 #define pollset_add(cs, sense, q, te) \
     pollset_add_at((cs), (sense), (q), (te), __FUNCTION__, __LINE__)
 
-static int pollset_del_at(event_conn_state_t *cs, int locked,
+static int pollset_del_at(event_conn_state_t *cs, int locked, int fired,
                           const char *at, int line)
 {
     apr_status_t rv;
@@ -2014,6 +2021,11 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
      * therefore, we can accept _SUCCESS or _NOTFOUND,
      * and we still want to keep going
      */
+#ifdef APR_POLLONESHOT
+    if (fired && (cs->pfd.reqevents & APR_POLLONESHOT)) {
+        return 1; /* disarmed by the kernel already, nothing to remove */
+    }
+#endif
     rv = apr_pollset_remove(event_pollset, &cs->pfd);
     if (rv != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rv)) {
         ap_log_cerror(APLOG_MARK, APLOG_ERR, rv, cs->c, APLOGNO(03094)
@@ -2027,7 +2039,10 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
     return 1;
 }
 #define pollset_del(cs, locked) \
-    pollset_del_at((cs), (locked), __FUNCTION__, __LINE__)
+    pollset_del_at((cs), (locked), 0, __FUNCTION__, __LINE__)
+/* After the connection's pfd fired (the listener) */
+#define pollset_del_fired(cs) \
+    pollset_del_at((cs), 0, 1, __FUNCTION__, __LINE__)
 
 /* Forward declare */
 static timer_event_t *get_timer_event(apr_time_t timeout,
@@ -2364,6 +2379,12 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 static void arm_pending_wait(event_conn_state_t *cs);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 
+/* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
+ * nothing remains to remove from event_pollset: not with kqueue, a filter per
+ * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
+ */
+static int oneshot_disarms_fd = 1;
+
 static apr_status_t user_wait_cleanup(void *data)
 {
     struct user_wait *user_wait = data;
@@ -2378,6 +2399,19 @@ static apr_status_t user_wait_cleanup(void *data)
     for (i = 0; i < pfds->nelts; i++) {
         apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
         if (pfd->client_data) {
+#ifdef APR_POLLONESHOT
+            if (pfd->rtnevents && (pfd->reqevents & APR_POLLONESHOT)
+                && (oneshot_disarms_fd
+                    || !(pfd->reqevents & APR_POLLIN)
+                    || !(pfd->reqevents & APR_POLLOUT))) {
+                /* It fired: disarmed by the kernel already (else its other
+                 * event may fire later, for this wait's pfd copy reused by
+                 * a next one: remove it)
+                 */
+                pfd->client_data = NULL;
+                continue;
+            }
+#endif
             rc = apr_pollset_remove(event_pollset, pfd);
             if (rc != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rc)) {
                 final_rc = rc;
@@ -2471,6 +2505,9 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
                 pfd->reqevents |= APR_POLLHUP;
             }
             pfd->reqevents |= APR_POLLERR;
+#ifdef APR_POLLONESHOT
+            pfd->reqevents |= APR_POLLONESHOT; /* see pollset_add_at() */
+#endif
             pfd->client_data = pt;
 
             rc = apr_pollset_add(event_pollset, pfd);
@@ -3700,6 +3737,12 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             struct user_wait *user_wait;
             backlog_class_e qclass = BACKLOG_NEW;
 
+            if (!pt) {
+                /* A wait's pfd copy whose wait completed meanwhile (its
+                 * client_data reset by user_wait_cleanup()): stale
+                 */
+                continue;
+            }
             switch (pt->type) {
             case PT_CSD:
                 /* one of the sockets is ready */
@@ -3732,7 +3775,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     ap_assert(0);
                 }
 
-                if (pollset_del(cs, 0)) {
+                if (pollset_del_fired(cs)) {
                     push2worker(cs, NULL, qclass, now, &above_limit);
                 }
                 else {
@@ -4358,6 +4401,8 @@ static void setup_threads_runtime(void)
                      "apr_pollset_create with Thread Safety failed.");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
+    oneshot_disarms_fd = (strcmp(apr_pollset_method_name(event_pollset),
+                                 "kqueue") != 0);
 
     /* Add listeners to the main pollset */
     listener_pollfd = apr_pcalloc(pruntime,
