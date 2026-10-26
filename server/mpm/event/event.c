@@ -684,7 +684,37 @@ struct user_wait {
     apr_interval_time_t timeout; /* the timeout to arm with */
     ap_mpm_continuation_fn_t *fn; /* the continuation (ap_mpm_register_wait()), if any */
     void *fn_baton;
+    struct user_watch_wakeup *notifier; /* the wait's wakeup, if any (constant) */
+    int wait_notified; /* resume with AP_MPM_WAIT_NOTIFIED (listener only) */
 };
+
+/* A notifier (ap_mpm_notifier_create()) fires the wait it's given to (see
+ * event_notify()), from any thread; it's created before it's given to
+ * ap_mpm_register_wait() so that it can be notified before. Protected by
+ * notifiers_mutex.
+ */
+struct user_watch_wakeup {
+    APR_RING_ENTRY(user_watch_wakeup) link; /* in notified_user_waits */
+    struct user_wait *baton;         /* the wait it resumes (constant) */
+    unsigned int used     :1, /* given to ap_mpm_register_wait() */
+                 notified :1, /* ap_mpm_notify() was called */
+                 armed    :1, /* its wait armed (pollset or timer) */
+                 queued   :1; /* in notified_user_waits */
+};
+
+/* A wakeup is the wait it resumes (see event_notify()), created before it's
+ * given to ap_mpm_register_wait() so that it can be called before.
+ */
+struct ap_mpm_notifier_t {
+    struct user_wait baton; /* baton.wakeup = &state */
+    struct user_watch_wakeup state;
+};
+
+/* The waits notified while armed, to be woken up by the
+ * listener (under notifiers_mutex).
+ */
+static apr_thread_mutex_t *notifiers_mutex;
+static APR_RING_HEAD(notified_user_waits_t, user_watch_wakeup) notified_user_waits;
 
 typedef struct event_child_bucket {
     ap_pod_t *pod;
@@ -2323,7 +2353,8 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                               apr_pool_t *p,
                                               const apr_array_header_t *user_pfds,
-                                              apr_interval_time_t timeout);
+                                              apr_interval_time_t timeout,
+                                              struct user_wait *user_wait);
 static apr_status_t arm_user_wait(event_conn_state_t *cs,
                                   struct user_wait *user_wait);
 static void arm_pending_wait(event_conn_state_t *cs);
@@ -2352,6 +2383,18 @@ static apr_status_t user_wait_cleanup(void *data)
     }
     apr_thread_mutex_unlock(user_wait->mutex);
 
+    /* The wait completes: notifying it does nothing from now on */
+    if (user_wait->notifier) {
+        struct user_watch_wakeup *notifier = user_wait->notifier;
+        apr_thread_mutex_lock(notifiers_mutex);
+        if (notifier->queued) {
+            APR_RING_REMOVE(notifier, link);
+            notifier->queued = 0;
+        }
+        notifier->armed = 0;
+        apr_thread_mutex_unlock(notifiers_mutex);
+    }
+
     if (final_rc) {
         ap_log_cerror(APLOG_MARK, APLOG_ERR, final_rc, user_wait->cs->c,
                       APLOGNO() "can't remove a wait's pollfd from the "
@@ -2362,17 +2405,21 @@ static apr_status_t user_wait_cleanup(void *data)
     return final_rc;
 }
 
-/* A wait of a SUSPENDED connection, to be armed by arm_user_wait() */
+/* A wait of a SUSPENDED connection, to be armed by arm_user_wait(), in
+ * user_wait if not NULL (a wakeup's, whose own fields are kept).
+ */
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
-                                              apr_pool_t *p,
-                                              const apr_array_header_t *user_pfds,
-                                              apr_interval_time_t timeout)
+                                        apr_pool_t *p,
+                                        const apr_array_header_t *user_pfds,
+                                        apr_interval_time_t timeout,
+                                        struct user_wait *user_wait)
 {
-    struct user_wait *user_wait;
-
-    user_wait = apr_pcalloc(p, sizeof(*user_wait));
+    if (!user_wait) {
+        user_wait = apr_pcalloc(p, sizeof(*user_wait));
+    }
     apr_thread_mutex_create(&user_wait->mutex, APR_THREAD_MUTEX_DEFAULT, p);
-    user_wait->pfds = apr_array_copy(p, user_pfds);
+    user_wait->pfds = user_pfds ? apr_array_copy(p, user_pfds)
+                                 : apr_array_make(p, 0, sizeof(apr_pollfd_t));
     user_wait->pool = p;
     user_wait->cs = cs;
     user_wait->timeout = timeout;
@@ -2431,6 +2478,28 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
             pfd->client_data = NULL;
         }
     }
+
+    /* Notifiable from now on, or completed right away if it was notified
+     * already (before the wait was armed). This is done before releasing
+     * user_wait->mutex, which the listener's user_wait_cleanup() takes
+     * first, so the wait can't complete (and its pool go away) meanwhile.
+     */
+    if (final_rc == APR_SUCCESS && user_wait->notifier) {
+        struct user_watch_wakeup *notifier = user_wait->notifier;
+        int wake = 0;
+        apr_thread_mutex_lock(notifiers_mutex);
+        notifier->armed = 1;
+        if (notifier->notified) {
+            APR_RING_INSERT_TAIL(&notified_user_waits, notifier,
+                                 user_watch_wakeup, link);
+            notifier->queued = 1;
+            wake = 1;
+        }
+        apr_thread_mutex_unlock(notifiers_mutex);
+        if (wake) {
+            apr_pollset_wakeup(event_pollset);
+        }
+    }
     apr_thread_mutex_unlock(user_wait->mutex);
 
     if (final_rc) {
@@ -2440,14 +2509,56 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
     return final_rc;
 }
 
-/* Suspend a request until some pfds are ready (ap_mpm_register_wait()). The
- * wait is armed once no thread runs the connection anymore, i.e. when the
- * handler has returned SUSPENDED (enter_suspended()) or when the continuation
- * of a previous wait has returned (process_socket()).
+/* Create a notifier for a wait (ap_mpm_notifier_create()) */
+static apr_status_t event_notifier_create(ap_mpm_notifier_t **notifier,
+                                          conn_rec *c, apr_pool_t *p)
+{
+    if (c->master || !ap_get_module_config(c->conn_config, &mpm_event_module)) {
+        return APR_ENOTIMPL; /* not a connection of this MPM */
+    }
+    *notifier = apr_pcalloc(p, sizeof(**notifier));
+    (*notifier)->baton.notifier = &(*notifier)->state;
+    (*notifier)->state.baton = &(*notifier)->baton;
+    return APR_SUCCESS;
+}
+
+/* Notify a wait (ap_mpm_notify()), from any thread: an armed wait is queued
+ * to the listener (notified_user_waits), which completes it after its next
+ * poll; a wait not armed yet completes once armed (arm_user_wait()). Once
+ * the wait has completed, user_wait_cleanup() has disarmed it so nothing is
+ * done.
+ */
+static int event_notify(ap_mpm_notifier_t *notifier)
+{
+    struct user_watch_wakeup *state = &notifier->state;
+    int wake = 0;
+
+    apr_thread_mutex_lock(notifiers_mutex);
+    state->notified = 1;
+    if (state->armed && !state->queued) {
+        APR_RING_INSERT_TAIL(&notified_user_waits, state, user_watch_wakeup,
+                             link);
+        state->queued = 1;
+        wake = 1;
+    }
+    apr_thread_mutex_unlock(notifiers_mutex);
+
+    if (wake) {
+        apr_pollset_wakeup(event_pollset);
+    }
+    return OK;
+}
+
+/* Suspend a request until some pfds are ready, its wakeup is called or a
+ * timeout (ap_mpm_register_wait()). The wait is armed once no thread runs the
+ * connection anymore, i.e. when the handler has returned SUSPENDED
+ * (enter_suspended()) or when the continuation of a previous wait has returned
+ * (process_socket()).
  */
 static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
                                        const apr_array_header_t *pfds,
                                        apr_interval_time_t timeout,
+                                       ap_mpm_notifier_t *notifier,
                                        ap_mpm_continuation_fn_t *fn, void *baton)
 {
     event_conn_state_t *cs;
@@ -2460,15 +2571,27 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     if (!cs) {
         return APR_ENOTIMPL; /* not a connection of this MPM */
     }
-    if (!fn || !pfds || pfds->nelts <= 0) {
-        return APR_EINVAL;
+    if (!fn || ((!pfds || pfds->nelts <= 0) && !notifier && timeout < 0)) {
+        return APR_EINVAL; /* nothing would fire the wait */
     }
     if (cs->pending_wait || (cs->suspended && !cs->in_continuation)) {
         /* One wait at a time, and not from another thread */
         return APR_EBUSY;
     }
 
-    user_wait = make_user_wait(cs, p, pfds, timeout);
+    if (notifier) {
+        int used;
+        apr_thread_mutex_lock(notifiers_mutex);
+        used = notifier->state.used;
+        notifier->state.used = 1;
+        apr_thread_mutex_unlock(notifiers_mutex);
+        if (used) {
+            return APR_EBUSY; /* a notifier serves a single wait */
+        }
+    }
+
+    user_wait = make_user_wait(cs, p, pfds, timeout,
+                                notifier ? &notifier->baton : NULL);
     user_wait->fn = fn;
     user_wait->fn_baton = baton;
     cs->pending_wait = user_wait;
@@ -3387,7 +3510,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     apr_pool_cleanup_run(cs->user_wait->pool, cs->user_wait,
                                          user_wait_cleanup);
 #ifdef AP_DEBUG
-                    memset(cs->user_wait, 0, sizeof(*cs->user_wait));
+                    if (!cs->user_wait->notifier) { /* can still be called */
+                        memset(cs->user_wait, 0, sizeof(*cs->user_wait));
+                    }
 #endif
                     cs->user_wait = NULL;
 
@@ -3707,6 +3832,28 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             }
         } /* for processing poll */
 
+        /* Chain the waits whose wakeup was called too (event_notify()). Only
+         * the listener completes an armed wait, so they can't go away once
+         * out of notified_user_waits.
+         */
+        apr_thread_mutex_lock(notifiers_mutex);
+        while (!APR_RING_EMPTY(&notified_user_waits, user_watch_wakeup,
+                               link)) {
+            struct user_watch_wakeup *notifier;
+            struct user_wait *user_wait;
+            notifier = APR_RING_FIRST(&notified_user_waits);
+            APR_RING_REMOVE(notifier, link);
+            notifier->queued = 0;
+            user_wait = notifier->baton;
+            user_wait->wait_notified = 1;
+            if (!user_wait->chained) {
+                user_wait->chained = 1;
+                user_wait->next = user_chain;
+                user_chain = user_wait;
+            }
+        }
+        apr_thread_mutex_unlock(notifiers_mutex);
+
         /* Time to queue user callbacks chained above */
         while (user_chain) {
             struct user_wait *user_wait = user_chain;
@@ -3732,14 +3879,18 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 cs->resume_fn = user_wait->fn;
                 cs->resume_baton = user_wait->fn_baton;
                 cs->resume_pfds = user_wait->pfds;
-                cs->resume_why = AP_MPM_WAIT_READY;
+                cs->resume_why = user_wait->wait_notified
+                                 ? AP_MPM_WAIT_NOTIFIED
+                                 : AP_MPM_WAIT_READY;
             }
 
             /* Remove all user pollfds from the pollset */
             apr_pool_cleanup_run(user_wait->pool, user_wait,
                                  user_wait_cleanup);
 #ifdef AP_DEBUG
-            memset(user_wait, 0, sizeof(*user_wait));
+            if (!user_wait->notifier) { /* can still be called */
+                memset(user_wait, 0, sizeof(*user_wait));
+            }
 #endif
             cs->user_wait = NULL;
 
@@ -4156,6 +4307,14 @@ static void setup_threads_runtime(void)
                      "creation of the timeout mutex failed.");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
+    rv = apr_thread_mutex_create(&notifiers_mutex, APR_THREAD_MUTEX_DEFAULT,
+                                 pruntime);
+    if (rv != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO()
+                     "creation of the notifiers mutex failed.");
+        clean_child_exit(APEXIT_CHILDFATAL);
+    }
+    APR_RING_INIT(&notified_user_waits, user_watch_wakeup, link);
 
     /* Create the main pollset with a good method. APR_POLLSET_WAKEABLE is
      * required (any method implements it with APR >= 1.4), we account for
@@ -5972,6 +6131,8 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_register_wait(event_register_wait, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_notifier_create(event_notifier_create, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_notify(event_notify, NULL, NULL, APR_HOOK_MIDDLE);
 
     ap_hook_pre_connection(event_pre_connection, NULL, NULL, APR_HOOK_REALLY_FIRST);
     ap_hook_protocol_switch(event_protocol_switch, NULL, NULL, APR_HOOK_REALLY_FIRST);

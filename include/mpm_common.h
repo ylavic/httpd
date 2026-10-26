@@ -447,8 +447,19 @@ AP_DECLARE_HOOK(apr_status_t, mpm_resume_suspended, (conn_rec*))
  */
 AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
                 (conn_rec *c, apr_pool_t *p, const apr_array_header_t *pfds,
-                 apr_interval_time_t timeout, ap_mpm_continuation_fn_t *fn,
-                 void *baton))
+                 apr_interval_time_t timeout, ap_mpm_notifier_t *notifier,
+                 ap_mpm_continuation_fn_t *fn, void *baton))
+
+/** Create a notifier for a wait (see ap_mpm_notifier_create())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_create,
+                (ap_mpm_notifier_t **notifier, conn_rec *c, apr_pool_t *p))
+
+/** Notify a wait (see ap_mpm_notify())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(int, mpm_notify, (ap_mpm_notifier_t *notifier))
 
 /**
  * Get MPM name (e.g., "prefork" or "event")

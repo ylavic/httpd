@@ -6639,7 +6639,8 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
         apr_pool_tag(ta->pool, "proxy_tunnel_async");
     }
     rv = ap_mpm_register_wait(r->connection, ta->pool, tunnel->pfds,
-                             ta->timeout, proxy_tunnel_async_continuation, ta);
+                              ta->timeout, NULL, proxy_tunnel_async_continuation,
+                              ta);
     if (rv == APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                       "proxy: %s: tunnel: waiting (async)", tunnel->scheme);

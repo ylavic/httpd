@@ -210,12 +210,16 @@ typedef void (ap_mpm_callback_fn_t)(void *baton);
 
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c);
-/** Why a suspended request is resumed by the MPM (ap_mpm_register_wait()) */
+/** The result of a wait (ap_mpm_register_wait()), given to its continuation */
 typedef enum {
-    AP_MPM_WAIT_READY,    /**< Some of the pfds are ready (their rtnevents set) */
+    AP_MPM_WAIT_READY,    /**< Some of the pfds are ready (rtnevents set) */
     AP_MPM_WAIT_TIMEOUT,  /**< The wait timed out */
-    AP_MPM_WAIT_ERROR     /**< The MPM could not wait (e.g. pollset failure) */
+    AP_MPM_WAIT_ERROR,    /**< The MPM could not wait (e.g. pollset failure) */
+    AP_MPM_WAIT_NOTIFIED  /**< The wait was notified (ap_mpm_notify()) */
 } ap_mpm_wait_result_e;
+
+/** Notifies a suspended wait from any thread (ap_mpm_notifier_create()) */
+typedef struct ap_mpm_notifier_t ap_mpm_notifier_t;
 
 /**
  * The continuation of a suspended request, called by the MPM on a worker
@@ -236,17 +240,20 @@ typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
                                         void *baton);
 
 /**
- * Suspend the processing of a request until some pfds are ready, or a timeout.
+ * Suspend the processing of a request until some pfds are ready, its
+ * notifier is notified, or a timeout.
  * @param c The connection
  * @param p The pool to allocate the wait from; the pfds are removed from the
  * MPM when this pool is cleared or destroyed
- * @param pfds The apr_pollfd_t to wait for (their client_data is used by the MPM)
+ * @param pfds The apr_pollfd_t to wait for (their client_data is used by the
+ * MPM), possibly none (NULL or empty)
  * @param timeout The timeout of the wait, or -1 for none
+ * @param wakeup The wakeup of the wait (ap_mpm_notifier_create()), or NULL
  * @param fn The continuation called by the MPM when the wait completes
  * @param baton The baton passed to @a fn
  * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
  * AP_MPMQ_CAN_REGISTER_WAIT) or the connection isn't handled by the MPM,
- * or an error.
+ * APR_EINVAL if nothing could complete the wait, or an error.
  * @remark It can be called from a handler (which then returns SUSPENDED), or
  * from the continuation of a previous wait. Either way the MPM arms the
  * wait once no thread is processing the connection anymore, so @a fn can't
@@ -256,10 +263,36 @@ typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
  * rtnevents, and can register a wait again for the others.
  */
 AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
-                                             const apr_array_header_t *pfds,
-                                             apr_interval_time_t timeout,
-                                             ap_mpm_continuation_fn_t *fn,
-                                             void *baton);
+                                              const apr_array_header_t *pfds,
+                                              apr_interval_time_t timeout,
+                                              ap_mpm_notifier_t *notifier,
+                                              ap_mpm_continuation_fn_t *fn,
+                                              void *baton);
+
+/**
+ * Create a notifier for the next wait of a request (ap_mpm_register_wait()).
+ * @param notifier The created notifier
+ * @param c The connection
+ * @param p The pool to allocate the notifier from, which must outlive the wait
+ * @return APR_SUCCESS, or APR_ENOTIMPL if the MPM doesn't support notifiers
+ * or the connection isn't handled by the MPM
+ * @remark A notifier serves a single wait. It can be notified before the
+ * wait is registered or armed: the wait then completes as soon as it is
+ * armed, so nothing is lost between the creation and the wait.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
+                                                conn_rec *c, apr_pool_t *p);
+
+/**
+ * Notify a wait, from any thread: its continuation runs with
+ * AP_MPM_WAIT_NOTIFIED.
+ * @param notifier The notifier
+ * @remark Once the wait has completed (its continuation called for
+ * whatever reason) this does nothing. The caller must ensure that
+ * @a notifier is not used after its pool is cleared or destroyed, e.g. by
+ * notifying it and canceling the reason to notify it under the same lock.
+ */
+AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier);
 
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(
