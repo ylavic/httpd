@@ -6710,7 +6710,29 @@ typedef struct {
     apr_interval_time_t timeout;
     ap_proxy_tunnel_done_fn *done;
     void *baton;
+    int kept; /* the MPM keeps the pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
 } proxy_tunnel_async_t;
+
+/* The tunnel's sockets are kept registered in the MPM across its waits
+ * (both live as long as the tunnel), until released here: before they are
+ * given up, i.e. before the done callback (which releases the backend
+ * connection) or tunneling synchronously.
+ */
+static void proxy_tunnel_async_release(proxy_tunnel_async_t *ta)
+{
+    if (ta->kept) {
+        proxy_tunnel_rec *tunnel = ta->tunnel;
+        apr_status_t rv;
+
+        rv = ap_mpm_release_pfds(tunnel->pfds);
+        if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, tunnel->r, APLOGNO()
+                          "proxy: %s: tunnel: releasing the MPM's pollfds "
+                          "failed", tunnel->scheme);
+        }
+        ta->kept = 0;
+    }
+}
 
 static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
                                             ap_mpm_wait_result_e why,
@@ -6742,16 +6764,19 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
         apr_pool_tag(ta->pool, "proxy_tunnel_async");
     }
     rv = ap_mpm_register_wait(r->connection, ta->pool, tunnel->pfds,
-                              ta->timeout, NULL, 0,
+                              ta->timeout, NULL, AP_MPM_WAIT_KEEP_PFDS,
                               proxy_tunnel_async_continuation, ta);
     if (rv == APR_SUCCESS) {
+        ta->kept = 1;
         ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                      "proxy: %s: tunnel: waiting (async)", tunnel->scheme);
+                      "proxy: %s: tunnel: waiting (async)",
+                      tunnel->scheme);
         return SUSPENDED;
     }
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                   "proxy: %s: can't tunnel asynchronously", tunnel->scheme);
 
+    proxy_tunnel_async_release(ta);
     tunnel->timeout = ta->timeout;
     return ap_proxy_tunnel_run(tunnel);
 }
@@ -6792,6 +6817,7 @@ static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
         break;
     }
 
+    proxy_tunnel_async_release(ta);
     if (ta->pool) {
         apr_pool_destroy(ta->pool);
         ta->pool = NULL;

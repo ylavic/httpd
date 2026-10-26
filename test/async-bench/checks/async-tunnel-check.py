@@ -363,7 +363,7 @@ for mode in os.environ.get("MODES", "sync default async wstunnel connect").split
         s.close()
         check(mode, "backend closes: client sees it", b == b"" and took < 2, "%.2fs" % took)
 
-        # 2MB to a slow reader (the tunnel waits for the client to take
+        # 2MB to a slow reader (the tunnel waits when the client takes no
         # output): a small receive buffer, 16KB read every 20ms
         before = errlog("tunnel: waiting (async)")
         s, ok, rest = upgrade("%s-big" % mode, "big", rcvbuf=16384)
