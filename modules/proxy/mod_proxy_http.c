@@ -931,9 +931,26 @@ static int proxy_http_request_read_body(proxy_http_req_t *req)
             return HTTP_REQUEST_TIME_OUT;
         }
 
-        /* Nothing from the client yet: let the filters release what they
-         * hold towards the backend without blocking (WC), then wait for the
-         * backend to take what's pending if any, otherwise for the client.
+        /* Nothing from the client yet: if it waits for a 100 Continue, send
+         * it as HTTP_IN does on a blocking read only (not to send it before
+         * the backend agrees with 100-continue, which is done by now), or the
+         * client and we would wait for each other.
+         */
+        if (r->expecting_100 && r->proto_num >= HTTP_VERSION(1,1)
+            && !(r->eos_sent || r->bytes_sent)
+            && ap_is_HTTP_SUCCESS(r->status)) {
+            int saved_status = r->status;
+            const char *saved_status_line = r->status_line;
+            r->status = HTTP_CONTINUE;
+            r->status_line = NULL;
+            ap_send_interim_response(r, 0);
+            r->status_line = saved_status_line;
+            r->status = saved_status;
+        }
+
+        /* Let the filters release what they hold towards the backend without
+         * blocking (WC), then wait for the backend to take what's pending if
+         * any, otherwise for the client.
          */
         apr_brigade_cleanup(bb);
         APR_BRIGADE_INSERT_TAIL(bb, ap_bucket_wc_create(bb->bucket_alloc));
