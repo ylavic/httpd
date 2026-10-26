@@ -341,6 +341,7 @@ typedef struct {
      */
     apr_array_header_t *head_lines;
     int head_next;
+    int head_final_idx; /* where the final head's lines start */
     ap_getline_state_t *head_state;
     apr_bucket_brigade *head_bb;
 
@@ -368,6 +369,7 @@ typedef struct {
                  head_interim           :1,
                  head_continue          :1,
                  head_stray             :1,
+                 head_final             :1, /* the final head is pre-read */
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
@@ -673,6 +675,12 @@ static int proxy_http_response_preread(proxy_http_req_t *req)
     apr_size_t size = HUGE_STRING_LEN;
     int nonblock = AP_GETLINE_NONBLOCK;
 
+    if (req->head_final) {
+        /* Pre-read already (and the body sent before its processing, see
+         * send_continue_body_before_final()), what follows is its body.
+         */
+        return OK;
+    }
     if (backend->worker->s->response_field_size_set) {
         size = backend->worker->s->response_field_size;
     }
@@ -738,6 +746,9 @@ static int proxy_http_response_preread(proxy_http_req_t *req)
             req->head_interim = (status >= 100 && status < 200);
             req->head_continue = (status == 100);
             req->head_in_headers = 1;
+            if (!req->head_interim) {
+                req->head_final_idx = req->head_lines->nelts - 1;
+            }
         }
         else if (hl->len == 0) {
             /* End of a head: another one follows an interim response, but
@@ -752,6 +763,7 @@ static int proxy_http_response_preread(proxy_http_req_t *req)
                 }
                 continue;
             }
+            req->head_final = 1;
             return OK;
         }
     }
@@ -1457,6 +1469,63 @@ static int send_continue_body(proxy_http_req_t *req)
     return status;
 }
 
+/* With 100-continue pending, the backend may answer a final response instead
+ * of the 100 Continue and keep the connection, reading (and discarding) the
+ * body (RFC 9110 10.1.1), which must then be sent for the connection to be
+ * reused, before the response is processed. When that final head is pre-read
+ * (proxy_http_response_preread()) and the client doesn't wait for a 100 itself
+ * (its body is read then), send the body without blocking first, then the
+ * processing has nothing more to send (it sends the body itself otherwise, see
+ * ap_proxy_http_process_response()). Returns OK, SUSPENDED
+ * (proxy_http_request_forward_continuation() continues, then
+ * proxy_http_request_sent()) or an error.
+ */
+static int send_continue_body_before_final(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    const proxy_head_line_t *hl;
+    int i, keepalive = 0;
+
+    if (!req->do_100_continue || !req->head_final || r->expecting_100) {
+        return OK;
+    }
+
+    /* Does the backend keep the connection: HTTP/1.1+ without
+     * "Connection: close" (the head ends with its empty line)?
+     */
+    hl = &APR_ARRAY_IDX(req->head_lines, req->head_final_idx,
+                        proxy_head_line_t);
+    if (apr_date_checkmask(hl->line, "HTTP/#.# ###*")
+        && hl->line[5] == '1' && hl->line[7] >= '1') {
+        keepalive = 1;
+        for (i = req->head_final_idx + 1; i < req->head_lines->nelts; i++) {
+            const char *val;
+
+            hl = &APR_ARRAY_IDX(req->head_lines, i, proxy_head_line_t);
+            if (strncasecmp(hl->line, "Connection:", 11) != 0) {
+                continue;
+            }
+            val = hl->line + 11;
+            if (ap_find_token(r->pool, val, "close")) {
+                keepalive = 0;
+                break;
+            }
+        }
+    }
+    if (!keepalive) {
+        /* Not sent: ap_proxy_http_process_response() then closes the
+         * backend connection (in either mode), not reusable without it.
+         */
+        return OK;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                  "HTTP: final response instead of 100 Continue, sending "
+                  "the body before processing it");
+    req->do_100_continue = 0;
+    return send_continue_body(req);
+}
+
 static int ap_proxy_http_request(proxy_http_req_t *req)
 {
     int rv;
@@ -2121,7 +2190,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     proxy_worker *worker = req->worker;
     proxy_conn_rec *backend = req->backend;
     conn_rec *origin = req->origin;
-    int do_100_continue = req->do_100_continue;
+    int do_100_continue;
     int status;
 
     char *buffer;
@@ -2146,6 +2215,15 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     apr_interval_time_t old_timeout = 0;
     proxy_dir_conf *dconf = req->dconf;
     int proxy_status = OK;
+
+    /* A final response instead of the 100 Continue may need the body to be
+     * sent before processing it, without blocking.
+     */
+    status = send_continue_body_before_final(req);
+    if (status != OK) {
+        return status; /* SUSPENDED included */
+    }
+    do_100_continue = req->do_100_continue;
 
     bb = apr_brigade_create(p, c->bucket_alloc);
     pass_bb = apr_brigade_create(p, c->bucket_alloc);
@@ -2580,10 +2658,17 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
              * Nor if the client waits for a 100 Continue (end-to-end), which
              * won't come with a final response: its body can't be read, so
              * the backend connection is closed instead (below).
+             *
+             * When async, a final response keeping the connection had the
+             * body sent before its processing, its head pre-read
+             * (send_continue_body_before_final(), then this is not reached);
+             * were the head not pre-read, the backend connection would be
+             * closed too rather than sending the body blocking.
              */
             int do_send_body = (proxy_status == HTTP_CONTINUE
                                 || (!toclose && major > 0 && minor > 0
-                                    && !r->expecting_100));
+                                    && !r->expecting_100
+                                    && !req->send_async));
 
             /* Reset to old timeout iff we've adjusted it. */
             if (worker->s->ping_timeout_set) {
@@ -2626,14 +2711,10 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                         return proxy_http_request_sent(req);
                     }
                 }
-                else {
-                    /* A final response with the backend keeping the
-                     * connection (and the client not waiting for a 100):
-                     * send the body before processing it (blocking, this rare
-                     * case would need processing the response to suspend).
-                     */
-                    req->send_async = 0;
-                }
+                /* Otherwise a final response with the backend keeping the
+                 * connection (and the client not waiting for a 100), when
+                 * blocking: send the body before processing it.
+                 */
                 status = send_continue_body(req);
                 if (status != OK) {
                     return status;
