@@ -21,8 +21,8 @@ INTERVAL = os.environ.get("INTERVAL", "1s")
 SIZE = os.environ.get("SIZE", "64")
 DELAY = os.environ.get("DELAY", "0")
 
-# Each tunnel takes 2 fds of the pollset (sized ThreadsPerChild times the factor)
-CONF = CONF.replace("AsyncRequestWorkerFactor 16", "AsyncRequestWorkerFactor 4000")
+# The tunnels all connect at start: don't let the admission's backstop refuse them
+CONF = CONF.replace("AsyncAdmissionBacklogPerThread 16", "AsyncAdmissionBacklogPerThread 4000")
 CONF = CONF.replace('<Location "/b">', """<Location "/t">
     ProxyPass "http://127.0.0.1:{back}/t" upgrade=echo max=20000 timeout=30
     ProxyAsyncDelay {delay}

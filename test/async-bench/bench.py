@@ -96,7 +96,7 @@ ThreadsPerChild 8
 MaxRequestWorkers 8
 MinSpareThreads 1
 MaxSpareThreads 8
-AsyncRequestWorkerFactor 16
+AsyncAdmissionBacklogPerThread 16
 KeepAlive On
 MaxKeepAliveRequests 0
 KeepAliveTimeout 30

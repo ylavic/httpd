@@ -4,7 +4,7 @@ included) and the server's backlog stats (mpm_event's "backlog sojourn"
 lines) aggregated over the measured window, with httpd's CPU use.
 
 usage: python3 -I queue.py HTTPD_PREFIX APTEST_SO WORKDIR [scenario...]
-env: CONF_EXTRA (appended to the httpd.conf, e.g. "AsyncRequestWorkerFactor 4"),
+env: CONF_EXTRA (appended to the httpd.conf, e.g. "AsyncAdmissionBacklogPerThread 4"),
 THREADS (the threads per child of the scenarios not setting theirs, 4 by
 default), FLOOD (the flood's query in the "progress" scenario, "cpu=1" by
 default)
