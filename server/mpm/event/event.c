@@ -741,7 +741,10 @@ struct ap_mpm_notifier_t {
  * complete the waits (under notifiers_mutex).
  */
 static apr_thread_mutex_t *notifiers_mutex;
-static APR_RING_HEAD(notified_user_waits_t, ap_mpm_notifier_t) notified_user_waits;
+/* Allocated (pruntime): a static head makes APR_RING_SENTINEL() point before
+ * a static object, which compilers flag (-Warray-bounds)
+ */
+static APR_RING_HEAD(notified_user_waits_t, ap_mpm_notifier_t) *notified_user_waits;
 
 typedef struct event_child_bucket {
     ap_pod_t *pod;
@@ -2653,7 +2656,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         apr_thread_mutex_lock(notifiers_mutex);
         notifier->armed = 1;
         if (notifier->notified) {
-            APR_RING_INSERT_TAIL(&notified_user_waits, notifier,
+            APR_RING_INSERT_TAIL(notified_user_waits, notifier,
                                  ap_mpm_notifier_t, link);
             notifier->queued = 1;
             wake = 1;
@@ -2720,7 +2723,7 @@ static int event_notify(ap_mpm_notifier_t *notifier)
     apr_thread_mutex_lock(notifiers_mutex);
     notifier->notified = 1;
     if (notifier->armed && !notifier->queued) {
-        APR_RING_INSERT_TAIL(&notified_user_waits, notifier, ap_mpm_notifier_t,
+        APR_RING_INSERT_TAIL(notified_user_waits, notifier, ap_mpm_notifier_t,
                              link);
         notifier->queued = 1;
         wake = 1;
@@ -4179,10 +4182,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          * away while its notifier is queued.
          */
         apr_thread_mutex_lock(notifiers_mutex);
-        while (!APR_RING_EMPTY(&notified_user_waits, ap_mpm_notifier_t, link)) {
+        while (!APR_RING_EMPTY(notified_user_waits, ap_mpm_notifier_t, link)) {
             ap_mpm_notifier_t *notifier;
             struct user_wait *user_wait;
-            notifier = APR_RING_FIRST(&notified_user_waits);
+            notifier = APR_RING_FIRST(notified_user_waits);
             APR_RING_REMOVE(notifier, link);
             notifier->queued = 0;
             user_wait = notifier->wait;
@@ -4644,7 +4647,8 @@ static void setup_threads_runtime(void)
                      "creation of the notifiers mutex failed.");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
-    APR_RING_INIT(&notified_user_waits, ap_mpm_notifier_t, link);
+    notified_user_waits = apr_palloc(pruntime, sizeof(*notified_user_waits));
+    APR_RING_INIT(notified_user_waits, ap_mpm_notifier_t, link);
 
     /* Create the main pollset with a good method. APR_POLLSET_WAKEABLE is
      * required (any method implements it with APR >= 1.4), we account for
