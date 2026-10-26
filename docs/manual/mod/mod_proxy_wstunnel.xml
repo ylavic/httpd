@@ -147,13 +147,13 @@ WebSocket always happens.
 </contextlist>
 
 <usage>
-    <p>If <directive>ProxyWebsocketAsync</directive> is enabled, this directive
-    controls how long the server synchronously waits for more data. The timeout
-    is considered in seconds by default, but it is possible to increase
-    the time resolution to milliseconds adding the <em>ms</em> suffix.</p>
-
-    <note><title>Note</title><p>Async support is experimental and subject
-    to change. </p></note>
+    <p>This directive has no effect anymore: the tunnel never waits
+    synchronously for data when the MPM can wait for it (e.g.
+    <module>event</module>), it forwards what is available on either side,
+    then the MPM waits for more without holding a worker thread (with
+    <directive module="mod_proxy_wstunnel">ProxyWebsocketIdleTimeout</directive>).
+    Otherwise, as for an HTTP/2 stream's connection, the whole tunneling
+    happens synchronously.</p>
 
 </usage>
 </directivesynopsis>
