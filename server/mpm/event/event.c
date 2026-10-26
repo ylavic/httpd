@@ -2701,6 +2701,20 @@ static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
  * that a kept pfd outside of a wait fires once only (worker_poll implies
  * them).
  */
+/* Whether the kept pfds are edge-triggered (APR_POLLET, epoll and kqueue,
+ * with EVENT_WORKER_NOTIFY), else one-shot: an edge-triggered one is never
+ * re-armed, but one that fired since its last wait is checked (poll()) when
+ * a wait arms it, since its user may have stopped reading or writing before
+ * EAGAIN, and no edge would come for what's pending (arm_kept_pfd()).
+ */
+static int kept_pfds_et;
+
+/* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
+ * nothing remains to remove from conn_pollset: not with kqueue, a filter per
+ * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
+ */
+static int oneshot_disarms_fd = 1;
+
 static APR_INLINE int kept_pfds_enabled(void)
 {
 #ifdef APR_POLLONESHOT
@@ -2860,6 +2874,56 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                                  apr_int16_t *rtnevents)
 {
     kept->wait = user_wait;
+#ifdef APR_POLLET
+    if (kept_pfds_et && rtnevents && kept->pfd.reqevents == reqevents) {
+        /* Edge-triggered, still registered for these events: no re-arm */
+        for (;;) {
+            apr_uint32_t state = apr_atomic_read32(&kept->state);
+            if (state == KEPT_IDLE) {
+                /* Nothing since its last wait (an edge would be latched) */
+                if (apr_atomic_cas32(&kept->state, KEPT_WAITED,
+                                     KEPT_IDLE) == KEPT_IDLE) {
+                    return APR_SUCCESS;
+                }
+            }
+            else if (state == KEPT_READY && (kept->latched & reqevents)) {
+                if (apr_atomic_cas32(&kept->state, KEPT_FIRED,
+                                     KEPT_READY) == KEPT_READY) {
+                    *rtnevents = kept->latched & reqevents;
+                    return APR_SUCCESS;
+                }
+            }
+            else if (state == KEPT_READY || state == KEPT_FIRED) {
+                /* Fired since its last wait (or ready for other events):
+                 * marked waited first, so that an edge from now on fires
+                 * it, then checked below.
+                 */
+                if (apr_atomic_cas32(&kept->state, KEPT_WAITED,
+                                     state) == state) {
+                    break;
+                }
+            }
+            else {
+                break; /* can't be (KEPT_NEW or KEPT_WAITED) */
+            }
+        }
+        {
+            apr_pollfd_t pfd = kept->pfd;
+            apr_int32_t n = 0;
+            pfd.reqevents = reqevents & ~APR_POLLET;
+            pfd.rtnevents = 0;
+            if (apr_poll(&pfd, 1, &n, 0) == APR_SUCCESS && n && pfd.rtnevents
+                && apr_atomic_cas32(&kept->state, KEPT_FIRED,
+                                    KEPT_WAITED) == KEPT_WAITED) {
+                /* Ready already: the caller completes the wait (unless an
+                 * edge claimed it meanwhile, then the event does)
+                 */
+                *rtnevents = pfd.rtnevents;
+            }
+        }
+        return APR_SUCCESS;
+    }
+#endif
     if (kept->pfd.reqevents == reqevents
         && apr_atomic_cas32(&kept->state, KEPT_WAITED,
                             KEPT_IDLE) == KEPT_IDLE) {
@@ -2905,6 +2969,20 @@ static struct user_wait *kept_pfd_fired(struct kept_pfd *kept,
                                  KEPT_IDLE) == KEPT_IDLE) {
                 return NULL;
             }
+        }
+        else if (kept_pfds_et && state == KEPT_FIRED) {
+            /* Edge-triggered, a new edge while its wait is completed:
+             * remembered for the next wait.
+             */
+            kept->latched = rtnevents;
+            if (apr_atomic_cas32(&kept->state, KEPT_READY,
+                                 KEPT_FIRED) == KEPT_FIRED) {
+                return NULL;
+            }
+        }
+        else if (kept_pfds_et && state == KEPT_READY) {
+            kept->latched |= rtnevents; /* remembered already */
+            return NULL;
         }
         else {
             /* Not armed (stale event after a release or a re-arm) */
@@ -3036,12 +3114,6 @@ static void notifier_wait_done(ap_mpm_notifier_t *notifier)
     notifier->done = 1;
     apr_thread_mutex_unlock(notifiers_mutex);
 }
-
-/* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
- * nothing remains to remove from conn_pollset: not with kqueue, a filter per
- * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
- */
-static int oneshot_disarms_fd = 1;
 
 static apr_status_t user_wait_cleanup(void *data)
 {
@@ -3220,7 +3292,12 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
                 kept = make_kept_pfd(cs, pfd);
             }
             if (kept) {
-                apr_int16_t *rtnevents = NULL;
+                apr_int16_t events = pfd->reqevents, *rtnevents = NULL;
+#ifdef APR_POLLET
+                if (kept_pfds_et) {
+                    events = (events & ~APR_POLLONESHOT) | APR_POLLET;
+                }
+#endif
 #ifdef EVENT_WORKER_NOTIFY
                 /* A readiness remembered for it completes the wait right
                  * away (below), by this polling worker.
@@ -3230,7 +3307,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
                 }
 #endif
                 pfd->client_data = NULL;
-                rc = arm_kept_pfd(kept, user_wait, pfd->reqevents, rtnevents);
+                rc = arm_kept_pfd(kept, user_wait, events, rtnevents);
                 if (rc != APR_SUCCESS) {
                     final_rc = rc;
                 }
@@ -5880,6 +5957,11 @@ static void setup_threads_runtime(void)
         if (rv == APR_SUCCESS) {
             conn_pollset = ps;
             worker_poll = 1;
+#if defined(APR_POLLET) && defined(EVENT_WORKER_NOTIFY)
+            /* Edge-triggered kept pfds where APR supports them */
+            kept_pfds_et = (strcmp(apr_pollset_method_name(ps), "epoll") == 0
+                            || strcmp(apr_pollset_method_name(ps), "kqueue") == 0);
+#endif
         }
         else {
             ap_log_error(APLOG_MARK, APLOG_WARNING, rv, ap_server_conf,
