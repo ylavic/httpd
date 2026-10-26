@@ -1268,13 +1268,17 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
  * ap_proxy_connect_backend_ex()
  */
 typedef struct {
-    apr_socket_t *sock;          /* The connecting socket, to poll for
-                                  * APR_POLLOUT */
-    apr_interval_time_t timeout; /* The connect timeout for the poll */
+    apr_socket_t *sock;          /* The connecting socket, to poll for events */
+    apr_int16_t events;          /* What to poll sock for: APR_POLLOUT while
+                                  * connecting, either direction during a
+                                  * CONNECT exchange with a forward proxy */
+    apr_interval_time_t timeout; /* The timeout for the poll */
     apr_status_t status;         /* Set by the caller to fail the attempt
                                   * (e.g. APR_TIMEUP), else APR_SUCCESS */
     apr_sockaddr_t *addr;        /* (opaque) the address being connected */
     int did_dns_lookup;          /* (opaque) */
+    void *exchange;              /* (opaque) the CONNECT exchange with a
+                                  * forward proxy, in progress */
 } ap_proxy_connect_state;
 
 /**
@@ -1285,13 +1289,14 @@ typedef struct {
  * @param s       current server record
  * @param state   NULL to block as ap_proxy_connect_backend() does; otherwise
  *                zeroed for a new connection, or as left by a call that
- *                returned SUSPENDED, to complete the connect once
- *                state->sock is writable (or, after state->timeout, with
- *                state->status set to APR_TIMEUP)
+ *                returned SUSPENDED, to continue the connect once
+ *                state->sock is ready for state->events (or, after
+ *                state->timeout, with state->status set to APR_TIMEUP)
  * @return        OK, SUSPENDED if the connect is in progress, or DECLINED
- * @note The connect still blocks for Unix Domain Sockets and through a
- * forward proxy (HTTP CONNECT). A caller giving up on a SUSPENDED connect
- * must call ap_proxy_connect_backend_cancel().
+ * @note Through a forward proxy (HTTP CONNECT), the connect is in progress
+ * until the proxy's reply to the CONNECT is read. The connect still blocks
+ * for Unix Domain Sockets. A caller giving up on a SUSPENDED connect must
+ * call ap_proxy_connect_backend_cancel().
  */
 PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
                                                proxy_conn_rec *conn,

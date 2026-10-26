@@ -3046,7 +3046,7 @@ static int proxy_http_connect(proxy_http_req_t *req)
         pfd.p = r->pool;
         pfd.desc_type = APR_POLL_SOCKET;
         pfd.desc.s = req->connect.sock;
-        pfd.reqevents = APR_POLLOUT;
+        pfd.reqevents = req->connect.events;
         nready = 0;
         if (delay >= req->connect.timeout) {
             delay = req->connect.timeout;
@@ -3074,7 +3074,7 @@ static int proxy_http_connect(proxy_http_req_t *req)
     ppfd->p = req->async_pool;
     ppfd->desc_type = APR_POLL_SOCKET;
     ppfd->desc.s = req->connect.sock;
-    ppfd->reqevents = APR_POLLOUT;
+    ppfd->reqevents = req->connect.events;
     rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
                              req->connect.timeout, proxy_http_connect_continuation,
                              req);
@@ -3090,7 +3090,7 @@ static int proxy_http_connect(proxy_http_req_t *req)
             pfd.p = r->pool;
             pfd.desc_type = APR_POLL_SOCKET;
             pfd.desc.s = req->connect.sock;
-            pfd.reqevents = APR_POLLOUT;
+            pfd.reqevents = req->connect.events;
             nready = 0;
             rv = apr_poll(&pfd, 1, &nready, req->connect.timeout);
             if (APR_STATUS_IS_TIMEUP(rv)) {

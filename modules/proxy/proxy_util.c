@@ -3729,76 +3729,129 @@ PROXY_DECLARE(int) ap_proxy_is_socket_connected(apr_socket_t *sock)
 #endif /* USE_ALTERNATE_IS_CONNECTED */
 
 
+/* A CONNECT exchange with a remote proxy, possibly in progress (see
+ * send_http_connect()).
+ */
+typedef struct {
+    char buffer[HUGE_STRING_LEN]; /* the request, then the reply's head */
+    apr_size_t len;               /* the request's length, then the reply's */
+    apr_size_t sent;              /* how much of the request was sent */
+    int started;                  /* the request is built */
+    int receiving;                /* the request is sent, read the reply */
+    int draining;                 /* the reply's head didn't fit the buffer */
+    char tail[3];                 /* the last bytes read while draining */
+    apr_size_t tail_len;
+} proxy_connect_exchange;
+
 /*
- * Send a HTTP CONNECT request to a remote proxy.
+ * Send a HTTP CONNECT request to a remote proxy and read its reply.
  * The proxy is given by "backend", the target server
  * is contained in the "forward" member of "backend".
+ * With a nonblocking socket, returns APR_EAGAIN (or an error) when the socket
+ * isn't ready for *events, to be called again with the same x then.
  */
 static apr_status_t send_http_connect(proxy_conn_rec *backend,
-                                      server_rec *s)
+                                      server_rec *s,
+                                      proxy_connect_exchange *x,
+                                      apr_int16_t *events)
 {
     int status;
     apr_size_t nbytes;
-    apr_size_t left;
-    int complete = 0;
-    char buffer[HUGE_STRING_LEN];
-    char drain_buffer[HUGE_STRING_LEN];
+    char *buffer = x->buffer;
     remote_connect_info *connect_info = backend->forward;
-    int len = 0;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00948)
-                 "CONNECT: sending the CONNECT request for %s:%d "
-                 "to the remote proxy %pI (%s)",
-                 connect_info->target_host, connect_info->target_port,
-                 backend->addr, backend->hostname);
-    /* Create the CONNECT request */
-    nbytes = apr_snprintf(buffer, sizeof(buffer),
-                          "CONNECT %s:%d HTTP/1.0" CRLF,
-                          connect_info->target_host, connect_info->target_port);
-    /* Add proxy authorization from the configuration, or initial
-     * request if necessary */
-    if (connect_info->proxy_auth != NULL) {
-        nbytes += apr_snprintf(buffer + nbytes, sizeof(buffer) - nbytes,
-                               "Proxy-Authorization: %s" CRLF,
-                               connect_info->proxy_auth);
+    if (!x->started) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00948)
+                     "CONNECT: sending the CONNECT request for %s:%d "
+                     "to the remote proxy %pI (%s)",
+                     connect_info->target_host, connect_info->target_port,
+                     backend->addr, backend->hostname);
+        /* Create the CONNECT request */
+        nbytes = apr_snprintf(buffer, sizeof(x->buffer),
+                              "CONNECT %s:%d HTTP/1.0" CRLF,
+                              connect_info->target_host,
+                              connect_info->target_port);
+        /* Add proxy authorization from the configuration, or initial
+         * request if necessary */
+        if (connect_info->proxy_auth != NULL) {
+            nbytes += apr_snprintf(buffer + nbytes, sizeof(x->buffer) - nbytes,
+                                   "Proxy-Authorization: %s" CRLF,
+                                   connect_info->proxy_auth);
+        }
+        /* Set a reasonable agent and send everything */
+        nbytes += apr_snprintf(buffer + nbytes, sizeof(x->buffer) - nbytes,
+                               "Proxy-agent: %s" CRLF CRLF,
+                               ap_get_server_banner());
+        ap_xlate_proto_to_ascii(buffer, nbytes);
+        x->len = nbytes;
+        x->sent = 0;
+        x->started = 1;
     }
-    /* Set a reasonable agent and send everything */
-    nbytes += apr_snprintf(buffer + nbytes, sizeof(buffer) - nbytes,
-                           "Proxy-agent: %s" CRLF CRLF,
-                           ap_get_server_banner());
-    ap_xlate_proto_to_ascii(buffer, nbytes);
-    apr_socket_send(backend->sock, buffer, &nbytes);
-
-    /* Receive the whole CONNECT response */
-    left = sizeof(buffer) - 1;
-    /* Read until we find the end of the headers or run out of buffer */
-    do {
-        nbytes = left;
-        status = apr_socket_recv(backend->sock, buffer + len, &nbytes);
-        len += nbytes;
-        left -= nbytes;
-        buffer[len] = '\0';
-        if (strstr(buffer + len - nbytes, CRLF_ASCII CRLF_ASCII) != NULL) {
-            ap_xlate_proto_from_ascii(buffer, len);
-            complete = 1;
+    while (!x->receiving) {
+        nbytes = x->len - x->sent;
+        status = apr_socket_send(backend->sock, buffer + x->sent, &nbytes);
+        x->sent += nbytes;
+        if (x->sent == x->len) {
+            x->receiving = 1;
+            x->len = 0;
             break;
         }
-    } while (status == APR_SUCCESS && left > 0);
-    /* Drain what's left */
-    if (!complete) {
-        nbytes = sizeof(drain_buffer) - 1;
-        while (status == APR_SUCCESS && nbytes) {
-            status = apr_socket_recv(backend->sock, drain_buffer, &nbytes);
-            drain_buffer[nbytes] = '\0';
-            nbytes = sizeof(drain_buffer) - 1;
-            if (strstr(drain_buffer, CRLF_ASCII CRLF_ASCII) != NULL) {
-                break;
-            }
+        if (status != APR_SUCCESS) {
+            *events = APR_POLLOUT;
+            return status;
         }
     }
 
-    /* Check for HTTP_OK response status */
-    if (status == APR_SUCCESS) {
+    /* Receive the whole CONNECT response: read until we find the end of the
+     * headers or run out of buffer, then drain what's left of them.
+     */
+    for (;;) {
+        if (!x->draining) {
+            nbytes = sizeof(x->buffer) - 1 - x->len;
+            status = apr_socket_recv(backend->sock, buffer + x->len, &nbytes);
+            if (nbytes) {
+                apr_size_t from = x->len >= 3 ? x->len - 3 : 0;
+                x->len += nbytes;
+                buffer[x->len] = '\0';
+                if (strstr(buffer + from, CRLF_ASCII CRLF_ASCII) != NULL) {
+                    ap_xlate_proto_from_ascii(buffer, x->len);
+                    break;
+                }
+                if (x->len == sizeof(x->buffer) - 1) {
+                    x->draining = 1;
+                    memcpy(x->tail, buffer + x->len - 3, 3);
+                    x->tail_len = 3;
+                }
+            }
+        }
+        else {
+            char drain_buffer[HUGE_STRING_LEN];
+            nbytes = sizeof(drain_buffer) - 1 - 3;
+            status = apr_socket_recv(backend->sock, drain_buffer + 3, &nbytes);
+            if (nbytes) {
+                /* The end of the headers may straddle two reads */
+                memcpy(drain_buffer + 3 - x->tail_len, x->tail, x->tail_len);
+                drain_buffer[3 + nbytes] = '\0';
+                if (strstr(drain_buffer + 3 - x->tail_len,
+                           CRLF_ASCII CRLF_ASCII) != NULL) {
+                    break;
+                }
+                x->tail_len = nbytes < 3 ? nbytes : 3;
+                memcpy(x->tail, drain_buffer + 3 + nbytes - x->tail_len,
+                       x->tail_len);
+            }
+        }
+        if (status != APR_SUCCESS) {
+            *events = APR_POLLIN;
+            return status;
+        }
+    }
+
+    /* Check for HTTP_OK response status (a reply that can't be parsed goes
+     * on, as it always did)
+     */
+    status = APR_SUCCESS;
+    {
         unsigned int major, minor;
         /* Only scan for three character status code */
         char code_str[4];
@@ -3986,6 +4039,7 @@ PROXY_DECLARE(void) ap_proxy_connect_backend_cancel(ap_proxy_connect_state *stat
         apr_socket_close(state->sock);
         state->sock = NULL;
     }
+    state->exchange = NULL;
 }
 
 PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
@@ -4001,7 +4055,9 @@ PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
     /* the local address to use for the outgoing connection */
     apr_sockaddr_t *local_addr;
     apr_socket_t *newsock;
-    apr_interval_time_t conn_timeout;
+    apr_interval_time_t conn_timeout, sock_timeout;
+    proxy_connect_exchange local_exchange, *exchange;
+    apr_int16_t events = 0;
     void *sconf = s->module_config;
     int address_reusable = worker->s->is_address_reusable;
     int did_dns_lookup = 0;
@@ -4011,28 +4067,30 @@ PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
     if (state && state->sock) {
         /* Complete the connect in progress (we returned SUSPENDED), or fail
          * it as the caller asked, then go on from connect_done like any
-         * connect (the next address on failure).
+         * connect (the next address on failure). The same for the CONNECT
+         * exchange with a forward proxy, from connect_exchange.
          */
         newsock = state->sock;
         backend_addr = state->addr;
         did_dns_lookup = state->did_dns_lookup;
-        conn_timeout = state->timeout;
+        conn_timeout = sock_timeout = state->timeout;
         state->sock = NULL;
         rv = state->status;
+        if (state->exchange) {
+            conn->sock = newsock;
+            goto connect_exchange;
+        }
         if (rv == APR_SUCCESS) {
             rv = apr_socket_connect(newsock, backend_addr);
         }
         goto connect_done;
     }
-    if (state && (connect_info || conn->uds_path)) {
-        /* Blocking connect for these:
-         * - Unix domain sockets: the connect completes right away unless
-         *   the backend's backlog is full, and a nonblocking connect can't
-         *   portably be waited for then (e.g. on Linux it fails with EAGAIN,
-         *   nothing in progress, and polling the socket returns at once), so
-         *   only the blocking connect waits for room in the backlog.
-         * - Through a forward proxy (CONNECT): not implemented without
-         *   blocking (yet), the CONNECT exchange is blocking.
+    if (state && conn->uds_path) {
+        /* Blocking connect for Unix domain sockets: the connect completes
+         * right away unless the backend's backlog is full, and a nonblocking
+         * connect can't portably be waited for then (e.g. on Linux it fails
+         * with EAGAIN, nothing in progress, and polling the socket returns at
+         * once), so only the blocking connect waits for room in the backlog.
          */
         state = NULL;
     }
@@ -4179,6 +4237,7 @@ connect_done:
                           )) {
                 /* The connect is in progress: the caller waits for it */
                 state->sock = newsock;
+                state->events = APR_POLLOUT;
                 state->addr = backend_addr;
                 state->did_dns_lookup = did_dns_lookup;
                 state->timeout = conn_timeout;
@@ -4238,14 +4297,15 @@ connect_done:
 
         /* Set a timeout on the socket */
         if (worker->s->timeout_set) {
-            apr_socket_timeout_set(newsock, worker->s->timeout);
+            sock_timeout = worker->s->timeout;
         }
         else if (conf->timeout_set) {
-            apr_socket_timeout_set(newsock, conf->timeout);
+            sock_timeout = conf->timeout;
         }
         else {
-             apr_socket_timeout_set(newsock, s->timeout);
+            sock_timeout = s->timeout;
         }
+        apr_socket_timeout_set(newsock, sock_timeout);
 
         conn->sock = newsock;
 
@@ -4254,7 +4314,49 @@ connect_done:
          * sending our actual HTTPS requests.
          */
         if (connect_info) {
-            rv = send_http_connect(conn, s);
+connect_exchange:
+            /* Nonblocking when asked (state): the caller waits for each step
+             * of the exchange with the socket's timeout, which otherwise
+             * applies to the blocking I/O.
+             */
+            if (state) {
+                if (!state->exchange) {
+                    state->exchange = apr_pcalloc(conn->scpool,
+                                                  sizeof(proxy_connect_exchange));
+                }
+                exchange = state->exchange;
+            }
+            else {
+                memset(&local_exchange, 0, sizeof(local_exchange));
+                exchange = &local_exchange;
+            }
+            if (rv == APR_SUCCESS) {
+                if (state) {
+                    apr_socket_timeout_set(newsock, 0);
+                }
+                rv = send_http_connect(conn, s, exchange, &events);
+            }
+            if (state && APR_STATUS_IS_EAGAIN(rv)) {
+                /* The exchange is in progress: the caller waits for it */
+                conn->sock = NULL;
+                state->sock = newsock;
+                state->events = events;
+                state->addr = backend_addr;
+                state->did_dns_lookup = did_dns_lookup;
+                state->timeout = sock_timeout;
+                state->status = APR_SUCCESS;
+                ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
+                             "%s: CONNECT to %s:%hu through %pI (%s:%hu) "
+                             "in progress", proxy_function,
+                             connect_info->target_host,
+                             connect_info->target_port, backend_addr,
+                             conn->hostname, conn->port);
+                return SUSPENDED;
+            }
+            if (state) {
+                state->exchange = NULL;
+                apr_socket_timeout_set(newsock, sock_timeout);
+            }
             /* If an error occurred, loop round and try again */
             if (rv != APR_SUCCESS) {
                 conn->sock = NULL;
