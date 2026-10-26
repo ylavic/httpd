@@ -816,6 +816,7 @@ struct kept_pfd {
     listener_poll_type pt;    /* PT_KEPT, baton = this */
     /*atomic*/ apr_uint32_t state; /* KEPT_* */
     struct user_wait *wait;   /* the wait on it (KEPT_WAITED) */
+    apr_int16_t latched;      /* the rtnevents of KEPT_READY */
     event_conn_state_t *cs;   /* its connection */
     struct kept_anchor *anchor; /* its descriptor's, if any */
 };
@@ -2826,15 +2827,24 @@ static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
 /* Have the wait be on a kept pfd, for reqevents: without a syscall if it's
  * still armed for them, else (re-)armed or added (firing right away if it is
  * still ready). The wait is set before the state, read by the events after.
+ * With rtnevents, a readiness remembered for reqevents is taken instead
+ * (*rtnevents set, the pfd left disarmed): the caller completes the wait.
  */
 static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                                  struct user_wait *user_wait,
-                                 apr_int16_t reqevents)
+                                 apr_int16_t reqevents,
+                                 apr_int16_t *rtnevents)
 {
     kept->wait = user_wait;
     if (kept->pfd.reqevents == reqevents
         && apr_atomic_cas32(&kept->state, KEPT_WAITED,
                             KEPT_IDLE) == KEPT_IDLE) {
+        return APR_SUCCESS;
+    }
+    if (rtnevents && (kept->latched & reqevents)
+        && apr_atomic_cas32(&kept->state, KEPT_FIRED,
+                            KEPT_READY) == KEPT_READY) {
+        *rtnevents = kept->latched & reqevents;
         return APR_SUCCESS;
     }
     /* New, fired, ready (an event raced the CAS above) or other events: an
@@ -2847,23 +2857,45 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
 }
 
 /* An event on a kept pfd: the wait on it, to claim, or NULL if none
- * (the readiness is then remembered for the next wait)
+ * (the readiness is then remembered for the next wait, its rtnevents set
+ * before the state, read by the arm after)
  */
-static struct user_wait *kept_pfd_fired(struct kept_pfd *kept)
+static struct user_wait *kept_pfd_fired(struct kept_pfd *kept,
+                                        apr_int16_t rtnevents)
 {
-    if (apr_atomic_cas32(&kept->state, KEPT_FIRED,
-                         KEPT_WAITED) == KEPT_WAITED) {
-        return kept->wait;
+    /* A wait may arm it (KEPT_IDLE -> KEPT_WAITED) or complete otherwise
+     * (KEPT_WAITED -> KEPT_IDLE) meanwhile: retry on what the CAS found, the
+     * pfd is disarmed so this event must not be lost.
+     */
+    for (;;) {
+        apr_uint32_t state = apr_atomic_read32(&kept->state);
+        if (state == KEPT_WAITED) {
+            if (apr_atomic_cas32(&kept->state, KEPT_FIRED,
+                                 KEPT_WAITED) == KEPT_WAITED) {
+                return kept->wait;
+            }
+        }
+        else if (state == KEPT_IDLE) {
+            kept->latched = rtnevents;
+            if (apr_atomic_cas32(&kept->state, KEPT_READY,
+                                 KEPT_IDLE) == KEPT_IDLE) {
+                return NULL;
+            }
+        }
+        else {
+            /* Not armed (stale event after a release or a re-arm) */
+            return NULL;
+        }
     }
-    (void)apr_atomic_cas32(&kept->state, KEPT_READY, KEPT_IDLE);
-    return NULL;
 }
 
 /* The wait of a fired kept pfd was completed otherwise (claimed by another
  * thread): remember the readiness, unless the next wait re-armed it already.
  */
-static APR_INLINE void kept_pfd_unclaimed(struct kept_pfd *kept)
+static APR_INLINE void kept_pfd_unclaimed(struct kept_pfd *kept,
+                                          apr_int16_t rtnevents)
 {
+    kept->latched = rtnevents;
     (void)apr_atomic_cas32(&kept->state, KEPT_READY, KEPT_FIRED);
 }
 
@@ -3099,6 +3131,9 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
     apr_status_t rc, final_rc = APR_SUCCESS;
     listener_poll_type *pt = &user_wait->pt_buf[user_wait->pfds_cur];
     int i;
+#ifdef EVENT_WORKER_NOTIFY
+    int ready = 0;
+#endif
 
     cs->pub.state = CONN_STATE_SUSPENDED;
     cs->user_wait = user_wait;
@@ -3157,11 +3192,25 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
                 kept = make_kept_pfd(cs, pfd);
             }
             if (kept) {
+                apr_int16_t *rtnevents = NULL;
+#ifdef EVENT_WORKER_NOTIFY
+                /* A readiness remembered for it completes the wait right
+                 * away (below), by this polling worker.
+                 */
+                if (worker_thread_polls) {
+                    rtnevents = &pfd->rtnevents;
+                }
+#endif
                 pfd->client_data = NULL;
-                rc = arm_kept_pfd(kept, user_wait, pfd->reqevents);
+                rc = arm_kept_pfd(kept, user_wait, pfd->reqevents, rtnevents);
                 if (rc != APR_SUCCESS) {
                     final_rc = rc;
                 }
+#ifdef EVENT_WORKER_NOTIFY
+                else if (pfd->rtnevents) {
+                    ready = 1;
+                }
+#endif
                 continue;
             }
 
@@ -3203,6 +3252,25 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         AP_DEBUG_ASSERT(0);
         signal_threads(ST_GRACEFUL);
     }
+#ifdef EVENT_WORKER_NOTIFY
+    else if (ready && claim_user_wait(user_wait)) {
+        /* Some kept pfd was ready already (its rtnevents set): complete the
+         * wait now, queued for this worker which pops it next (the caller
+         * doesn't touch the connection once armed), rather than re-arming
+         * it to have it fire again. Unless completed otherwise meanwhile,
+         * which then reports these rtnevents too.
+         */
+        if (user_wait->continuation.fn) {
+            set_user_continuation(cs, user_wait, AP_MPM_WAIT_READY);
+        }
+        apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
+        cs->user_wait = NULL;
+        if (push2worker(cs, NULL, BACKLOG_CONTINUATION, event_time_now(),
+                        NULL, 1)) {
+            worker_wake_queued = 1;
+        }
+    }
+#endif
     return final_rc;
 }
 
@@ -4772,7 +4840,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                  */
                 if (pt->type == PT_KEPT) {
                     kept = pt->baton;
-                    user_wait = kept_pfd_fired(kept);
+                    user_wait = kept_pfd_fired(kept, out_pfd->rtnevents);
                     if (!user_wait) {
                         break;
                     }
@@ -4787,7 +4855,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      */
                     if (stale || !claim_user_wait(user_wait)) {
                         if (kept) {
-                            kept_pfd_unclaimed(kept);
+                            kept_pfd_unclaimed(kept, out_pfd->rtnevents);
                         }
                         break;
                     }
@@ -5167,13 +5235,13 @@ static event_conn_state_t *worker_poll_one(int slot,
         if (pt->type == PT_KEPT) {
             /* For the wait on it, else remembered for the next */
             kept = pt->baton;
-            user_wait = kept_pfd_fired(kept);
+            user_wait = kept_pfd_fired(kept, out.rtnevents);
             if (!user_wait) {
                 DRAIN_STAT_INC(drain_dropped);
                 break;
             }
             if (!claim_user_wait(user_wait)) {
-                kept_pfd_unclaimed(kept);
+                kept_pfd_unclaimed(kept, out.rtnevents);
                 DRAIN_STAT_INC(drain_dropped);
                 break;
             }
