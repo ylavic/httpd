@@ -312,6 +312,8 @@ typedef struct event_srv_cfg_s event_srv_cfg;
 struct timeout_queue;
 static apr_thread_mutex_t *timeout_mutex;
 
+struct user_wait;
+
 /*
  * The pollset for sockets that are in any of the timeout queues. Currently
  * we use the timeout_mutex to make sure that connections are added/removed
@@ -363,6 +365,8 @@ struct event_conn_state_t {
     struct timeout_queue *q;
     /** the timer event for this entry */
     timer_event_t *te;
+    /** user pollfds (for suspended connection) */
+    struct user_wait *user_wait;
 
     /*
      * when queued to workers
@@ -386,6 +390,8 @@ struct event_conn_state_t {
          *  hooks)
          */
         suspended       :1,
+        /** Did the connection timed out? */
+        timed_out       :1,
         /** Has ap_start_lingering_close() been called? */
         linger_started  :1,
         /** Is lingering connection flushed and shutdown? */
@@ -501,6 +507,15 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
 {
     apr_time_t elem_expiry;
     apr_time_t next_expiry;
+
+    /* It greatly simplifies the logic to use a single timeout value per q
+     * because the new element can just be added to the end of the list and
+     * it will stay sorted in expiration time sequence.  If brand new
+     * sockets are sent to the event thread for a readability check, this
+     * will be a slight behavior change - they use the non-keepalive
+     * timeout today.  With a normal client, the socket will be readable in
+     * a few milliseconds anyway.
+     */
 
     ap_assert(q && !cs->q);
 
@@ -630,14 +645,15 @@ typedef struct
     void *baton;
 } listener_poll_type;
 
-typedef struct socket_callback_baton
-{
-    ap_mpm_callback_fn_t *cbfunc;
-    void *user_baton;
+struct user_wait {
+    apr_pool_t *pool;
+    event_conn_state_t *cs;
     apr_array_header_t *pfds;
-    timer_event_t *cancel_event; /* If a timeout was requested, a pointer to the timer event */
-    struct socket_callback_baton *next;
-} socket_callback_baton_t;
+    apr_thread_mutex_t *mutex; /* pfds added/removed atomically */
+    timer_event_t *timer; /* the timer of its timeout if any (also cs->te) */
+    struct user_wait *next; /* chaining */
+    int chained; /* in the listener's user_chain (next may be NULL there) */
+};
 
 typedef struct event_child_bucket {
     ap_pod_t *pod;
@@ -1040,10 +1056,10 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
     case AP_MPMQ_CAN_SUSPEND:
         *result = 1;
         break;
-    case AP_MPMQ_CAN_POLL:
+    case AP_MPMQ_CAN_WAITIO:
         *result = 1;
         break;
-    case AP_MPMQ_CAN_WAITIO:
+    case AP_MPMQ_CAN_POLL_SUSPENDED:
         *result = 1;
         break;
     default:
@@ -1158,11 +1174,8 @@ static apr_status_t decrement_connection_count(void *cs_)
                  "connection %" CS_FMT_TO " cleaned up",
                  CS_ARG_TO(cs));
 
-    switch (cs->pub.state) {
-    case CONN_STATE_SUSPENDED:
+    if (cs->suspended) {
         apr_atomic_dec32(&suspended_count);
-    default:
-        break;
     }
 
     /* Unblock the listener if it's waiting for connection_count = 0,
@@ -1184,15 +1197,24 @@ static apr_status_t decrement_connection_count(void *cs_)
 
 static void enter_suspended(event_conn_state_t *cs)
 {
-    ap_run_suspend_connection(cs->c, cs->r);
-    cs->c->sbh = NULL;
+    AP_DEBUG_ASSERT(!cs->suspended);
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
+                  "Suspend connection %" CS_FMT, CS_ARG(cs));
+    apr_atomic_inc32(&suspended_count);
     cs->suspended = 1;
+
+    cs->c->sbh = NULL;
+    cs->c->suspended_baton = cs;
+    ap_run_suspend_connection(cs->c, cs->r);
 }
 
-static void notify_resume(event_conn_state_t *cs, int cleanup)
+static void take_suspended(event_conn_state_t *cs)
 {
-    cs->suspended = 0;
-    cs->c->sbh = cleanup ? NULL : cs->sbh;
+    AP_DEBUG_ASSERT(cs->suspended);
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
+                  "Resume connection %" CS_FMT, CS_ARG(cs));
+
+    cs->c->sbh = cs->sbh;
     ap_run_resume_connection(cs->c, cs->r);
 }
 
@@ -1355,12 +1377,13 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
  * if the connection is currently suspended as far as modules
  * know, provide notification of resumption.
  */
-static apr_status_t ptrans_pre_cleanup(void *dummy)
+static apr_status_t ptrans_pre_cleanup(void *arg)
 {
-    event_conn_state_t *cs = dummy;
-
+    event_conn_state_t *cs = arg;
     if (cs->suspended) {
-        notify_resume(cs, 1);
+        cs->sbh = NULL;
+        cs->pub.state = CONN_STATE_LINGER;
+        take_suspended(cs);
     }
     return APR_SUCCESS;
 }
@@ -1450,7 +1473,8 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
                   (int)cs->pfd.reqevents,
                   CS_ARG(cs), at, line);
 
-    ap_assert(cs->q == NULL && cs->te == NULL && ((q != NULL) ^ (te != NULL)));
+    ap_assert((q != NULL) ^ (te != NULL));
+    ap_assert(cs->q == NULL && cs->te == NULL);
 
     set_conn_state_sense(cs, sense);
 
@@ -1518,8 +1542,6 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
                   (int)cs->pfd.reqevents,
                   CS_ARG(cs), at, line);
 
-    ap_assert((cs->q != NULL) ^ (cs->te != NULL));
-
     if (cs->q) {
         if (!locked) {
             apr_thread_mutex_lock(timeout_mutex);
@@ -1529,7 +1551,7 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
             apr_thread_mutex_unlock(timeout_mutex);
         }
     }
-    else {
+    else if (cs->te) {
         cs->te->canceled = 1;
         cs->te = NULL;
     }
@@ -1558,8 +1580,7 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
 /* Forward declare */
 static timer_event_t *get_timer_event(apr_time_t timeout,
                                       ap_mpm_callback_fn_t *cbfn, void *baton,
-                                      int insert,
-                                      apr_array_header_t *pfds);
+                                      int insert);
 static void process_lingering_close(event_conn_state_t *cs);
 
 static event_conn_state_t *make_conn_state(apr_pool_t *p, apr_socket_t *csd)
@@ -1666,22 +1687,28 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
             close_connection(cs);
             return;
         }
-
-        cs->pub.sense = CONN_SENSE_DEFAULT;
     }
     else { /* The connection is scheduled back */
         c = cs->c;
         c->current_thread = thd;
         c->id = conn_id; /* thread number is part of ID */
         ap_update_sb_handle(cs->sbh, my_child_num, my_thread_num);
-        notify_resume(cs, 0);
+    }
+
+    /* Suspended connections hooks run here and don't fall through */
+    if (cs->suspended) {
+        ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
+                      "resuming connection %" CS_FMT, CS_ARG(cs));
+        take_suspended(cs);
+        return;
     }
 
     ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                   "processing connection %" CS_FMT " (aborted %d, clogging %d)",
                   CS_ARG(cs), c->aborted, c->clogging_input_filters);
 
-    if (cs->pub.state == CONN_STATE_LINGER) {
+    if (cs->pub.state == CONN_STATE_LINGER || c->aborted) {
+        cs->pub.state = CONN_STATE_LINGER;
         goto lingering_close;
     }
 
@@ -1723,16 +1750,15 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
          * worker or prefork MPMs for instance.
          */
         switch (rc) {
-        case DONE:
-            rc = OK; /* same as OK, fall through */
         case OK:
+        case DONE: /* same as OK, fall through */
             if (cs->pub.state == CONN_STATE_PROCESSING) {
                 cs->pub.state = CONN_STATE_LINGER;
             }
             else if (cs->pub.state == CONN_STATE_KEEPALIVE) {
                 cs->pub.state = CONN_STATE_WRITE_COMPLETION;
             }
-            break;
+            rc = OK;
         }
         if (rc != OK || (cs->pub.state != CONN_STATE_LINGER
                          && cs->pub.state != CONN_STATE_ASYNC_WAITIO
@@ -1773,7 +1799,6 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
          * event thread poll for read/writeability.
          */
         ap_update_child_status(cs->sbh, SERVER_BUSY_READ, NULL);
-        enter_suspended(cs);
 
         /* If the connection timeout is actually different than the waitio_q's,
          * use a timer event to honor it (e.g. mod_reqtimeout may enforce its
@@ -1786,7 +1811,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
                 timeout = TIMERS_FUDGE_TIMEOUT;
             }
             /* Inserted once recorded (cs->te), see pollset_add_at() */
-            te = get_timer_event(timeout, NULL, cs, 0, NULL);
+            te = get_timer_event(timeout, NULL, cs, 0);
         }
         else {
             q = cs->sc->io_q;
@@ -1815,7 +1840,6 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         }
         if (pending == AGAIN) {
             /* Let the event thread poll for write */
-            enter_suspended(cs);
             cs->pub.sense = CONN_SENSE_DEFAULT;
             if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
                 return; /* queued */
@@ -1843,16 +1867,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
     if (cs->pub.state == CONN_STATE_KEEPALIVE) {
         ap_update_child_status(cs->sbh, SERVER_BUSY_KEEPALIVE, NULL);
 
-        /* It greatly simplifies the logic to use a single timeout value per q
-         * because the new element can just be added to the end of the list and
-         * it will stay sorted in expiration time sequence.  If brand new
-         * sockets are sent to the event thread for a readability check, this
-         * will be a slight behavior change - they use the non-keepalive
-         * timeout today.  With a normal client, the socket will be readable in
-         * a few milliseconds anyway.
-         */
-        enter_suspended(cs);
-
+        cs->pub.sense = CONN_SENSE_DEFAULT;
         if (!pollset_add(cs, CONN_SENSE_WANT_READ, cs->ka_sc->ka_q, NULL)) {
             cs->pub.state = CONN_STATE_LINGER;
             goto lingering_close;
@@ -1862,33 +1877,152 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
     }
 
     if (cs->pub.state == CONN_STATE_SUSPENDED) {
-        cs->c->suspended_baton = cs;
-        apr_atomic_inc32(&suspended_count);
         enter_suspended(cs);
-        return; /* done */
+        return; /* suspended */
     }
 
  lingering_close:
     process_lingering_close(cs);
 }
 
-/* Put a SUSPENDED connection back into a queue. */
-static apr_status_t event_resume_suspended (conn_rec *c)
+static apr_status_t user_wait_cleanup(void *data)
 {
-    event_conn_state_t* cs = (event_conn_state_t*) c->suspended_baton;
+    struct user_wait *user_wait = data;
+    apr_array_header_t *pfds = user_wait->pfds;
+    apr_status_t rc, final_rc = APR_SUCCESS;
+    int i;
+
+    /* All the pollfds should be added/removed atomically, so synchronize
+     * with register_user_poll().
+     */
+    apr_thread_mutex_lock(user_wait->mutex);
+    for (i = 0; i < pfds->nelts; i++) {
+        apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
+        if (pfd->client_data) {
+            rc = apr_pollset_remove(event_pollset, pfd);
+            if (rc != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rc)) {
+                final_rc = rc;
+            }
+            pfd->client_data = NULL;
+        }
+    }
+    apr_thread_mutex_unlock(user_wait->mutex);
+
+    if (final_rc) {
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, final_rc, user_wait->cs->c,
+                      APLOGNO() "can't remove a wait's pollfd from the "
+                      "pollset: stopping the child gracefully");
+        AP_DEBUG_ASSERT(0);
+        signal_threads(ST_GRACEFUL);
+    }
+    return final_rc;
+}
+
+/* Put some user pollfds into the listener pollset for a SUSPENDED connection */
+static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
+                                         const apr_array_header_t *user_pfds,
+                                         apr_interval_time_t timeout)
+{
+    event_conn_state_t *cs = c->suspended_baton;
+    apr_status_t rc, final_rc = APR_SUCCESS;
+    struct user_wait *user_wait;
+    apr_array_header_t *pfds;
+    listener_poll_type *pt;
+    int i;
+
+    AP_DEBUG_ASSERT(cs != NULL);
+    AP_DEBUG_ASSERT(cs->suspended);
+    AP_DEBUG_ASSERT(user_pfds->nelts > 0);
+    if (cs == NULL) {
+        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
+                "event_poll_suspended: suspended_baton is NULL");
+        return APR_EINVAL;
+    }
+    if (!cs->suspended) {
+        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
+                "event_poll_suspended: thread isn't suspended");
+        return APR_EINVAL;
+    }
+    if (user_pfds->nelts <= 0) {
+        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
+                "event_poll_suspended: no poll FDs");
+        return APR_EINVAL;
+    }
+ 
+    cs->pub.state = CONN_STATE_SUSPENDED;
+    cs->user_wait = user_wait = apr_pcalloc(p, sizeof(*user_wait));
+    apr_thread_mutex_create(&user_wait->mutex, APR_THREAD_MUTEX_DEFAULT, p);
+    user_wait->pfds = pfds = apr_array_copy(p, user_pfds);
+    user_wait->pool = p;
+    user_wait->cs = cs;
+
+    apr_pool_pre_cleanup_register(p, user_wait, user_wait_cleanup);
+
+    pt = apr_pcalloc(p, sizeof(*pt));
+    pt->baton = user_wait;
+    pt->type = PT_USER;
+
+    if (timeout >= 0) {
+        /* Prevent the timer from firing before the pollset is updated */
+        if (timeout < TIMERS_FUDGE_TIMEOUT) {
+            timeout = TIMERS_FUDGE_TIMEOUT;
+        }
+        user_wait->timer = get_timer_event(timeout, NULL, cs, 1);
+    }
+    cs->te = user_wait->timer;
+
+    /* All the pollfds should be added/removed atomically, so synchronize
+     * with user_wait_cleanup().
+     */
+    apr_thread_mutex_lock(user_wait->mutex);
+    for (i = 0; i < pfds->nelts; i++) {
+        apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
+        if (pfd->reqevents) {
+            if (pfd->reqevents & APR_POLLIN) {
+                pfd->reqevents |= APR_POLLHUP;
+            }
+            pfd->reqevents |= APR_POLLERR;
+            pfd->client_data = pt;
+
+            rc = apr_pollset_add(event_pollset, pfd);
+            if (rc != APR_SUCCESS) {
+                final_rc = rc;
+            }
+        }
+        else {
+            pfd->client_data = NULL;
+        }
+    }
+    apr_thread_mutex_unlock(user_wait->mutex);
+
+    if (final_rc) {
+        AP_DEBUG_ASSERT(0);
+        signal_threads(ST_GRACEFUL);
+    }
+    return final_rc;
+}
+
+/* Put a SUSPENDED connection back into a queue. */
+static apr_status_t event_resume_suspended(conn_rec *c)
+{
+    event_conn_state_t *cs = c->suspended_baton;
+
+    AP_DEBUG_ASSERT(cs != NULL);
+    AP_DEBUG_ASSERT(cs->suspended);
     if (cs == NULL) {
         ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO(02615)
                 "event_resume_suspended: suspended_baton is NULL");
-        return APR_EGENERAL;
+        return APR_EINVAL;
     }
     if (!cs->suspended) {
         ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO(02616)
-                "event_resume_suspended: Thread isn't suspended");
-        return APR_EGENERAL;
+                "event_resume_suspended: thread isn't suspended");
+        return APR_EINVAL;
     }
-
     apr_atomic_dec32(&suspended_count);
-    c->suspended_baton = NULL;
+    cs->c->suspended_baton = NULL;
+    cs->c->sbh = cs->sbh;
+    cs->suspended = 0;
 
     cs->pub.sense = CONN_SENSE_DEFAULT;
     if (cs->pub.state != CONN_STATE_LINGER) {
@@ -1896,7 +2030,6 @@ static apr_status_t event_resume_suspended (conn_rec *c)
         if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
             return APR_SUCCESS; /* queued */
         }
-
         /* fall through lingering close on error */
         cs->pub.state = CONN_STATE_LINGER;
     }
@@ -1971,11 +2104,11 @@ static void dummy_signal_handler(int sig)
 
 
 #if HAVE_SERF
-static apr_status_t s_socket_add(void *user_baton,
+static apr_status_t s_socket_add(void *user_wait,
                                  apr_pollfd_t *pfd,
                                  void *serf_baton)
 {
-    s_baton_t *s = (s_baton_t*)user_baton;
+    s_baton_t *s = (s_baton_t*)user_wait;
     /* XXXXX: recycle listener_poll_types */
     listener_poll_type *pt = ap_malloc(sizeof(*pt));
     pt->type = PT_SERF;
@@ -1984,11 +2117,11 @@ static apr_status_t s_socket_add(void *user_baton,
     return apr_pollset_add(s->pollset, pfd);
 }
 
-static apr_status_t s_socket_remove(void *user_baton,
+static apr_status_t s_socket_remove(void *user_wait,
                                     apr_pollfd_t *pfd,
                                     void *serf_baton)
 {
-    s_baton_t *s = (s_baton_t*)user_baton;
+    s_baton_t *s = (s_baton_t*)user_wait;
     listener_poll_type *pt = pfd->client_data;
     free(pt);
     return apr_pollset_remove(s->pollset, pfd);
@@ -2214,8 +2347,7 @@ static void insert_timer_event(timer_event_t *te)
 
 static timer_event_t *get_timer_event(apr_time_t timeout,
                                       ap_mpm_callback_fn_t *cbfn, void *baton,
-                                      int insert,
-                                      apr_array_header_t *pfds)
+                                      int insert)
 {
     timer_event_t *te;
     apr_time_t now = (timeout < 0) ? 0 : event_time_now();
@@ -2244,7 +2376,6 @@ static timer_event_t *get_timer_event(apr_time_t timeout,
     te->baton = baton;
     te->when = now + timeout;
     te->timeout = timeout;
-    te->pfds = pfds;
 
     if (insert) {
         wakeup = timer_insert_locked(te);
@@ -2276,122 +2407,15 @@ static void put_timer_event(timer_event_t *te, int locked)
     }
 }
 
-static apr_status_t event_register_timed_callback_ex(apr_time_t timeout,
-                                                  ap_mpm_callback_fn_t *cbfn,
-                                                  void *baton,
-                                                  apr_array_header_t *pfds)
-{
-    if (!cbfn) {
-        return APR_EINVAL;
-    }
-    get_timer_event(timeout, cbfn, baton, 1, pfds);
-    return APR_SUCCESS;
-}
-
 static apr_status_t event_register_timed_callback(apr_time_t timeout,
                                                   ap_mpm_callback_fn_t *cbfn,
                                                   void *baton)
 {
-    event_register_timed_callback_ex(timeout, cbfn, baton, NULL);
-    return APR_SUCCESS;
-}
-
-static apr_status_t event_cleanup_poll_callback(void *data)
-{
-    apr_status_t final_rc = APR_SUCCESS;
-    apr_array_header_t *pfds = data;
-    int i;
-
-    for (i = 0; i < pfds->nelts; i++) {
-        apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
-        if (pfd->client_data) {
-            apr_status_t rc;
-            rc = apr_pollset_remove(event_pollset, pfd);
-            if (rc != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rc)) {
-                final_rc = rc;
-            }
-            pfd->client_data = NULL;
-        }
-    }
-
-    if (final_rc) {
-        AP_DEBUG_ASSERT(0);
-        signal_threads(ST_GRACEFUL);
-    }
-    return final_rc;
-}
-
-static apr_status_t event_register_poll_callback_ex(apr_pool_t *p,
-                                                const apr_array_header_t *pfds,
-                                                ap_mpm_callback_fn_t *cbfn,
-                                                ap_mpm_callback_fn_t *tofn,
-                                                void *baton,
-                                                apr_time_t timeout)
-{
-    listener_poll_type *pt;
-    socket_callback_baton_t *scb;
-    apr_status_t rc, final_rc = APR_SUCCESS;
-    int i;
-
-    if (!cbfn || !tofn) {
+    if (!cbfn) {
         return APR_EINVAL;
     }
-
-    scb = apr_pcalloc(p, sizeof(*scb));
-    scb->cbfunc = cbfn;
-    scb->user_baton = baton;
-    scb->pfds = apr_array_copy(p, pfds);
-
-    pt = apr_palloc(p, sizeof(*pt));
-    pt->type = PT_USER;
-    pt->baton = scb;
-
-    apr_pool_pre_cleanup_register(p, scb->pfds, event_cleanup_poll_callback);
-
-    for (i = 0; i < scb->pfds->nelts; i++) {
-        apr_pollfd_t *pfd = (apr_pollfd_t *)scb->pfds->elts + i;
-        if (pfd->reqevents) {
-            if (pfd->reqevents & APR_POLLIN) {
-                pfd->reqevents |= APR_POLLHUP;
-            }
-            pfd->reqevents |= APR_POLLERR;
-            pfd->client_data = pt;
-        }
-        else {
-            pfd->client_data = NULL;
-        }
-    }
-
-    if (timeout > 0) {
-        /* Prevent the timer from firing before the pollset is updated */
-        if (timeout < TIMERS_FUDGE_TIMEOUT) {
-            timeout = TIMERS_FUDGE_TIMEOUT;
-        }
-        scb->cancel_event = get_timer_event(timeout, tofn, baton, 1, scb->pfds);
-    }
-    for (i = 0; i < scb->pfds->nelts; i++) {
-        apr_pollfd_t *pfd = (apr_pollfd_t *)scb->pfds->elts + i;
-        if (pfd->client_data) {
-            rc = apr_pollset_add(event_pollset, pfd);
-            if (rc != APR_SUCCESS) {
-                final_rc = rc;
-            }
-        }
-    }
-    return final_rc;
-}
-
-static apr_status_t event_register_poll_callback(apr_pool_t *p,
-                                                 const apr_array_header_t *pfds,
-                                                 ap_mpm_callback_fn_t *cbfn,
-                                                 void *baton)
-{
-    return event_register_poll_callback_ex(p,
-                                           pfds,
-                                           cbfn,
-                                           NULL, /* no timeout function */
-                                           baton,
-                                           0     /* no timeout */);
+    get_timer_event(timeout, cbfn, baton, 1);
+    return APR_SUCCESS;
 }
 
 /* Whether a lingering close lasted long enough (see SECONDS_TO_LINGER) */
@@ -2433,11 +2457,9 @@ static void process_lingering_close(event_conn_state_t *cs)
         conn_rec *c = cs->c;
         int rc = OK;
 
-        cs->pub.state = CONN_STATE_LINGER;
-
         if (!cs->linger_started) {
             cs->linger_started = 1; /* once! */
-            enter_suspended(cs);
+            cs->pub.state = CONN_STATE_LINGER;
 
             /* Shutdown the connection, i.e. pre_connection_close hooks,
              * SSL/TLS close notify, WC bucket, etc..
@@ -2553,6 +2575,7 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                     break;
                 }
             }
+            cs->timed_out = 1;
 
             if (cs_in_backlog(cs)) {
                 /* Remove the backlog connection from worker_queue (note that
@@ -2561,8 +2584,8 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                  * none could handle the event. Ours from now, shut down by
                  * the caller after unlocking.
                  */
-                ap_assert(cs_qe(cs)->cb_baton == cs);
                 ap_assert(cs->q == cs->sc->bl_q || cs->q == backlog_linger_q);
+                ap_assert(cs_qe(cs)->cb_baton == cs);
                 ap_assert(timed_out != NULL);
                 ap_queue_info_idlers_inc(worker_queue_info);
                 ap_queue_kill_event_locked(worker_queue, cs_qe(cs));
@@ -2674,7 +2697,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         apr_interval_time_t timeout = -1;
         int above_limit = 0, force_stats = 0;
         event_conn_state_t *expired = NULL;
-        socket_callback_baton_t *user_chain;
+        struct user_wait *user_chain;
         const apr_pollfd_t *out_pfd;
         apr_time_t now, poll_time;
         event_conn_state_t *cs;
@@ -2737,24 +2760,54 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     continue;
                 }
 
+                /* A timer without a callback is a cancel event for a cs in
+                 * either:
+                 *  1. CONN_STATE_ASYNC_WAITIO: the timer enforces a timeout
+                 *     different from the cs->sc->io_q's;
+                 *  2. CONN_STATE_SUSPENDED: the timer enforces a timeout for
+                 *     some user pollfds bound to the cs.
+                 * In both cases te->baton is the (timed out) cs.
+                 * For 1. we can shutdow the connection now, but for 2. we
+                 * need to resume the suspended connection in a worker thread
+                 * for the responsible module to know, which we do by setting
+                 * CONN_STATE_LINGER but also cs->timed_out to make sure that,
+                 * after the next/last ap_run_resume_connection(), this state
+                 * is maintained/restored to issue the actual close.
+                 */
                 if (!te->cbfunc) {
                     cs = te->baton;
+                    AP_DEBUG_ASSERT(cs != NULL);
+                    AP_DEBUG_ASSERT(cs->te == te);
                     put_timer_event(te, 1);
-                    ap_assert(cs && cs->te == te);
-                    ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
-                                  "timed out connection %" CS_FMT,
-                                  CS_ARG(cs));
-                    (void)pollset_del(cs, 0);
-                    kill_connection(cs, APR_TIMEUP);
-                    continue;
+                    cs->te = te = NULL;
+                    cs->timed_out = 1;
+
+                    if (!cs->user_wait) {
+                        ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
+                                      "timed out connection %" CS_FMT,
+                                      CS_ARG(cs));
+                        (void)pollset_del(cs, 0);
+                        shutdown_connection(cs, now, 0);
+                        continue;
+                    }
+
+                    /* Remove all user pollfds from the pollset */
+                    AP_DEBUG_ASSERT(cs->user_wait->pfds != NULL);
+                    apr_pool_cleanup_run(cs->user_wait->pool, cs->user_wait,
+                                         user_wait_cleanup);
+#ifdef AP_DEBUG
+                    memset(cs->user_wait, 0, sizeof(*cs->user_wait));
+#endif
+                    cs->user_wait = NULL;
+
+                    AP_DEBUG_ASSERT(cs->suspended);
+                    cs->pub.state = CONN_STATE_LINGER;
+                }
+                else {
+                    cs = NULL;
                 }
 
-                if (te->pfds) {
-                    /* remove all sockets from the pollset */
-                    apr_pool_cleanup_run(te->pfds->pool, te->pfds,
-                                         event_cleanup_poll_callback);
-                }
-                push2worker(NULL, te, now, &above_limit);
+                push2worker(cs, te, now, &above_limit);
             }
             if (te) {
                 next_expiry = te->when;
@@ -2861,7 +2914,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
         for (user_chain = NULL; num > 0; --num, ++out_pfd) {
             listener_poll_type *pt = out_pfd->client_data;
-            socket_callback_baton_t *baton;
+            struct user_wait *user_wait;
 
             switch (pt->type) {
             case PT_CSD:
@@ -2982,13 +3035,14 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             case PT_USER:
                 /* Multiple pfds of the same baton might trigger in this pass
                  * so chain once here and run the cleanup only after this loop
-                 * to avoid lifetime issues (i.e. pfds->pool cleared while some
-                 * of its pfd->client_data are still to be dereferenced here).
+                 * to avoid lifetime issues (i.e. user_wait->pool cleared while
+                 * some of its pfd->client_data are still to be dereferenced here).
                  */
-                baton = pt->baton;
-                if (baton != user_chain && !baton->next) {
-                    baton->next = user_chain;
-                    user_chain = baton;
+                user_wait = pt->baton;
+                if (!user_wait->chained) {
+                    user_wait->chained = 1;
+                    user_wait->next = user_chain;
+                    user_chain = user_wait;
                 }
                 break;
             }
@@ -2996,27 +3050,33 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
         /* Time to queue user callbacks chained above */
         while (user_chain) {
-            socket_callback_baton_t *baton = user_chain;
-            user_chain = user_chain->next;
-            baton->next = NULL;
+            struct user_wait *user_wait = user_chain;
+            user_chain = user_wait->next;
+            user_wait->next = NULL;
+            user_wait->chained = 0;
+
+            cs = user_wait->cs;
+            AP_DEBUG_ASSERT(cs != NULL);
+            AP_DEBUG_ASSERT(cs->user_wait == user_wait);
+            AP_DEBUG_ASSERT(cs->te == user_wait->timer);
+            AP_DEBUG_ASSERT(cs->pub.state == CONN_STATE_SUSPENDED);
+            AP_DEBUG_ASSERT(cs->suspended);
 
             /* Not expirable anymore */
-            if (baton->cancel_event) {
-                baton->cancel_event->canceled = 1;
-                baton->cancel_event = NULL;
+            if (cs->te) {
+                cs->te->canceled = 1;
+                cs->te = NULL;
             }
 
-            /* remove all sockets from the pollset */
-            apr_pool_cleanup_run(baton->pfds->pool, baton->pfds,
-                                 event_cleanup_poll_callback);
+            /* Remove all user pollfds from the pollset */
+            apr_pool_cleanup_run(user_wait->pool, user_wait,
+                                 user_wait_cleanup);
+#ifdef AP_DEBUG
+            memset(user_wait, 0, sizeof(*user_wait));
+#endif
 
-            /* masquerade as a timer event that is firing */
-            te = get_timer_event(-1 /* fake timer */,
-                                 baton->cbfunc,
-                                 baton->user_baton,
-                                 0, /* don't insert it */
-                                 NULL /* no associated socket callback */);
-            push2worker(NULL, te, now, &above_limit);
+            /* Schedule ap_run_resume_connection() */
+            push2worker(cs, NULL, now, &above_limit);
         }
 
         /* We process the timeout queues here only when the global
@@ -3050,6 +3110,7 @@ do_maintenance:
              */
             (void)process_timeout_queue_ex(shutdown_q, now, 0, &expired);
 
+            /* No specific requirement/order for those */
             process_timeout_queue(waitio_q, now);
             process_timeout_queue(write_completion_q, now);
             process_timeout_queue(keepalive_q, now);
@@ -4525,7 +4586,6 @@ static void setup_slave_conn(conn_rec *c, void *csd)
     cs = make_conn_state(c->pool, csd);
     cs->c = c;
     cs->sc = mcs->sc;
-    cs->suspended = 0;
     cs->bucket_alloc = c->bucket_alloc;
     cs->pfd = mcs->pfd;
     cs->pub = mcs->pub;
@@ -5203,14 +5263,11 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_query(event_query, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_register_timed_callback(event_register_timed_callback, NULL, NULL,
                                         APR_HOOK_MIDDLE);
-    ap_hook_mpm_register_poll_callback(event_register_poll_callback,
-                                       NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_mpm_register_poll_callback_timeout(event_register_poll_callback_ex,
-                                               NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_read_request(event_pre_read_request, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(event_post_read_request, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_poll_suspended(event_poll_suspended, NULL, NULL, APR_HOOK_MIDDLE);
 
     ap_hook_pre_connection(event_pre_connection, NULL, NULL, APR_HOOK_REALLY_FIRST);
     ap_hook_protocol_switch(event_protocol_switch, NULL, NULL, APR_HOOK_REALLY_FIRST);
