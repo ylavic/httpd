@@ -5752,7 +5752,8 @@ static apr_status_t proxy_transfer(request_rec *r,
                                    int flags,
                                    apr_off_t *bytes_in,
                                    apr_off_t *bytes_out,
-                                   proxy_tunnel_rec *tunnel)
+                                   proxy_tunnel_rec *tunnel,
+                                   int *read_eagain)
 {
     apr_status_t rv;
     int flush_each = 0;
@@ -5776,6 +5777,9 @@ static apr_status_t proxy_transfer(request_rec *r,
         rv = ap_get_brigade(c_i->input_filters, bb_i, AP_MODE_READBYTES,
                             APR_NONBLOCK_READ, bsize);
         if (rv != APR_SUCCESS) {
+            if (read_eagain && APR_STATUS_IS_EAGAIN(rv)) {
+                *read_eagain = 1;
+            }
             if (!APR_STATUS_IS_EAGAIN(rv) && !APR_STATUS_IS_EOF(rv)) {
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO(03308)
                               "proxy_transfer: can't get data from %s", name);
@@ -5794,6 +5798,10 @@ static apr_status_t proxy_transfer(request_rec *r,
             break;
         }
         if (APR_BRIGADE_EMPTY(bb_i)) {
+            /* How the core input filter reports EAGAIN */
+            if (read_eagain) {
+                *read_eagain = 1;
+            }
             break;
         }
 
@@ -5935,7 +5943,7 @@ PROXY_DECLARE(apr_status_t) ap_proxy_transfer_between_connections(
 {
     apr_off_t bytes_out = 0;
     apr_status_t rv = proxy_transfer(r, c_i, c_o, bb_i, bb_o, name, bsize,
-                                     flags, NULL, &bytes_out, NULL);
+                                     flags, NULL, &bytes_out, NULL, NULL);
     if (sent && bytes_out > 0) {
         *sent = 1;
     }
@@ -5956,7 +5964,11 @@ struct proxy_tunnel_conn {
               bytes_out;
 
     unsigned int down_in:1,
-                 down_out:1;
+                 down_out:1,
+                 /* the last read/flush ended on EAGAIN (nothing left to read
+                  * or no room to write, until the next poll event) */
+                 in_eagain:1,
+                 out_eagain:1;
 };
 
 PROXY_DECLARE(apr_off_t) ap_proxy_tunnel_conn_bytes_in(
@@ -6275,6 +6287,7 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
 {
     proxy_tunnel_conn_t *out = in->other;
     apr_status_t rv;
+    int read_eagain = 0;
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, tunnel->r,
                   "proxy: %s: %s input ready",
@@ -6287,13 +6300,15 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
                         AP_PROXY_TRANSFER_YIELD_PENDING |
                         AP_PROXY_TRANSFER_YIELD_MAX_READS,
                         &in->bytes_in, &out->bytes_out,
-                        tunnel);
+                        tunnel, &read_eagain);
+    in->in_eagain = read_eagain;
     if (rv != APR_SUCCESS) {
         if (APR_STATUS_IS_INCOMPLETE(rv)) {
             /* Pause POLLIN while waiting for POLLOUT on the other
              * side, hence avoid filling the output filters even
              * more to avoid blocking there.
              */
+            out->out_eagain = 0; /* not flushed until EAGAIN yet */
             ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, tunnel->r,
                           "proxy: %s: %s wait writable",
                           tunnel->scheme, out->name);
@@ -6383,7 +6398,10 @@ static int proxy_tunnel_events(proxy_tunnel_rec *tunnel,
 
         rc = ap_check_output_pending(out->c);
         if (rc == AGAIN) {
-            /* Keep polling (OUT only) */
+            /* Keep polling (OUT only), the pending data written until
+             * EAGAIN.
+             */
+            out->out_eagain = 1;
             return OK;
         }
         if (rc != OK) {
@@ -6739,6 +6757,26 @@ static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
                                             const apr_array_header_t *pfds,
                                             void *baton);
 
+/* Whether each side waits for POLLIN/POLLOUT only after its last read/flush
+ * ended on EAGAIN (AP_MPM_WAIT_DRAINED), not after a yield.
+ */
+static int proxy_tunnel_drained(proxy_tunnel_rec *tunnel)
+{
+    const proxy_tunnel_conn_t *tcs[2];
+    int i;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        if (((tcs[i]->pfd->reqevents & APR_POLLIN) && !tcs[i]->in_eagain)
+            || ((tcs[i]->pfd->reqevents & APR_POLLOUT)
+                && !tcs[i]->out_eagain)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Step the tunnel with what's ready, then wait in the MPM for what it needs,
  * or when the MPM can't wait tunnel synchronously from now on. Returns
  * SUSPENDED, or the tunnel's status once done.
@@ -6764,7 +6802,10 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
         apr_pool_tag(ta->pool, "proxy_tunnel_async");
     }
     rv = ap_mpm_register_wait(r->connection, ta->pool, tunnel->pfds,
-                              ta->timeout, NULL, AP_MPM_WAIT_KEEP_PFDS,
+                              ta->timeout, NULL,
+                              AP_MPM_WAIT_KEEP_PFDS
+                              | (proxy_tunnel_drained(tunnel)
+                                 ? AP_MPM_WAIT_DRAINED : 0),
                               proxy_tunnel_async_continuation, ta);
     if (rv == APR_SUCCESS) {
         ta->kept = 1;

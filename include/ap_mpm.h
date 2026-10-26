@@ -288,6 +288,17 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
 #define AP_MPM_WAIT_KEEP_PFDS (1u << 0)
 
 /**
+ * Flag for ap_mpm_register_wait(), with AP_MPM_WAIT_KEEP_PFDS: the caller
+ * drained its pfds before waiting, i.e. it waits for each event only after
+ * the operation it waits for (read, write) failed with EAGAIN since the last
+ * wait, so a kept pfd that fired for the last wait needs no check for a
+ * readiness the caller would have consumed. Without it, an MPM that doesn't
+ * re-arm the kept pfds checks them (the caller may have stopped reading or
+ * writing before EAGAIN, and no new event would come).
+ */
+#define AP_MPM_WAIT_DRAINED (1u << 1)
+
+/**
  * Release the pfds of an array as ap_mpm_release_pfd() does for each.
  * @param pfds The pfds to release (those not kept are ignored)
  * @return APR_SUCCESS, or the last error of ap_mpm_release_pfd()

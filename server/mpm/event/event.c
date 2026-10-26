@@ -785,6 +785,7 @@ struct user_wait {
     ap_mpm_notifier_t *notifier; /* the wait's notifier, if any */
     int wait_notified; /* completes with AP_MPM_WAIT_NOTIFIED (listener only) */
     int keep; /* keep its pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
+    int drained; /* its user drained the pfds (AP_MPM_WAIT_DRAINED) */
 };
 
 /* A pfd kept registered in conn_pollset across the waits of a connection
@@ -820,6 +821,8 @@ struct kept_pfd {
     /*atomic*/ apr_uint32_t state; /* KEPT_* */
     struct user_wait *wait;   /* the wait on it (KEPT_WAITED) */
     apr_int16_t latched;      /* the rtnevents of KEPT_READY */
+    int delivered;            /* fired for its last wait, which was given
+                               * its rtnevents (not completed otherwise) */
     event_conn_state_t *cs;   /* its connection */
     struct kept_anchor *anchor; /* its descriptor's, if any */
     apr_uint32_t free_epoch;  /* the drain epoch of its release */
@@ -2705,7 +2708,8 @@ static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
  * with EVENT_WORKER_NOTIFY), else one-shot: an edge-triggered one is never
  * re-armed, but one that fired since its last wait is checked (poll()) when
  * a wait arms it, since its user may have stopped reading or writing before
- * EAGAIN, and no edge would come for what's pending (arm_kept_pfd()).
+ * EAGAIN, and no edge would come for what's pending (arm_kept_pfd()), unless
+ * the user drained it (AP_MPM_WAIT_DRAINED).
  */
 static int kept_pfds_et;
 
@@ -2873,6 +2877,10 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                                  apr_int16_t reqevents,
                                  apr_int16_t *rtnevents)
 {
+#ifdef APR_POLLET
+    int delivered = kept->delivered;
+    kept->delivered = 0;
+#endif
     kept->wait = user_wait;
 #ifdef APR_POLLET
     if (kept_pfds_et && rtnevents && kept->pfd.reqevents == reqevents) {
@@ -2890,6 +2898,19 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                 if (apr_atomic_cas32(&kept->state, KEPT_FIRED,
                                      KEPT_READY) == KEPT_READY) {
                     *rtnevents = kept->latched & reqevents;
+                    kept->delivered = 1;
+                    return APR_SUCCESS;
+                }
+            }
+            else if (state == KEPT_FIRED && delivered
+                     && user_wait->drained) {
+                /* Fired for the last wait only, which got its events, and
+                 * its user drained it since: an edge from then on would be
+                 * latched (KEPT_READY). Not if the last wait completed
+                 * otherwise (the event may be latched after this arm).
+                 */
+                if (apr_atomic_cas32(&kept->state, KEPT_WAITED,
+                                     KEPT_FIRED) == KEPT_FIRED) {
                     return APR_SUCCESS;
                 }
             }
@@ -2919,6 +2940,7 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                  * edge claimed it meanwhile, then the event does)
                  */
                 *rtnevents = pfd.rtnevents;
+                kept->delivered = 1;
             }
         }
         return APR_SUCCESS;
@@ -3533,6 +3555,7 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     user_wait->continuation.baton = baton;
     user_wait->keep = ((flags & AP_MPM_WAIT_KEEP_PFDS)
                        && kept_pfds_enabled());
+    user_wait->drained = !!(flags & AP_MPM_WAIT_DRAINED);
     cs->pending_wait = user_wait;
     return APR_SUCCESS;
 }
@@ -4971,6 +4994,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 else if (stale) {
                     break;
                 }
+                if (kept) {
+                    kept->delivered = 1; /* before the continuation is queued */
+                }
                 if (user_wait->continuation.fn) {
                     /* Tell the continuation which pfds are ready */
                     apr_array_header_t *pfds = user_wait->pfds;
@@ -5350,6 +5376,7 @@ static event_conn_state_t *worker_poll_one(int slot,
                 DRAIN_STAT_INC(drain_dropped);
                 break;
             }
+            kept->delivered = 1; /* before the continuation runs */
         }
         else {
             user_wait = pt->baton;
