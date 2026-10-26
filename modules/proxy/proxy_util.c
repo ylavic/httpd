@@ -1648,6 +1648,27 @@ static proxy_conn_rec *connection_make(apr_pool_t *p, proxy_worker *worker)
     return conn;
 }
 
+#if APR_HAS_THREADS
+/* Notify the first waiter of an exhausted pool, if any, waiters_mutex held */
+static void notify_first_conn_waiter(proxy_conn_pool *cp)
+{
+    proxy_conn_waiter *waiter = cp->waiters_head;
+
+    if (waiter) {
+        char b = 0;
+        apr_size_t n = 1;
+        cp->waiters_head = waiter->next;
+        if (!cp->waiters_head) {
+            cp->waiters_tail = NULL;
+        }
+        waiter->next = NULL;
+        waiter->queued = 0;
+        waiter->notified = 1;
+        (void)apr_file_write(waiter->notifier, &b, &n);
+    }
+}
+#endif
+
 static void connection_cleanup(void *theconn)
 {
     proxy_conn_rec *conn = (proxy_conn_rec *)theconn;
@@ -1691,6 +1712,17 @@ static void connection_cleanup(void *theconn)
     if (worker->s->hmax && worker->cp->res) {
         conn->inreslist = 1;
         apr_reslist_release(worker->cp->res, (void *)conn);
+#if APR_HAS_THREADS
+        /* Notify the first waiter (ap_proxy_acquire_connection_ex()), under
+         * the lock so that it can't be canceled (and its wakeup file closed)
+         * meanwhile.
+         */
+        if (worker->cp->waiters_mutex) {
+            apr_thread_mutex_lock(worker->cp->waiters_mutex);
+            notify_first_conn_waiter(worker->cp);
+            apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+        }
+#endif
     }
     else {
         worker->cp->conn = conn;
@@ -2403,6 +2435,14 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
                 if (rv == APR_SUCCESS && worker->s->acquire_set) {
                     apr_reslist_timeout_set(worker->cp->res, worker->s->acquire);
                 }
+#if APR_HAS_THREADS
+                /* For ap_proxy_acquire_connection_ex()'s waiters */
+                if (rv == APR_SUCCESS) {
+                    rv = apr_thread_mutex_create(&worker->cp->waiters_mutex,
+                                                 APR_THREAD_MUTEX_DEFAULT,
+                                                 worker->cp->pool);
+                }
+#endif
 
             }
             else {
@@ -2816,6 +2856,49 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
                                                proxy_worker *worker,
                                                server_rec *s)
 {
+    return ap_proxy_acquire_connection_ex(proxy_function, conn, worker, s,
+                                          NULL);
+}
+
+PROXY_DECLARE(void) ap_proxy_cancel_conn_waiter(proxy_worker *worker,
+                                                proxy_conn_waiter *waiter)
+{
+#if APR_HAS_THREADS
+    if (worker->cp && worker->cp->waiters_mutex) {
+        apr_thread_mutex_lock(worker->cp->waiters_mutex);
+        if (waiter->queued) {
+            proxy_conn_waiter **pw = &worker->cp->waiters_head, *prev = NULL;
+            while (*pw && *pw != waiter) {
+                prev = *pw;
+                pw = &(*pw)->next;
+            }
+            if (*pw) {
+                *pw = waiter->next;
+                if (worker->cp->waiters_tail == waiter) {
+                    worker->cp->waiters_tail = prev;
+                }
+            }
+            waiter->next = NULL;
+            waiter->queued = 0;
+        }
+        else if (waiter->notified) {
+            /* Notified for a released connection that it won't acquire:
+             * the next waiter takes it, or its notification would be lost.
+             */
+            waiter->notified = 0;
+            notify_first_conn_waiter(worker->cp);
+        }
+        apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+    }
+#endif
+}
+
+PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
+                                                  proxy_conn_rec **conn,
+                                                  proxy_worker *worker,
+                                                  server_rec *s,
+                                                  proxy_conn_waiter *waiter)
+{
     apr_status_t rv;
 
     if (!PROXY_WORKER_IS_USABLE(worker)) {
@@ -2830,6 +2913,37 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
             return HTTP_SERVICE_UNAVAILABLE;
         }
     }
+
+#if APR_HAS_THREADS
+    /* Don't block on an exhausted pool if the caller can wait otherwise:
+     * queue the waiter (notified when a connection is released). The check
+     * and the queuing are under the lock taken by the release to notify a
+     * waiter, so no notification is lost.
+     */
+    if (waiter && worker->s->hmax && worker->cp->res && worker->cp->waiters_mutex) {
+        apr_thread_mutex_lock(worker->cp->waiters_mutex);
+        waiter->notified = 0; /* acquiring now, the wakeup is used */
+        if (apr_reslist_acquired_count(worker->cp->res)
+                >= (apr_uint32_t)worker->s->hmax) {
+            waiter->next = NULL;
+            waiter->queued = 1;
+            if (worker->cp->waiters_tail) {
+                worker->cp->waiters_tail->next = waiter;
+            }
+            else {
+                worker->cp->waiters_head = waiter;
+            }
+            worker->cp->waiters_tail = waiter;
+            apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO()
+                         "%s: connection pool exhausted for (%s:%d), "
+                         "waiting", proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
+            return SUSPENDED;
+        }
+        apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+    }
+#endif
 
     if (worker->s->hmax && worker->cp->res) {
         rv = apr_reslist_acquire(worker->cp->res, (void **)conn);

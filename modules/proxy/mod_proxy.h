@@ -300,6 +300,17 @@ typedef struct {
         int content_length; /* length of the content */
 } proxy_completion;
 
+/* A waiter for a connection of an exhausted pool, see
+ * ap_proxy_acquire_connection_ex()
+ */
+typedef struct proxy_conn_waiter proxy_conn_waiter;
+struct proxy_conn_waiter {
+    apr_file_t *notifier;         /* Written (one byte) when a connection is released */
+    proxy_conn_waiter *next;    /* The next waiter (FIFO) */
+    int queued;
+    int notified;               /* Dequeued by a release, not acquired yet */
+};
+
 /* Connection pool */
 struct proxy_conn_pool {
     apr_pool_t     *pool;     /* The pool used in constructor and destructor calls */
@@ -307,6 +318,10 @@ struct proxy_conn_pool {
     apr_reslist_t  *res;      /* Connection resource list */
     proxy_conn_rec *conn;     /* Single connection for prefork mpm */
     apr_pool_t     *dns_pool; /* The pool used for worker scoped DNS resolutions */
+#if APR_HAS_THREADS
+    apr_thread_mutex_t *waiters_mutex; /* Protects the waiters */
+#endif
+    proxy_conn_waiter *waiters_head, *waiters_tail; /* Waiting for a connection */
 };
 
 #define AP_VOLATILIZE_T(T, x) (*(T volatile *)&(x))
@@ -1144,6 +1159,33 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
                                                proxy_conn_rec **conn,
                                                proxy_worker *worker,
                                                server_rec *s);
+/**
+ * Acquire a connection from the worker's connection pool. When a waiter is
+ * given, don't block if the connection limit has been reached.
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn    acquired connection
+ * @param worker  worker used for obtaining connection
+ * @param s       current server record
+ * @param waiter  NULL to block as ap_proxy_acquire_connection() does,
+ *                otherwise queued if the connection limit has been reached
+ * @return        OK, SUSPENDED if the waiter is queued (its wakeup file is
+ *                written once a connection is released, and the caller then
+ *                retries), or HTTP_XXX error
+ */
+PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
+                                                  proxy_conn_rec **conn,
+                                                  proxy_worker *worker,
+                                                  server_rec *s,
+                                                  proxy_conn_waiter *waiter);
+/**
+ * Remove a waiter from the queue of a worker connection pool, if queued, or
+ * pass its wakeup on to the next waiter if it was woken up already (giving
+ * up instead of acquiring the released connection).
+ * @param worker  worker used for obtaining connection
+ * @param waiter  the waiter given to ap_proxy_acquire_connection_ex()
+ */
+PROXY_DECLARE(void) ap_proxy_cancel_conn_waiter(proxy_worker *worker,
+                                                proxy_conn_waiter *waiter);
 /**
  * Release a connection back to worker connection pool
  * @param proxy_function calling proxy scheme (http, ajp, ...)
