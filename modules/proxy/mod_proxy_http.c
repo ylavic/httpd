@@ -1662,10 +1662,12 @@ static void proxy_http_response_body_continuation(conn_rec *c, request_rec *r,
                                                   const apr_array_header_t *pfds,
                                                   void *baton);
 
-/* Wait in the MPM while streaming the response body (ap_mpm_register_wait()),
- * for the client to drain the pending output (AP_PROXY_CLIENT_OUT), or for
- * the backend to be readable (AP_PROXY_BACKEND_IN). Returns SUSPENDED, or OK
- * if it can't wait asynchronously (the caller then blocks).
+/* While streaming the response body, wait for the client to drain the pending
+ * output (AP_PROXY_CLIENT_OUT), or for the backend to be readable
+ * (AP_PROXY_BACKEND_IN): synchronously for up to ProxyAsyncDelay, then in the
+ * MPM (ap_mpm_register_wait()). Returns AGAIN if ready within ProxyAsyncDelay
+ * (the caller goes on), SUSPENDED, or OK if we can't wait asynchronously (the
+ * caller then blocks).
  */
 static int proxy_http_response_body_wait(proxy_http_req_t *req,
                                          ap_proxy_direction_e direction)
@@ -1676,6 +1678,28 @@ static int proxy_http_response_body_wait(proxy_http_req_t *req,
     apr_array_header_t *pfds;
     apr_pollfd_t *pfd;
     apr_status_t rv;
+
+    if (req->dconf->async_delay > 0) {
+        apr_pollfd_t dpfd;
+        apr_int32_t nready = 0;
+
+        memset(&dpfd, 0, sizeof(dpfd));
+        dpfd.p = r->pool;
+        dpfd.desc_type = APR_POLL_SOCKET;
+        if (for_client) {
+            dpfd.desc.s = ap_get_conn_socket(c);
+            dpfd.reqevents = APR_POLLOUT;
+        }
+        else {
+            dpfd.desc.s = req->backend->sock;
+            dpfd.reqevents = APR_POLLIN;
+        }
+        rv = apr_poll(&dpfd, 1, &nready, req->dconf->async_delay);
+        if (!APR_STATUS_IS_TIMEUP(rv)) {
+            /* Ready (or an error the next read/write will report) */
+            return AGAIN;
+        }
+    }
 
     if (req->async_pool) {
         apr_pool_clear(req->async_pool);
@@ -1735,6 +1759,7 @@ static int proxy_http_response_body(proxy_http_req_t *req)
     do {
         apr_off_t readbytes;
         apr_status_t rv;
+        int rc;
 
         rv = ap_get_brigade(backend->r->input_filters, bb,
                             AP_MODE_READBYTES, req->response_mode,
@@ -1760,11 +1785,15 @@ static int proxy_http_response_body(proxy_http_req_t *req)
                     break;
                 }
                 apr_brigade_cleanup(bb);
-                if (proxy_http_response_body_wait(req,
-                            (ap_filter_should_yield(c->output_filters)
-                             ? AP_PROXY_CLIENT_OUT : AP_PROXY_BACKEND_IN))
-                        == SUSPENDED) {
+                rc = proxy_http_response_body_wait(req,
+                                                   (ap_filter_should_yield(c->output_filters)
+                                                    ? AP_PROXY_CLIENT_OUT
+                                                    : AP_PROXY_BACKEND_IN));
+                if (rc == SUSPENDED) {
                     return SUSPENDED;
+                }
+                if (rc == AGAIN) {
+                    continue; /* ready within ProxyAsyncDelay */
                 }
                 req->body_async = 0; /* can't wait: block */
             }
@@ -1922,10 +1951,13 @@ static int proxy_http_response_body(proxy_http_req_t *req)
             /* The client is slower than the backend: wait for it to drain
              * the pending output before reading more (backpressure).
              */
-            if (proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT) == SUSPENDED) {
+            rc = proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT);
+            if (rc == SUSPENDED) {
                 return SUSPENDED;
             }
-            req->body_async = 0; /* can't wait: block */
+            if (rc != AGAIN) {
+                req->body_async = 0; /* can't wait: block */
+            }
         }
     } while (!finish);
 
@@ -1988,10 +2020,13 @@ static void proxy_http_response_body_continuation(conn_rec *c, request_rec *r,
         /* Write what's pending to the client */
         int rc = ap_check_output_pending(c);
         if (rc == AGAIN) {
-            if (proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT) == SUSPENDED) {
+            rc = proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT);
+            if (rc == SUSPENDED) {
                 return;
             }
-            req->body_async = 0; /* can't wait: block */
+            if (rc != AGAIN) {
+                req->body_async = 0; /* can't wait: block */
+            }
         }
         else if (rc != OK) {
             /* The client is gone */
