@@ -1516,8 +1516,33 @@ PROXY_DECLARE(proxy_worker *) ap_proxy_balancer_get_best_worker(proxy_balancer *
  * CONNECTION related...
  */
 
+/* Release the socket of a backend connection from the MPM if it's kept there
+ * (AP_MPM_WAIT_KEEP_PFDS), before it's closed or released for another
+ * request to use.
+ */
+static void release_kept_pfd(proxy_conn_rec *conn)
+{
+    apr_pollfd_t pfd;
+    apr_status_t rv;
+
+    if (!conn->sock) {
+        return;
+    }
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = conn->sock;
+    rv = ap_mpm_release_pfd(&pfd);
+    if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+        ap_log_perror(APLOG_MARK, APLOG_ERR, rv, conn->pool, APLOGNO()
+                      "releasing the MPM's pollfd of a backend connection "
+                      "for (%s:%d) failed", conn->worker->s->hostname_ex,
+                      (int)conn->worker->s->port);
+    }
+}
+
 static void socket_cleanup(proxy_conn_rec *conn)
 {
+    release_kept_pfd(conn);
     conn->sock = NULL;
     conn->tmp_bb = NULL;
     conn->connection = NULL;
@@ -1680,6 +1705,9 @@ static void connection_cleanup(void *theconn)
                       ap_proxy_worker_get_name(worker));
         return;
     }
+
+    /* Not registered in the MPM for this connection anymore */
+    release_kept_pfd(conn);
 
     if (conn->r) {
         apr_pool_destroy(conn->r->pool);
