@@ -411,6 +411,10 @@ struct user_continuation {
     ap_mpm_wait_result_e why;
 };
 
+/* The kept pfds of a connection (a tunnel keeps 2) */
+#define EVENT_KEPT_MAX 4
+struct kept_pfd;
+
 typedef struct event_conn_state_t event_conn_state_t;
 struct event_conn_state_t {
     /** APR_RING of expiration timeouts */
@@ -454,6 +458,10 @@ struct event_conn_state_t {
     struct user_wait *wait;
     /** the continuation to run (continuation.fn set), once its wait fired */
     struct user_continuation continuation;
+    /** the pfds kept registered across the waits (AP_MPM_WAIT_KEEP_PFDS),
+     *  in cs->p, until released */
+    struct kept_pfd *kept[EVENT_KEPT_MAX];
+    int nkept;
 
     /*
      * when queued to workers
@@ -730,7 +738,8 @@ typedef enum
     PT_SERF,
 #endif
     PT_USER,
-    PT_QUEUE   /* the doorbell (worker_poll) */
+    PT_QUEUE,  /* the doorbell (worker_poll) */
+    PT_KEPT    /* a kept pfd (AP_MPM_WAIT_KEEP_PFDS) */
 } poll_type_e;
 
 typedef struct
@@ -773,7 +782,55 @@ struct user_wait {
     struct user_continuation continuation; /* fn and baton (ap_mpm_register_wait()), if any */
     ap_mpm_notifier_t *notifier; /* the wait's notifier, if any */
     int wait_notified; /* completes with AP_MPM_WAIT_NOTIFIED (listener only) */
+    int keep; /* keep its pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
 };
+
+/* A pfd kept registered in conn_pollset across the waits of a connection
+ * (AP_MPM_WAIT_KEEP_PFDS), until released (ap_mpm_release_pfd(), or the
+ * connection resumed or closed): one-shot, so only the one that fired needs to
+ * be re-armed for the next wait, and a readiness while no wait is on it
+ * is remembered rather than lost. Its state is
+ * changed by CAS between the events (any thread) and the waits of its
+ * connection (one thread at a time), but for the re-arm (a plain set: it is
+ * disarmed or not registered then, or an event racing the set fires again
+ * after the re-arm):
+ *   KEPT_IDLE   -> KEPT_WAITED: a wait is on it, still armed (no syscall)
+ *   KEPT_WAITED -> KEPT_FIRED:  an event for the wait, disarmed (one-shot)
+ *   KEPT_WAITED -> KEPT_IDLE:   the wait completed otherwise, still armed
+ *   KEPT_IDLE   -> KEPT_READY:  an event while no wait is on it, disarmed
+ *   KEPT_FIRED  -> KEPT_READY:  an event for a wait completed otherwise
+ *   KEPT_READY, KEPT_FIRED, KEPT_NEW -> KEPT_WAITED: re-armed (or added) for
+ *                               the next wait, firing again right away if it
+ *                               is still ready (level-triggered)
+ * The record is in cs->p, so an event polled for it before its release can't
+ * read freed memory (see the drain epochs).
+ */
+#define KEPT_NEW     0u
+#define KEPT_IDLE    1u
+#define KEPT_WAITED  2u
+#define KEPT_FIRED   3u
+#define KEPT_READY   4u
+
+struct kept_pfd {
+    apr_pollfd_t pfd;         /* registered (NOCOPY), client_data = &pt */
+    listener_poll_type pt;    /* PT_KEPT, baton = this */
+    /*atomic*/ apr_uint32_t state; /* KEPT_* */
+    struct user_wait *wait;   /* the wait on it (KEPT_WAITED) */
+    event_conn_state_t *cs;   /* its connection */
+    struct kept_anchor *anchor; /* its descriptor's, if any */
+};
+
+/* A descriptor's link to its kept pfd, attached once to the socket or file
+ * (allocated in its pool, apr_socket_data_set() adds a node each time): for
+ * ap_mpm_release_pfd() to find it from the descriptor only, and to release
+ * it if the descriptor's pool is cleaned up while it's still kept (closed
+ * without being released first, a bug of its user). Linked both ways while
+ * kept, unlinked by any release or a cleanup of the connection's pool.
+ */
+struct kept_anchor {
+    struct kept_pfd *kept;    /* NULL when not kept */
+};
+#define KEPT_ANCHOR_KEY "mpm_event:kept_anchor"
 
 /* A notifier (ap_mpm_notifier_create()) fires the wait it's given to (see
  * event_notify()), from any thread; it's created before it's given to
@@ -1884,9 +1941,11 @@ static int take_back_worker_socket(apr_socket_t *csd)
     return !apr_atomic_read32(&workers_may_exit);
 }
 
+static void release_kept_pfds(event_conn_state_t *cs);
 static void close_connection_at(event_conn_state_t *cs,
                                 const char *at, int line)
 {
+    release_kept_pfds(cs);
     if (cs->c) {
         ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, cs->c,
                       "closing connection %" CS_FMT " at %s:%i",
@@ -2632,6 +2691,276 @@ static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
     cs->continuation.why = why;
 }
 
+/* Whether pfds can be kept (AP_MPM_WAIT_KEEP_PFDS): with one-shot pfds, so
+ * that a kept pfd outside of a wait fires once only (worker_poll implies
+ * them).
+ */
+static APR_INLINE int kept_pfds_enabled(void)
+{
+#ifdef APR_POLLONESHOT
+    return worker_poll;
+#else
+    return 0;
+#endif
+}
+
+/* The index of the connection's kept pfd for the descriptor of pfd, or -1 */
+static int kept_pfd_index(event_conn_state_t *cs, const apr_pollfd_t *pfd)
+{
+    int i;
+    for (i = 0; i < cs->nkept; i++) {
+        struct kept_pfd *kept = cs->kept[i];
+        if (kept->pfd.desc_type == pfd->desc_type
+            && (pfd->desc_type == APR_POLL_SOCKET
+                ? kept->pfd.desc.s == pfd->desc.s
+                : kept->pfd.desc.f == pfd->desc.f)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static APR_INLINE struct kept_pfd *find_kept_pfd(event_conn_state_t *cs,
+                                                 const apr_pollfd_t *pfd)
+{
+    int i = kept_pfd_index(cs, pfd);
+    return (i < 0) ? NULL : cs->kept[i];
+}
+
+/* A new kept pfd for the descriptor of pfd, or NULL if the table is full
+ * (the pfd is then registered for the wait only)
+ */
+static apr_status_t kept_anchor_cleanup(void *data);
+static apr_status_t kept_pfd_cleanup(void *data);
+
+/* The anchor of pfd's descriptor, or NULL if none and !create */
+static struct kept_anchor *kept_anchor_of(const apr_pollfd_t *pfd, int create)
+{
+    struct kept_anchor *anchor = NULL;
+    apr_pool_t *p;
+
+    if (pfd->desc_type == APR_POLL_SOCKET) {
+        (void)apr_socket_data_get((void **)&anchor, KEPT_ANCHOR_KEY,
+                                  pfd->desc.s);
+        if (anchor || !create) {
+            return anchor;
+        }
+        p = apr_socket_pool_get(pfd->desc.s);
+        anchor = apr_pcalloc(p, sizeof(*anchor));
+        (void)apr_socket_data_set(pfd->desc.s, anchor, KEPT_ANCHOR_KEY, NULL);
+    }
+    else if (pfd->desc_type == APR_POLL_FILE) {
+        /* The userdata of the file's pool, so keyed by the file too (e.g.
+         * the pipes of a process share a pool)
+         */
+        char key[64];
+        apr_snprintf(key, sizeof(key), KEPT_ANCHOR_KEY ":%pp",
+                     (void *)pfd->desc.f);
+        (void)apr_file_data_get((void **)&anchor, key, pfd->desc.f);
+        if (anchor || !create) {
+            return anchor;
+        }
+        p = apr_file_pool_get(pfd->desc.f);
+        anchor = apr_pcalloc(p, sizeof(*anchor));
+        (void)apr_file_data_set(pfd->desc.f, anchor, key, NULL);
+    }
+    else {
+        return NULL;
+    }
+    /* No child cleanup (as apr_socket_data_set() and apr_file_data_set()
+     * would register): a forked child must not unregister the descriptor
+     * from the pollset it shares.
+     */
+    apr_pool_cleanup_register(p, anchor, kept_anchor_cleanup,
+                              apr_pool_cleanup_null);
+    return anchor;
+}
+
+static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
+                                      const apr_pollfd_t *pfd)
+{
+    struct kept_anchor *anchor;
+    struct kept_pfd *kept;
+
+    if (cs->nkept >= EVENT_KEPT_MAX) {
+        return NULL;
+    }
+    anchor = kept_anchor_of(pfd, 0);
+    if (anchor && anchor->kept) {
+        /* Still kept for another connection, not released by its user (see
+         * AP_MPM_WAIT_KEEP_PFDS): registered for the wait only.
+         */
+        {
+            static log_ratelimit_t rl;
+            if (LOG_RATELIMIT(&rl, APLOG_ERR, 1, ap_server_conf, NULL)) {
+                ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf, APLOGNO()
+                             "pollfd kept by connection %" CS_FMT_TO " not released "
+                             "by its user (ap_mpm_release_pfd())",
+                             CS_ARG_TO(anchor->kept->cs));
+            }
+        }
+        AP_DEBUG_ASSERT(0);
+        return NULL;
+    }
+    kept = apr_pcalloc(cs->p, sizeof(*kept));
+    kept->pfd = *pfd;
+    kept->pfd.p = cs->p;
+    kept->pt.type = PT_KEPT;
+    kept->pt.baton = kept;
+    kept->pfd.client_data = &kept->pt;
+    kept->state = KEPT_NEW;
+    kept->cs = cs;
+    if (!anchor) {
+        anchor = kept_anchor_of(pfd, 1);
+    }
+    if (anchor) {
+        anchor->kept = kept;
+        kept->anchor = anchor;
+        apr_pool_cleanup_register(cs->p, kept, kept_pfd_cleanup,
+                                  apr_pool_cleanup_null);
+    }
+    cs->kept[cs->nkept++] = kept;
+    return kept;
+}
+
+/* Have the wait be on a kept pfd, for reqevents: without a syscall if it's
+ * still armed for them, else (re-)armed or added (firing right away if it is
+ * still ready). The wait is set before the state, read by the events after.
+ */
+static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
+                                 struct user_wait *user_wait,
+                                 apr_int16_t reqevents)
+{
+    kept->wait = user_wait;
+    if (kept->pfd.reqevents == reqevents
+        && apr_atomic_cas32(&kept->state, KEPT_WAITED,
+                            KEPT_IDLE) == KEPT_IDLE) {
+        return APR_SUCCESS;
+    }
+    /* New, fired, ready (an event raced the CAS above) or other events: an
+     * event armed for the previous events may still fire for this wait
+     * before the re-arm, with rtnevents it didn't ask for (spurious).
+     */
+    kept->pfd.reqevents = reqevents;
+    apr_atomic_set32(&kept->state, KEPT_WAITED);
+    return apr_pollset_add(conn_pollset, &kept->pfd);
+}
+
+/* An event on a kept pfd: the wait on it, to claim, or NULL if none
+ * (the readiness is then remembered for the next wait)
+ */
+static struct user_wait *kept_pfd_fired(struct kept_pfd *kept)
+{
+    if (apr_atomic_cas32(&kept->state, KEPT_FIRED,
+                         KEPT_WAITED) == KEPT_WAITED) {
+        return kept->wait;
+    }
+    (void)apr_atomic_cas32(&kept->state, KEPT_READY, KEPT_IDLE);
+    return NULL;
+}
+
+/* The wait of a fired kept pfd was completed otherwise (claimed by another
+ * thread): remember the readiness, unless the next wait re-armed it already.
+ */
+static APR_INLINE void kept_pfd_unclaimed(struct kept_pfd *kept)
+{
+    (void)apr_atomic_cas32(&kept->state, KEPT_READY, KEPT_FIRED);
+}
+
+/* The wait completes: its kept pfds that didn't fire stay armed, idle */
+static void idle_kept_pfds(event_conn_state_t *cs,
+                           struct user_wait *user_wait)
+{
+    int i;
+    for (i = 0; i < cs->nkept; i++) {
+        struct kept_pfd *kept = cs->kept[i];
+        if (kept->wait == user_wait) {
+            (void)apr_atomic_cas32(&kept->state, KEPT_IDLE, KEPT_WAITED);
+        }
+    }
+}
+
+/* Unregister the i-th kept pfd of the connection (no wait is on it) */
+static apr_status_t release_kept_pfd(event_conn_state_t *cs, int i)
+{
+    struct kept_pfd *kept = cs->kept[i];
+    apr_status_t rc = APR_SUCCESS;
+
+    if (apr_atomic_read32(&kept->state) != KEPT_NEW) {
+        rc = apr_pollset_remove(conn_pollset, &kept->pfd);
+        if (APR_STATUS_IS_NOTFOUND(rc)) {
+            rc = APR_SUCCESS;
+        }
+    }
+    kept->wait = NULL;
+    if (kept->anchor) {
+        kept->anchor->kept = NULL;
+        kept->anchor = NULL;
+        apr_pool_cleanup_kill(cs->p, kept, kept_pfd_cleanup);
+    }
+    cs->kept[i] = cs->kept[--cs->nkept];
+    return rc;
+}
+
+static int kept_index(event_conn_state_t *cs, const struct kept_pfd *kept)
+{
+    int i;
+    for (i = 0; i < cs->nkept; i++) {
+        if (cs->kept[i] == kept) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* The safety net: the pool of a descriptor still kept is cleaned up (it's
+ * about to be closed), release it first.
+ */
+static apr_status_t kept_anchor_cleanup(void *data)
+{
+    struct kept_anchor *anchor = data;
+    struct kept_pfd *kept = anchor->kept;
+
+    if (kept) {
+        int i = kept_index(kept->cs, kept);
+        if (i >= 0) {
+            (void)release_kept_pfd(kept->cs, i);
+        }
+        else {
+            anchor->kept = NULL;
+            kept->anchor = NULL;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+/* The pool of the connection keeping a descriptor is cleaned up first (it's
+ * released already, or the child is exiting): unlink the descriptor's anchor.
+ */
+static apr_status_t kept_pfd_cleanup(void *data)
+{
+    struct kept_pfd *kept = data;
+
+    if (kept->anchor) {
+        kept->anchor->kept = NULL;
+        kept->anchor = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+/* Unregister the kept pfds still there when the connection is resumed (the
+ * request is done, its users release only the sockets they give up before,
+ * see AP_MPM_WAIT_KEEP_PFDS) or closed (possibly while suspended, e.g.
+ * killed): an event on them would be for this connection (its cs->p)
+ * otherwise, and the connection's socket is polled by the MPM from now on.
+ */
+static void release_kept_pfds(event_conn_state_t *cs)
+{
+    while (cs->nkept > 0) {
+        (void)release_kept_pfd(cs, cs->nkept - 1);
+    }
+}
+
 /* The wait of a notifier is over, completed or dropped before being armed:
  * notifying it does nothing from now on, until it's re-armed for the next
  * wait (event_notifier_rearm()).
@@ -2665,6 +2994,7 @@ static apr_status_t user_wait_cleanup(void *data)
      * with arm_user_wait().
      */
     apr_thread_mutex_lock(user_wait->mutex);
+    idle_kept_pfds(user_wait->cs, user_wait);
     for (i = 0; i < pfds->nelts; i++) {
         apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
         if (pfd->client_data) {
@@ -2807,6 +3137,8 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
         pfd->rtnevents = 0;
         if (pfd->reqevents) {
+            struct kept_pfd *kept = NULL;
+
             if (pfd->reqevents & APR_POLLIN) {
                 pfd->reqevents |= APR_POLLHUP;
             }
@@ -2814,8 +3146,26 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 #ifdef APR_POLLONESHOT
             pfd->reqevents |= APR_POLLONESHOT; /* see pollset_add_at() */
 #endif
-            pfd->client_data = pt;
 
+            /* A kept pfd is registered by its record, this copy only gets
+             * the rtnevents (and user_wait_cleanup() skips it)
+             */
+            if (cs->nkept) {
+                kept = find_kept_pfd(cs, pfd);
+            }
+            if (!kept && user_wait->keep) {
+                kept = make_kept_pfd(cs, pfd);
+            }
+            if (kept) {
+                pfd->client_data = NULL;
+                rc = arm_kept_pfd(kept, user_wait, pfd->reqevents);
+                if (rc != APR_SUCCESS) {
+                    final_rc = rc;
+                }
+                continue;
+            }
+
+            pfd->client_data = pt;
             rc = apr_pollset_add(conn_pollset, pfd);
             if (rc != APR_SUCCESS) {
                 final_rc = rc;
@@ -2969,6 +3319,7 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
                                         const apr_array_header_t *pfds,
                                         apr_interval_time_t timeout,
                                         ap_mpm_notifier_t *notifier,
+                                        unsigned int flags,
                                         ap_mpm_continuation_fn_t *fn, void *baton)
 {
     event_conn_state_t *cs;
@@ -3007,8 +3358,33 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     }
     user_wait->continuation.fn = fn;
     user_wait->continuation.baton = baton;
+    user_wait->keep = ((flags & AP_MPM_WAIT_KEEP_PFDS)
+                       && kept_pfds_enabled());
     cs->pending_wait = user_wait;
     return APR_SUCCESS;
+}
+
+/* Release a descriptor kept for whichever connection
+ * (ap_mpm_release_pfd(), ap_mpm_release_pfds()), from the thread running
+ * it, no wait pending nor armed.
+ */
+static apr_status_t event_release_pfd(const apr_pollfd_t *pfd)
+{
+    struct kept_anchor *anchor = kept_anchor_of(pfd, 0);
+    struct kept_pfd *kept = (anchor) ? anchor->kept : NULL;
+    event_conn_state_t *cs;
+    int i;
+
+    if (!kept) {
+        return APR_SUCCESS; /* not kept */
+    }
+    cs = kept->cs;
+    if (cs->pending_wait || cs->user_wait) {
+        return APR_EBUSY;
+    }
+    i = kept_index(cs, kept);
+    AP_DEBUG_ASSERT(i >= 0);
+    return (i >= 0) ? release_kept_pfd(cs, i) : APR_SUCCESS;
 }
 
 /* Arm the pending wait of a connection, or run its continuation with
@@ -3045,6 +3421,7 @@ static void arm_pending_wait(event_conn_state_t *cs)
  */
 static void leave_suspended_state(event_conn_state_t *cs)
 {
+    release_kept_pfds(cs);
     apr_atomic_dec32(&event_counts.suspended_count);
     cs->c->suspended_baton = NULL;
     cs->c->sbh = cs->sbh;
@@ -4380,25 +4757,45 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 break;
 #endif
 
-            case PT_USER:
+            case PT_KEPT:
+            case PT_USER: {
+                /* A kept pfd's event is for the wait on it, if any
+                 * (else remembered for the next one), never stale.
+                 */
+                struct kept_pfd *kept = NULL;
+                int stale = 0;
+
                 /* Multiple pfds of the same baton might trigger in this pass
                  * so chain once here and run the cleanup only after this loop
                  * to avoid lifetime issues (i.e. user_wait->pool cleared while
                  * some of its pfd->client_data are still to be dereferenced here).
                  */
-                user_wait = pt->baton;
+                if (pt->type == PT_KEPT) {
+                    kept = pt->baton;
+                    user_wait = kept_pfd_fired(kept);
+                    if (!user_wait) {
+                        break;
+                    }
+                }
+                else {
+                    user_wait = pt->baton;
+                    stale = stale_user_wait(pt);
+                }
                 if (!user_wait->chained) {
                     /* Ours unless completed meanwhile (timer, notifier, other
                      * thread), else this is a stale event.
                      */
-                    if (stale_user_wait(pt) || !claim_user_wait(user_wait)) {
+                    if (stale || !claim_user_wait(user_wait)) {
+                        if (kept) {
+                            kept_pfd_unclaimed(kept);
+                        }
                         break;
                     }
                     user_wait->chained = 1;
                     user_wait->next = user_chain;
                     user_chain = user_wait;
                 }
-                else if (stale_user_wait(pt)) {
+                else if (stale) {
                     break;
                 }
                 if (user_wait->continuation.fn) {
@@ -4416,6 +4813,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     }
                 }
                 break;
+            }
 
             case PT_QUEUE:
                 /* The doorbell is in conn_pollset only (worker_poll) */
@@ -4759,14 +5157,33 @@ static event_conn_state_t *worker_poll_one(int slot,
         DRAIN_STAT_INC(drain_csd);
         break;
 
+    case PT_KEPT:
     case PT_USER: {
-        struct user_wait *user_wait = pt->baton;
+        struct user_wait *user_wait;
+        struct kept_pfd *kept = NULL;
         apr_array_header_t *pfds;
         int i;
 
-        if (stale_user_wait(pt) || !claim_user_wait(user_wait)) {
-            DRAIN_STAT_INC(drain_dropped);
-            break;
+        if (pt->type == PT_KEPT) {
+            /* For the wait on it, else remembered for the next */
+            kept = pt->baton;
+            user_wait = kept_pfd_fired(kept);
+            if (!user_wait) {
+                DRAIN_STAT_INC(drain_dropped);
+                break;
+            }
+            if (!claim_user_wait(user_wait)) {
+                kept_pfd_unclaimed(kept);
+                DRAIN_STAT_INC(drain_dropped);
+                break;
+            }
+        }
+        else {
+            user_wait = pt->baton;
+            if (stale_user_wait(pt) || !claim_user_wait(user_wait)) {
+                DRAIN_STAT_INC(drain_dropped);
+                break;
+            }
         }
         cs = user_wait->cs;
         AP_DEBUG_ASSERT(cs->user_wait == user_wait);
@@ -7202,6 +7619,7 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_register_wait(event_register_wait, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_release_pfd(event_release_pfd, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notifier_create(event_notifier_create, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notify(event_notify, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notifier_rearm(event_notifier_rearm, NULL, NULL,

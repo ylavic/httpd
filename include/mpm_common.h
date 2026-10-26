@@ -448,7 +448,12 @@ AP_DECLARE_HOOK(apr_status_t, mpm_resume_suspended, (conn_rec*))
 AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
                 (conn_rec *c, apr_pool_t *p, const apr_array_header_t *pfds,
                  apr_interval_time_t timeout, ap_mpm_notifier_t *notifier,
-                 ap_mpm_continuation_fn_t *fn, void *baton))
+                 unsigned int flags, ap_mpm_continuation_fn_t *fn, void *baton))
+
+/** Release a kept descriptor (see ap_mpm_release_pfd())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_release_pfd, (const apr_pollfd_t *pfd))
 
 /** Create a notifier for a wait (see ap_mpm_notifier_create())
  * @ingroup hooks

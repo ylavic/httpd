@@ -72,6 +72,7 @@
     APR_HOOK_LINK(mpm_get_name) \
     APR_HOOK_LINK(mpm_resume_suspended) \
     APR_HOOK_LINK(mpm_register_wait) \
+    APR_HOOK_LINK(mpm_release_pfd) \
     APR_HOOK_LINK(mpm_notifier_create) \
     APR_HOOK_LINK(mpm_notify) \
     APR_HOOK_LINK(mpm_notifier_rearm) \
@@ -118,10 +119,12 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_wait,
                             (conn_rec *c, apr_pool_t *p,
                              const apr_array_header_t *pfds,
                              apr_interval_time_t timeout,
-                             ap_mpm_notifier_t *notifier,
+                             ap_mpm_notifier_t *notifier, unsigned int flags,
                              ap_mpm_continuation_fn_t *fn, void *baton),
-                            (c, p, pfds, timeout, notifier, fn, baton),
+                            (c, p, pfds, timeout, notifier, flags, fn, baton),
                             APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_release_pfd,
+                            (const apr_pollfd_t *pfd), (pfd), APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_create,
                             (ap_mpm_notifier_t **notifier, conn_rec *c,
                              apr_pool_t *p),
@@ -633,10 +636,31 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
                                               const apr_array_header_t *pfds,
                                               apr_interval_time_t timeout,
                                               ap_mpm_notifier_t *notifier,
+                                              unsigned int flags,
                                               ap_mpm_continuation_fn_t *fn,
                                               void *baton)
 {
-    return ap_run_mpm_register_wait(c, p, pfds, timeout, notifier, fn, baton);
+    return ap_run_mpm_register_wait(c, p, pfds, timeout, notifier, flags,
+                                    fn, baton);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_release_pfds(const apr_array_header_t *pfds)
+{
+    apr_status_t rv, final_rv = APR_SUCCESS;
+    int i;
+
+    for (i = 0; pfds && i < pfds->nelts; i++) {
+        rv = ap_mpm_release_pfd(&APR_ARRAY_IDX(pfds, i, apr_pollfd_t));
+        if (rv != APR_SUCCESS) {
+            final_rv = rv;
+        }
+    }
+    return final_rv;
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_release_pfd(const apr_pollfd_t *pfd)
+{
+    return ap_run_mpm_release_pfd(pfd);
 }
 
 AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,

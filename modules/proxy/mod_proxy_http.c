@@ -629,7 +629,7 @@ static int proxy_http_response_suspend(proxy_http_req_t *req)
                                && req->worker->s->ping_timeout_set)
                               ? req->worker->s->ping_timeout
                               : req->idle_timeout,
-                              NULL, proxy_http_response_head_continuation, req);
+                              NULL, 0, proxy_http_response_head_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                       "proxy %s: can't wait for the response asynchronously",
@@ -829,7 +829,7 @@ static int proxy_http_request_forward_wait(proxy_http_req_t *req,
         timeout = proxy_http_request_read_timeout(r);
         break;
     }
-    rv = ap_mpm_register_wait(c, req->async_pool, pfds, timeout, NULL,
+    rv = ap_mpm_register_wait(c, req->async_pool, pfds, timeout, NULL, 0,
                               proxy_http_request_forward_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
@@ -1865,7 +1865,7 @@ static int proxy_http_response_body_wait(proxy_http_req_t *req,
     rv = ap_mpm_register_wait(c, req->async_pool, pfds,
                               for_client ? r->server->timeout
                                             : req->idle_timeout,
-                              NULL, proxy_http_response_body_continuation, req);
+                              NULL, 0, proxy_http_response_body_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                       "proxy %s: can't wait for the %s asynchronously",
@@ -3076,7 +3076,7 @@ static int proxy_http_connect(proxy_http_req_t *req)
     ppfd->desc.s = req->connect.sock;
     ppfd->reqevents = req->connect.events;
     rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
-                              req->connect.timeout, NULL,
+                              req->connect.timeout, NULL, 0,
                               proxy_http_connect_continuation, req);
     if (rv != APR_SUCCESS) {
         /* We can't wait asynchronously: wait synchronously, for each address
@@ -3192,7 +3192,7 @@ static int proxy_http_handshake(proxy_http_req_t *req)
     pfd->desc.s = backend->sock;
     pfd->reqevents = events;
     rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
-                              req->idle_timeout, NULL,
+                              req->idle_timeout, NULL, 0,
                               proxy_http_handshake_continuation, req);
     if (rv != APR_SUCCESS) {
         /* We can't wait asynchronously, so the first write of the request
@@ -3637,7 +3637,7 @@ static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
     pfd->desc_type = APR_POLL_SOCKET;
     pfd->desc.s = ap_get_conn_socket(c);
     pfd->reqevents = APR_POLLIN;
-    rv = ap_mpm_register_wait(c, pr->wait_pool, pfds, proxy_http_request_read_timeout(r), NULL,
+    rv = ap_mpm_register_wait(c, pr->wait_pool, pfds, proxy_http_request_read_timeout(r), NULL, 0,
                               proxy_http_request_preread_continuation, pr);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
@@ -3722,7 +3722,7 @@ static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
     rv = ap_mpm_register_wait(r->connection, aw->wait_pool, NULL,
                               worker->s->acquire_set ? worker->s->acquire
                                                        : r->server->timeout,
-                              aw->notifier, proxy_http_acquire_continuation, aw);
+                              aw->notifier, 0, proxy_http_acquire_continuation, aw);
     if (rv != APR_SUCCESS) {
         ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
         return ap_proxy_acquire_connection(scheme, backend, worker, r->server);

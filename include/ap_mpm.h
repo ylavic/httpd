@@ -248,7 +248,8 @@ typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
  * @param pfds The apr_pollfd_t to wait for (their client_data is used by the
  * MPM), possibly none (NULL or empty)
  * @param timeout The timeout of the wait, or -1 for none
- * @param wakeup The wakeup of the wait (ap_mpm_notifier_create()), or NULL
+ * @param notifier The notifier of the wait (ap_mpm_notifier_create()), or NULL
+ * @param flags AP_MPM_WAIT_* flags, or 0
  * @param fn The continuation called by the MPM when the wait completes
  * @param baton The baton passed to @a fn
  * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
@@ -268,8 +269,44 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
                                               const apr_array_header_t *pfds,
                                               apr_interval_time_t timeout,
                                               ap_mpm_notifier_t *notifier,
+                                              unsigned int flags,
                                               ap_mpm_continuation_fn_t *fn,
                                               void *baton);
+
+/**
+ * Flag for ap_mpm_register_wait(): keep the pfds registered in the MPM once
+ * the wait completes (armed, or their readiness remembered), for the next
+ * waits on them, until ap_mpm_release_pfds() or ap_mpm_release_pfd(), or
+ * the connection is resumed (ap_mpm_resume_suspended(), the request is done)
+ * or closed. Meanwhile the owner of a socket or file (pipe) must release it
+ * before giving it up (closing it, or letting another connection use it),
+ * mod_proxy does for its backend connections; a kept descriptor whose pool is
+ * cleaned up is released then too, but not if it's closed otherwise
+ * (apr_socket_close(), apr_file_close()).
+ * An MPM that can't keep them ignores the flag (each wait registers its pfds).
+ */
+#define AP_MPM_WAIT_KEEP_PFDS (1u << 0)
+
+/**
+ * Release the pfds of an array as ap_mpm_release_pfd() does for each.
+ * @param pfds The pfds to release (those not kept are ignored)
+ * @return APR_SUCCESS, or the last error of ap_mpm_release_pfd()
+ */
+AP_DECLARE(apr_status_t) ap_mpm_release_pfds(const apr_array_header_t *pfds);
+
+/**
+ * Release a socket or file (pipe) kept for whichever connection
+ * (AP_MPM_WAIT_KEEP_PFDS), before giving it up (closing it, or letting
+ * another connection use it).
+ * @param pfd The descriptor to release (desc_type and desc only)
+ * @return APR_SUCCESS (also if it's not kept), APR_ENOTIMPL if the MPM
+ * doesn't support it, APR_EBUSY if a wait is registered for the connection
+ * keeping it, or an error
+ * @remark It must be called from the thread running the connection keeping
+ * it, while no wait is registered for it (e.g. from its handler or a
+ * continuation, where the descriptor's owner gives it up).
+ */
+AP_DECLARE(apr_status_t) ap_mpm_release_pfd(const apr_pollfd_t *pfd);
 
 /**
  * Create a notifier for the next wait of a request (ap_mpm_register_wait()).

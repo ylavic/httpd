@@ -269,7 +269,7 @@ static int aptest_queue(request_rec *r)
                 pfd->desc.f = in;
                 pfd->reqevents = APR_POLLIN;
                 if (ap_mpm_register_wait(r->connection, p, pfds, q->suspend,
-                                         NULL, aptest_queue_continuation,
+                                         NULL, 0, aptest_queue_continuation,
                                          q) == APR_SUCCESS) {
                     return SUSPENDED;
                 }
