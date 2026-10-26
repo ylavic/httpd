@@ -1,0 +1,66 @@
+Async proxying and MPM queuing: benchmark harness and checks (prototype)
+
+Build the Go tools (Go >= 1.21, no module needed):
+  go build -o backend backend.go     # backend: GET /?d=MS answers 512 bytes after MS ms,
+                                     # "Upgrade: echo" gets a 101 then an echo
+  go build -o loadgen loadgen.go     # load generator (closed loop, or open loop -rate)
+  go build -o tunnelgen tunnelgen.go # tunnels (Upgrade: echo) sending a message every -i
+
+Build mod_aptest (its "aptest-queue" handler, controlled service times):
+  cd ../pyhttpd/mod_aptest && $PREFIX/bin/apxs -c mod_aptest.c
+
+The scripts start their own httpd from an install prefix ($PREFIX, e.g. built
+from this tree) with their own configuration under WORKDIR, on 127.0.0.1
+ports 18431-18435 (checks) and 18500-18510 (bench, queue). They pin httpd on
+CPUs 0-3 and the tools on 4-7 (taskset); for stable numbers use a fixed CPU
+frequency (cpupower frequency-set -g performance, no turbo).
+
+bench.py PREFIX WORKDIR [delays] [backend_ms]
+  ProxyAsyncDelay benchmark: blocking (-1) vs async (0, 1ms, 10ms) against
+  backends answering in 0/1/10/100ms, 64 clients on one child of 8 threads;
+  throughput, latency percentiles, CPU and context switches per request of
+  the httpd tree. POOLMAX sets the backend pool's max= (256 by default, below
+  CLIENTS for a pool-bound run where requests wait for a connection); STRACE=1
+  adds the httpd child's syscalls per request (strace -c over the measured
+  window, which slows it down: only the per-request ratios are meaningful).
+  Build httpd optimized for numbers that mean something (-O2, no AP_DEBUG).
+  Run it several times into log files, then medians.py LOG... for the median
+  of each cell.
+
+tunnelbench.py PREFIX WORKDIR [tunnels,...]
+  Tunnel benchmark: 100, 1000 and 5000 tunnels by default (Upgrade: echo
+  through mod_proxy_http, async), each sending a SIZE-byte message (64) every
+  INTERVAL (1s) to the backend's echo; messages/s, latency percentiles, CPU
+  and context switches per message, and syscalls with STRACE=1 (the
+  epoll_ctl churn per message). DELAY=-1 for blocking tunnels (one thread
+  each, so no more tunnels than ThreadsPerChild). medians.py reads its logs
+  too.
+
+queue.py PREFIX MOD_APTEST_SO WORKDIR [scenario...]
+  MPM queuing scenarios (burst, overload-cpu, blocked, async-mix, progress,
+  two-children): a background load and open-loop probes (a new connection
+  each, latency from the scheduled time) against "aptest-queue", with the
+  server's backlog stats (mpm_event's "backlog sojourn" lines, LogLevel
+  mpm_event:trace2) aggregated over the measured window and httpd's CPU use.
+  The admission's target and interval (ms, 5 and 100 by default) are set at
+  build time (-DAP_EVENT_ADMISSION_TARGET=, -DAP_EVENT_ADMISSION_INTERVAL=).
+
+checks/async-*-check.py PREFIX WORKDIR
+  Functional checks of the async proxy paths, each comparing blocking ("sync")
+  and async (ProxyAsyncDelay 0) modes (MODES="sync async" by default):
+  proto (response wait), body (response body), send (request body), head
+  (response head), connect, pool (waiting for a connection of an exhausted
+  pool, max= and acquire=), prefetch (request body before acquiring), tls
+  (backend handshake), remote (the CONNECT exchange with a forward proxy,
+  ProxyRemote, in front of the tls backend), balancer (failover,
+  failonstatus/failontimeout), shutdown (graceful and hard restarts/stops
+  with suspended requests), 100 (Expect: 100-continue end-to-end, ping=, ping
+  timeout, final responses instead of 100, the 100 sent by httpd itself, and
+  uploads waiting for the 100 not holding a worker), tunnel (Upgrade: tunnels
+  exchanging data, many on few threads, the idle timeout, either side
+  closing, a large transfer to a slow client, Upgrades answered late or
+  refused; tunnels being async by default, "sync" is ProxyAsyncDelay -1
+  there, and the "default", "wstunnel" (mod_proxy_wstunnel) and "connect"
+  (mod_proxy_connect) modes are added).
+  PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
+  backend connection pool).
