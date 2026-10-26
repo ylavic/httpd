@@ -329,7 +329,19 @@ typedef struct {
     ap_getline_state_t *head_state;
     apr_bucket_brigade *head_bb;
 
-    unsigned int can_suspend            :1,
+    /* The state of the steps run by proxy_http_process(), including a
+     * connect in progress (proxy_http_connect())
+     */
+    char *url, *locurl;
+    apr_uri_t *uri;
+    const char *proxyname;
+    apr_port_t proxyport;
+    int retry;
+    ap_proxy_connect_state connect;
+
+    unsigned int connecting             :1,
+                 toclose                :1,
+                 can_suspend            :1,
                  body_async             :1,
                  direction              :2, /* ap_proxy_direction_e */
                  backend_broke          :1,
@@ -2730,6 +2742,276 @@ static void proxy_http_finish_request(request_rec *r, int status)
     ap_mpm_resume_suspended(c);
 }
 
+static int proxy_http_process(proxy_http_req_t *req);
+
+/* The continuation of proxy_http_connect(), called when the connect in
+ * progress completes (or on timeout or error): go on with the steps from
+ * there.
+ */
+static void proxy_http_connect_continuation(conn_rec *c, request_rec *r,
+                                            ap_mpm_wait_result_e why,
+                                            const apr_array_header_t *pfds,
+                                            void *baton)
+{
+    proxy_http_req_t *req = baton;
+    int status;
+
+    AP_DEBUG_ASSERT(req->r == r);
+    switch (why) {
+    case AP_MPM_WAIT_READY:
+        req->connect.status = APR_SUCCESS;
+        break;
+    case AP_MPM_WAIT_TIMEOUT:
+        /* Fail this address: the next one is tried */
+        req->connect.status = APR_TIMEUP;
+        break;
+    default:
+        ap_proxy_connect_backend_cancel(&req->connect);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: can't wait for the connection to %s:%d "
+                      "(async, %i)", req->proto,
+                      req->backend->hostname, req->backend->port, (int)why);
+        status = HTTP_SERVICE_UNAVAILABLE;
+        goto finish;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: connect %s (async)", req->proto,
+                  why == AP_MPM_WAIT_READY ? "ready" : "timeout");
+
+    req->connecting = 1;
+    status = proxy_http_process(req);
+    if (status == SUSPENDED) {
+        return;
+    }
+
+finish:
+    /* Clean up as proxy_http_handler() does */
+    if (req->backend) {
+        if (status != OK) {
+            req->backend->close = 1;
+        }
+        ap_proxy_release_connection(req->proto, req->backend, r->server);
+        req->backend = NULL;
+    }
+    proxy_http_async_finish(req, status);
+}
+
+/* Connect to the backend, without blocking when waiting asynchronously is
+ * possible (ProxyAsyncDelay). Each connect in progress is polled first (for up
+ * to ProxyAsyncDelay the first time, then without waiting, so that a connect
+ * which has completed already doesn't suspend), then waited for in the MPM
+ * with the connect timeout (proxy_http_connect_continuation() continues then).
+ * Returns OK, SUSPENDED or DECLINED.
+ */
+static int proxy_http_connect(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    proxy_conn_rec *backend = req->backend;
+    apr_array_header_t *pfds;
+    apr_pollfd_t pfd, *ppfd;
+    apr_interval_time_t delay = 0;
+    apr_int32_t nready;
+    apr_status_t rv;
+    int status;
+
+    if (!req->connecting) {
+        if (!req->can_suspend) {
+            return ap_proxy_connect_backend(req->proto, backend, req->worker,
+                                            r->server);
+        }
+        memset(&req->connect, 0, sizeof(req->connect));
+        delay = req->dconf->async_delay;
+    }
+    req->connecting = 0;
+
+    for (;;) {
+        status = ap_proxy_connect_backend_ex(req->proto, backend, req->worker,
+                                             r->server, &req->connect);
+        if (status != SUSPENDED) {
+            return status;
+        }
+
+        /* Poll for ProxyAsyncDelay the first time, then for 0: a nonblocking
+         * connect is always in progress at first, even when it completes
+         * right away (e.g. on loopback).
+         */
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.p = r->pool;
+        pfd.desc_type = APR_POLL_SOCKET;
+        pfd.desc.s = req->connect.sock;
+        pfd.reqevents = APR_POLLOUT;
+        nready = 0;
+        if (delay >= req->connect.timeout) {
+            delay = req->connect.timeout;
+        }
+        rv = apr_poll(&pfd, 1, &nready, delay);
+        if (APR_STATUS_IS_TIMEUP(rv)) {
+            if (delay < req->connect.timeout) {
+                req->connect.timeout -= delay;
+                break;
+            }
+            req->connect.status = APR_TIMEUP;
+        }
+        delay = 0;
+    }
+
+    if (req->async_pool) {
+        apr_pool_clear(req->async_pool);
+    }
+    else {
+        apr_pool_create(&req->async_pool, req->p);
+    }
+    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
+    ppfd = apr_array_push(pfds);
+    memset(ppfd, 0, sizeof(*ppfd));
+    ppfd->p = req->async_pool;
+    ppfd->desc_type = APR_POLL_SOCKET;
+    ppfd->desc.s = req->connect.sock;
+    ppfd->reqevents = APR_POLLOUT;
+    rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
+                             req->connect.timeout, proxy_http_connect_continuation,
+                             req);
+    if (rv != APR_SUCCESS) {
+        /* We can't wait asynchronously: wait synchronously, for each address
+         * as needed.
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy %s: can't wait for the connection "
+                      "asynchronously", req->proto);
+        do {
+            memset(&pfd, 0, sizeof(pfd));
+            pfd.p = r->pool;
+            pfd.desc_type = APR_POLL_SOCKET;
+            pfd.desc.s = req->connect.sock;
+            pfd.reqevents = APR_POLLOUT;
+            nready = 0;
+            rv = apr_poll(&pfd, 1, &nready, req->connect.timeout);
+            if (APR_STATUS_IS_TIMEUP(rv)) {
+                req->connect.status = APR_TIMEUP;
+            }
+            status = ap_proxy_connect_backend_ex(req->proto, backend,
+                                                 req->worker, r->server,
+                                                 &req->connect);
+        } while (status == SUSPENDED);
+        return status;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: connecting to %s:%d (async)", req->proto,
+                  backend->hostname, backend->port);
+    return SUSPENDED;
+}
+
+/* Run Steps Two to Five of proxy_http_handler(): from Step Two (again for a
+ * 100-continue retry), or from the connect in progress when resumed
+ * (req->connecting, proxy_http_connect_continuation()).
+ * Returns the status of the request, or SUSPENDED.
+ */
+static int proxy_http_process(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    proxy_conn_rec *backend = req->backend;
+    const char *scheme = req->proto;
+    int status = OK;
+
+    while (req->retry < 2) {
+        if (req->retry && !req->connecting) {
+            char *newurl = req->url;
+
+            /* Step One (again): (Re)Determine Who To Connect To */
+            if ((status = ap_proxy_determine_connection(req->p, r, req->sconf,
+                            req->worker, backend, req->uri, &newurl,
+                            req->proxyname, req->proxyport,
+                            req->server_portstr, sizeof(req->server_portstr))))
+                break;
+
+            /* The code assumes locurl is not changed during the loop, or
+             * ap_proxy_http_prefetch() would have to be called every time,
+             * and header_brigade be changed accordingly...
+             */
+            AP_DEBUG_ASSERT(strcmp(newurl, req->locurl) == 0);
+        }
+
+        /* Step Two: Make the Connection */
+        if (req->connecting
+            || ap_proxy_check_connection(scheme, backend, r->server, 1, PROXY_CHECK_CONN_EMPTY)) {
+            status = proxy_http_connect(req);
+            if (status == SUSPENDED) {
+                return SUSPENDED;
+            }
+            if (status != OK) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01114)
+                              "HTTP: failed to make connection to backend: %s",
+                              backend->hostname);
+                status = HTTP_SERVICE_UNAVAILABLE;
+                break;
+            }
+        }
+
+        /* Step Three: Create conn_rec */
+        if ((status = ap_proxy_connection_create_ex(scheme, backend, r)) != OK)
+            break;
+        req->origin = backend->connection;
+
+        /* Don't recycle the connection if prefetch (above) told not to do so */
+        if (req->toclose) {
+            backend->close = 1;
+            req->origin->keepalive = AP_CONN_CLOSE;
+        }
+
+        /* Step Four: Send the Request
+         * On the off-chance that we forced a 100-Continue as a
+         * kinda HTTP ping test, allow for retries
+         */
+        /* Don't hold the thread while the client or the backend is slow
+         * (as for the response, see Step Five below).
+         */
+        req->send_async = (req->can_suspend
+                           && !req->do_100_continue && !req->upgrade);
+        req->request_eos = 0;
+        req->bytes_streamed = 0;
+        status = ap_proxy_http_request(req);
+        if (status == SUSPENDED) {
+            return SUSPENDED;
+        }
+        if (status != OK) {
+            proxy_run_detach_backend(r, backend);
+            if (req->do_100_continue && status == HTTP_SERVICE_UNAVAILABLE) {
+                ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, APLOGNO(01115)
+                              "HTTP: 100-Continue failed to %pI (%s:%d)",
+                              backend->addr, backend->hostname, backend->port);
+                backend->close = 1;
+                req->retry++;
+                continue;
+            }
+            break;
+        }
+
+        /* Step Five: Receive the Response... Fall thru to cleanup */
+        if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
+            /* Don't hold the thread while the backend processes the request
+             * (except for upgrades, whose tunnel path uses the hooks, and for
+             * 100-continue's ping).
+             */
+            status = proxy_http_response_head_wait(req);
+            if (status == SUSPENDED) {
+                return SUSPENDED;
+            }
+        }
+        status = ap_proxy_http_process_response(req);
+        if (status == SUSPENDED) {
+            return SUSPENDED;
+        }
+        if (req->backend) {
+            proxy_run_detach_backend(r, req->backend);
+        }
+
+        break;
+    }
+
+    return status;
+}
+
 static int proxy_http_handler(request_rec *r, proxy_worker *worker,
                               proxy_server_conf *conf,
                               char *url, const char *proxyname,
@@ -2891,9 +3173,7 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
     int is_ssl = 0;
     conn_rec *c = r->connection;
     proxy_dir_conf *dconf;
-    int retry = 0;
     char *locurl = url;
-    int toclose = 0;
     /*
      * Use a shorter-lived pool to reduce memory usage
      * and avoid a memory leak
@@ -3067,97 +3347,18 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
      * assure what is expected later by using a local flag and do the right thing
      * when ap_proxy_connect_backend() below provides the connection to close.
      */
-    toclose = backend->close;
+    req->toclose = backend->close;
     backend->close = 0;
 
-    while (retry < 2) {
-        if (retry) {
-            char *newurl = url;
-
-            /* Step One (again): (Re)Determine Who To Connect To */
-            if ((status = ap_proxy_determine_connection(p, r, conf, worker,
-                            backend, uri, &newurl, proxyname, proxyport,
-                            req->server_portstr, sizeof(req->server_portstr))))
-                break;
-
-            /* The code assumes locurl is not changed during the loop, or
-             * ap_proxy_http_prefetch() would have to be called every time,
-             * and header_brigade be changed accordingly...
-             */
-            AP_DEBUG_ASSERT(strcmp(newurl, locurl) == 0);
-        }
-
-        /* Step Two: Make the Connection */
-        if (ap_proxy_check_connection(scheme, backend, r->server, 1,
-                                      PROXY_CHECK_CONN_EMPTY)
-                && ap_proxy_connect_backend(scheme, backend, worker,
-                                            r->server)) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01114)
-                          "HTTP: failed to make connection to backend: %s",
-                          backend->hostname);
-            status = HTTP_SERVICE_UNAVAILABLE;
-            break;
-        }
-
-        /* Step Three: Create conn_rec */
-        if ((status = ap_proxy_connection_create_ex(scheme, backend, r)) != OK)
-            break;
-        req->origin = backend->connection;
-
-        /* Don't recycle the connection if prefetch (above) told not to do so */
-        if (toclose) {
-            backend->close = 1;
-            req->origin->keepalive = AP_CONN_CLOSE;
-        }
-
-        /* Step Four: Send the Request
-         * On the off-chance that we forced a 100-Continue as a
-         * kinda HTTP ping test, allow for retries
-         */
-        /* Don't hold the thread while the client or the backend is slow
-         * (as for the response, see Step Five below).
-         */
-        req->send_async = (req->can_suspend
-                           && !req->do_100_continue && !req->upgrade);
-        req->request_eos = 0;
-        req->bytes_streamed = 0;
-        status = ap_proxy_http_request(req);
-        if (status == SUSPENDED) {
-            return SUSPENDED;
-        }
-        if (status != OK) {
-            proxy_run_detach_backend(r, backend);
-            if (req->do_100_continue && status == HTTP_SERVICE_UNAVAILABLE) {
-                ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, APLOGNO(01115)
-                              "HTTP: 100-Continue failed to %pI (%s:%d)",
-                              backend->addr, backend->hostname, backend->port);
-                backend->close = 1;
-                retry++;
-                continue;
-            }
-            break;
-        }
-
-        /* Step Five: Receive the Response... Fall thru to cleanup */
-        if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
-            /* Don't hold the thread while the backend processes the request
-             * (except for upgrades, whose tunnel path uses the hooks, and for
-             * 100-continue's ping).
-             */
-            status = proxy_http_response_head_wait(req);
-            if (status == SUSPENDED) {
-                return SUSPENDED;
-            }
-        }
-        status = ap_proxy_http_process_response(req);
-        if (status == SUSPENDED) {
-            return SUSPENDED;
-        }
-        if (req->backend) {
-            proxy_run_detach_backend(r, req->backend);
-        }
-
-        break;
+    /* Steps Two to Five (on SUSPENDED, they continue asynchronously) */
+    req->url = url;
+    req->locurl = locurl;
+    req->uri = uri;
+    req->proxyname = proxyname;
+    req->proxyport = proxyport;
+    status = proxy_http_process(req);
+    if (status == SUSPENDED) {
+        return SUSPENDED;
     }
 
     /* Step Six: Clean Up */

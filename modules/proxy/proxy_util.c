@@ -3939,6 +3939,23 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                                             proxy_worker *worker,
                                             server_rec *s)
 {
+    return ap_proxy_connect_backend_ex(proxy_function, conn, worker, s, NULL);
+}
+
+PROXY_DECLARE(void) ap_proxy_connect_backend_cancel(ap_proxy_connect_state *state)
+{
+    if (state->sock) {
+        apr_socket_close(state->sock);
+        state->sock = NULL;
+    }
+}
+
+PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
+                                               proxy_conn_rec *conn,
+                                               proxy_worker *worker,
+                                               server_rec *s,
+                                               ap_proxy_connect_state *state)
+{
     apr_status_t rv;
     int loglevel;
     remote_connect_info *connect_info = conn->forward;
@@ -3946,11 +3963,41 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
     /* the local address to use for the outgoing connection */
     apr_sockaddr_t *local_addr;
     apr_socket_t *newsock;
+    apr_interval_time_t conn_timeout;
     void *sconf = s->module_config;
     int address_reusable = worker->s->is_address_reusable;
     int did_dns_lookup = 0;
     proxy_server_conf *conf =
         (proxy_server_conf *) ap_get_module_config(sconf, &proxy_module);
+
+    if (state && state->sock) {
+        /* Complete the connect in progress (we returned SUSPENDED), or fail
+         * it as the caller asked, then go on from connect_done like any
+         * connect (the next address on failure).
+         */
+        newsock = state->sock;
+        backend_addr = state->addr;
+        did_dns_lookup = state->did_dns_lookup;
+        conn_timeout = state->timeout;
+        state->sock = NULL;
+        rv = state->status;
+        if (rv == APR_SUCCESS) {
+            rv = apr_socket_connect(newsock, backend_addr);
+        }
+        goto connect_done;
+    }
+    if (state && (connect_info || conn->uds_path)) {
+        /* Blocking connect for these:
+         * - Unix domain sockets: the connect completes right away unless
+         *   the backend's backlog is full, and a nonblocking connect can't
+         *   portably be waited for then (e.g. on Linux it fails with EAGAIN,
+         *   nothing in progress, and polling the socket returns at once), so
+         *   only the blocking connect waits for room in the backlog.
+         * - Through a forward proxy (CONNECT): not implemented without
+         *   blocking (yet), the CONNECT exchange is blocking.
+         */
+        state = NULL;
+    }
 
     rv = ap_proxy_check_connection(proxy_function, conn, s, 0, 0);
     if (rv == APR_EINVAL) {
@@ -4041,19 +4088,22 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                              "Failed to set");
             }
 
-            /* Set a timeout for connecting to the backend on the socket */
+            /* The timeout for connecting to the backend: set on the socket
+             * when blocking, otherwise given to the caller to wait with.
+             */
             if (worker->s->conn_timeout_set) {
-                apr_socket_timeout_set(newsock, worker->s->conn_timeout);
+                conn_timeout = worker->s->conn_timeout;
             }
             else if (worker->s->timeout_set) {
-                apr_socket_timeout_set(newsock, worker->s->timeout);
+                conn_timeout = worker->s->timeout;
             }
             else if (conf->timeout_set) {
-                apr_socket_timeout_set(newsock, conf->timeout);
+                conn_timeout = conf->timeout;
             }
             else {
-                apr_socket_timeout_set(newsock, s->timeout);
+                conn_timeout = s->timeout;
             }
+            apr_socket_timeout_set(newsock, state ? 0 : conn_timeout);
             /* Set a keepalive option */
             if (worker->s->keepalive) {
                 if ((rv = apr_socket_opt_set(newsock,
@@ -4082,6 +4132,25 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
 
             /* make the connection out of the socket */
             rv = apr_socket_connect(newsock, backend_addr);
+
+connect_done:
+            if (state && (APR_STATUS_IS_EINPROGRESS(rv)
+#ifdef EALREADY
+                          || rv == APR_FROM_OS_ERROR(EALREADY)
+#endif
+                          )) {
+                /* The connect is in progress: the caller waits for it */
+                state->sock = newsock;
+                state->addr = backend_addr;
+                state->did_dns_lookup = did_dns_lookup;
+                state->timeout = conn_timeout;
+                state->status = APR_SUCCESS;
+                ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
+                             "%s: connecting to %pI (%s:%hu) in progress",
+                             proxy_function, backend_addr,
+                             conn->hostname, conn->port);
+                return SUSPENDED;
+            }
 
             /* if an error occurred, loop round and try again */
             if (rv != APR_SUCCESS) {

@@ -1234,6 +1234,46 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                                             proxy_worker *worker,
                                             server_rec *s);
 
+/* The state of a connection to the backend in progress, see
+ * ap_proxy_connect_backend_ex()
+ */
+typedef struct {
+    apr_socket_t *sock;          /* The connecting socket, to poll for
+                                  * APR_POLLOUT */
+    apr_interval_time_t timeout; /* The connect timeout for the poll */
+    apr_status_t status;         /* Set by the caller to fail the attempt
+                                  * (e.g. APR_TIMEUP), else APR_SUCCESS */
+    apr_sockaddr_t *addr;        /* (opaque) the address being connected */
+    int did_dns_lookup;          /* (opaque) */
+} ap_proxy_connect_state;
+
+/**
+ * Make a connection to the backend, possibly without blocking
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn    acquired connection
+ * @param worker  connection worker
+ * @param s       current server record
+ * @param state   NULL to block as ap_proxy_connect_backend() does; otherwise
+ *                zeroed for a new connection, or as left by a call that
+ *                returned SUSPENDED, to complete the connect once
+ *                state->sock is writable (or, after state->timeout, with
+ *                state->status set to APR_TIMEUP)
+ * @return        OK, SUSPENDED if the connect is in progress, or DECLINED
+ * @note The connect still blocks for Unix Domain Sockets and through a
+ * forward proxy (HTTP CONNECT). A caller giving up on a SUSPENDED connect
+ * must call ap_proxy_connect_backend_cancel().
+ */
+PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
+                                               proxy_conn_rec *conn,
+                                               proxy_worker *worker,
+                                               server_rec *s,
+                                               ap_proxy_connect_state *state);
+/**
+ * Abort a connect to the backend in progress (after SUSPENDED)
+ * @param state   as returned by ap_proxy_connect_backend_ex()
+ */
+PROXY_DECLARE(void) ap_proxy_connect_backend_cancel(ap_proxy_connect_state *state);
+
 /**
  * Make a connection to a Unix Domain Socket (UDS) path
  * @param sock     UDS to connect
