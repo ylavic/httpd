@@ -1411,6 +1411,14 @@ PROXY_DECLARE(int) ap_proxy_pass_brigade(apr_bucket_alloc_t *bucket_alloc,
                                          conn_rec *origin, apr_bucket_brigade *bb,
                                          int flush);
 
+/** The direction of a wait or transfer (client or backend, in or out) */
+typedef enum {
+    AP_PROXY_CLIENT_IN,   /**< from the client (e.g. the request body) */
+    AP_PROXY_CLIENT_OUT,  /**< to the client (e.g. the response) */
+    AP_PROXY_BACKEND_IN,  /**< from the backend (e.g. the response) */
+    AP_PROXY_BACKEND_OUT  /**< to the backend (e.g. the request) */
+} ap_proxy_direction_e;
+
 struct proxy_tunnel_conn; /* opaque */
 typedef struct proxy_tunnel_conn proxy_tunnel_conn_t;
 typedef struct {

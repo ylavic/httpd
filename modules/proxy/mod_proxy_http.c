@@ -313,7 +313,14 @@ typedef struct {
     apr_pool_t *async_pool;
     apr_interval_time_t idle_timeout;
 
+    /* The response body's streaming state (proxy_http_response_body()) */
+    apr_bucket_brigade *response_bb, *response_pass_bb;
+    apr_read_type_e response_mode;
+
     unsigned int can_suspend            :1,
+                 body_async             :1,
+                 direction              :2, /* ap_proxy_direction_e */
+                 backend_broke          :1,
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
@@ -459,6 +466,50 @@ static void proxy_http_suspend_connection(conn_rec *c, request_rec *r)
 
 static int ap_proxy_http_process_response(proxy_http_req_t *req);
 
+/* Finish a request whose processing was suspended (status as returned by
+ * proxy_http_handler()): release the backend, finish the request and give
+ * the client connection back to the MPM.
+ */
+static void proxy_http_async_finish(proxy_http_req_t *req, int status)
+{
+    request_rec *r = req->r;
+    conn_rec *c = r->connection;
+
+    /* Release the backend, which proxy_http_handler() didn't since it
+     * returned SUSPENDED, unless ap_proxy_http_process_response() already
+     * did (then req->backend is NULL).
+     */
+    if (req->backend) {
+        proxy_run_detach_backend(r, req->backend);
+        if (status != OK) {
+            req->backend->close = 1;
+        }
+        ap_proxy_release_connection(req->proto, req->backend, r->server);
+        req->backend = NULL;
+    }
+    if (req->async_pool) {
+        apr_pool_destroy(req->async_pool);
+        req->async_pool = NULL;
+    }
+
+    /* Finish the request, as ap_process_async_request() does */
+    if (status != OK && status != DONE) {
+        r->status = HTTP_OK;
+    }
+    ap_die(status, r);
+    ap_process_request_after_handler(r);
+    /* don't dereference req or r from here! */
+
+    /* Give the client connection back to the MPM */
+    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
+        c->cs->state = CONN_STATE_LINGER;
+    }
+    else {
+        c->cs->state = CONN_STATE_WRITE_COMPLETION;
+    }
+    ap_mpm_resume_suspended(c);
+}
+
 /* The continuation of proxy_http_response_head_wait(), called when the
  * backend's response is available (or on timeout or error): process it and
  * finish the request.
@@ -495,42 +546,14 @@ static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
         status = HTTP_BAD_GATEWAY;
         break;
     }
-    /* No upgrade (tunnel) on this path, see proxy_http_handler() */
-    AP_DEBUG_ASSERT(status != SUSPENDED);
-
-    /* Release the backend, which proxy_http_handler() didn't since it
-     * returned SUSPENDED, unless ap_proxy_http_process_response() already
-     * did (then req->backend is NULL).
-     */
-    if (req->backend) {
-        proxy_run_detach_backend(r, req->backend);
-        if (status != OK) {
-            req->backend->close = 1;
-        }
-        ap_proxy_release_connection(req->proto, req->backend, r->server);
-        req->backend = NULL;
+    if (status == SUSPENDED) {
+        /* Streaming the response body is waiting,
+         * proxy_http_response_body_continuation() continues. Upgrades
+         * (tunnels) don't take this path, see proxy_http_handler().
+         */
+        return;
     }
-    if (req->async_pool) {
-        apr_pool_destroy(req->async_pool);
-        req->async_pool = NULL;
-    }
-
-    /* Finish the request, as ap_process_async_request() does */
-    if (status != OK && status != DONE) {
-        r->status = HTTP_OK;
-    }
-    ap_die(status, r);
-    ap_process_request_after_handler(r);
-    /* don't dereference req or r from here! */
-
-    /* Give the client connection back to the MPM */
-    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
-        c->cs->state = CONN_STATE_LINGER;
-    }
-    else {
-        c->cs->state = CONN_STATE_WRITE_COMPLETION;
-    }
-    ap_mpm_resume_suspended(c);
+    proxy_http_async_finish(req, status);
 }
 
 /* Wait for the backend's response without holding the thread: synchronously
@@ -1165,6 +1188,359 @@ static int send_continue_body(proxy_http_req_t *req)
     return status;
 }
 
+static void proxy_http_response_body_continuation(conn_rec *c, request_rec *r,
+                                                  ap_mpm_wait_result_e why,
+                                                  const apr_array_header_t *pfds,
+                                                  void *baton);
+
+/* Wait in the MPM while streaming the response body (ap_mpm_register_wait()),
+ * for the client to drain the pending output (AP_PROXY_CLIENT_OUT), or for
+ * the backend to be readable (AP_PROXY_BACKEND_IN). Returns SUSPENDED, or OK
+ * if it can't wait asynchronously (the caller then blocks).
+ */
+static int proxy_http_response_body_wait(proxy_http_req_t *req,
+                                         ap_proxy_direction_e direction)
+{
+    int for_client = (direction == AP_PROXY_CLIENT_OUT);
+    request_rec *r = req->r;
+    conn_rec *c = r->connection;
+    apr_array_header_t *pfds;
+    apr_pollfd_t *pfd;
+    apr_status_t rv;
+
+    if (req->async_pool) {
+        apr_pool_clear(req->async_pool);
+    }
+    else {
+        apr_pool_create(&req->async_pool, req->p);
+    }
+    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
+    pfd = apr_array_push(pfds);
+    memset(pfd, 0, sizeof(*pfd));
+    pfd->p = req->async_pool;
+    pfd->desc_type = APR_POLL_SOCKET;
+    if (for_client) {
+        pfd->desc.s = ap_get_conn_socket(c);
+        pfd->reqevents = APR_POLLOUT;
+    }
+    else {
+        pfd->desc.s = req->backend->sock;
+        pfd->reqevents = APR_POLLIN;
+    }
+    /* Wait for the client with the server's Timeout, and for the backend with
+     * the proxy's timeout (ProxyAsyncIdleTimeout, or else the backend's).
+     */
+    rv = ap_mpm_register_wait(c, req->async_pool, pfds,
+                             for_client ? r->server->timeout
+                                        : req->idle_timeout,
+                             proxy_http_response_body_continuation, req);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy %s: can't wait for the %s asynchronously",
+                      req->proto, for_client ? "client" : "backend");
+        return OK;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: body: waiting for the %s (async)",
+                  req->proto, for_client ? "client" : "backend");
+    req->direction = direction;
+    return SUSPENDED;
+}
+
+/* Stream the response body from the backend to the client, resuming where it
+ * stopped (the state is in req). Returns OK once done (with
+ * req->backend_broke set if the backend failed half way), or SUSPENDED if
+ * waiting in the MPM (only when req->body_async;
+ * proxy_http_response_body_continuation() continues then).
+ */
+static int proxy_http_response_body(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    conn_rec *c = r->connection;
+    proxy_conn_rec *backend = req->backend;
+    apr_bucket_brigade *bb = req->response_bb;
+    apr_bucket_brigade *pass_bb = req->response_pass_bb;
+    apr_bucket *e;
+    int finish = FALSE;
+
+    do {
+        apr_off_t readbytes;
+        apr_status_t rv;
+
+        rv = ap_get_brigade(backend->r->input_filters, bb,
+                            AP_MODE_READBYTES, req->response_mode,
+                            req->sconf->io_buffer_size);
+
+        /* ap_get_brigade will return success with an empty brigade
+         * for a non-blocking read which would block: */
+        if (req->response_mode == APR_NONBLOCK_READ
+            && (APR_STATUS_IS_EAGAIN(rv)
+                || (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(bb)))) {
+            if (req->body_async) {
+                /* Nothing to read from the backend yet: let the filters
+                 * release what they hold without blocking on the client
+                 * (WC), then wait in the MPM for the client to drain what's
+                 * pending if any, otherwise for the backend.
+                 */
+                apr_brigade_cleanup(bb);
+                e = ap_bucket_wc_create(c->bucket_alloc);
+                APR_BRIGADE_INSERT_TAIL(bb, e);
+                if (ap_pass_brigade(r->output_filters, bb)
+                    || c->aborted) {
+                    backend->close = 1;
+                    break;
+                }
+                apr_brigade_cleanup(bb);
+                if (proxy_http_response_body_wait(req,
+                            (ap_filter_should_yield(c->output_filters)
+                             ? AP_PROXY_CLIENT_OUT : AP_PROXY_BACKEND_IN))
+                        == SUSPENDED) {
+                    return SUSPENDED;
+                }
+                req->body_async = 0; /* can't wait: block */
+            }
+            /* flush to the client and switch to blocking mode */
+            e = apr_bucket_flush_create(c->bucket_alloc);
+            APR_BRIGADE_INSERT_TAIL(bb, e);
+            if (ap_pass_brigade(r->output_filters, bb)
+                || c->aborted) {
+                backend->close = 1;
+                break;
+            }
+            apr_brigade_cleanup(bb);
+            req->response_mode = APR_BLOCK_READ;
+            continue;
+        }
+        if (rv == APR_EOF) {
+            backend->close = 1;
+            break;
+        }
+        if (rv != APR_SUCCESS || APR_BRIGADE_EMPTY(bb)) {
+            int error_status = HTTP_BAD_GATEWAY;
+            if (rv == APR_ENOSPC) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02475)
+                              "Response chunk/line was too large to parse");
+            }
+            else if (rv == APR_ENOTIMPL) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02476)
+                              "Response Transfer-Encoding was not recognised");
+            }
+            else if (rv != APR_SUCCESS) {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01110)
+                              "Network error reading response");
+            }
+            else {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10293)
+                              "Unexpected empty data reading response");
+                error_status = HTTP_INTERNAL_SERVER_ERROR;
+            }
+
+            /* In this case, we are in real trouble because
+             * our backend bailed on us. Given we're half way
+             * through a response, our only option is to
+             * disconnect the client too.
+             */
+            apr_brigade_cleanup(bb);
+            ap_proxy_fill_error_brigade(r, error_status, bb, 1);
+            ap_pass_brigade(r->output_filters, bb);
+
+            req->backend_broke = 1;
+            backend->close = 1;
+            break;
+        }
+        /* next time try a non-blocking read */
+        req->response_mode = APR_NONBLOCK_READ;
+
+        if (!apr_is_empty_table(backend->r->trailers_in)) {
+            apr_table_do(add_trailers, r->trailers_out,
+                    backend->r->trailers_in, NULL);
+            apr_table_clear(backend->r->trailers_in);
+        }
+
+        apr_brigade_length(bb, 0, &readbytes);
+        backend->worker->s->read += readbytes;
+#if DEBUGGING
+        {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01111)
+                      "readbytes: %#x", readbytes);
+        }
+#endif
+
+        /* Switch the allocator lifetime of the buckets */
+        rv = ap_proxy_buckets_lifetime_transform(r, bb, pass_bb);
+        if (rv != APR_SUCCESS) {
+            /* Same, half way through a response, our only option is
+             * to notice the output filters and then disconnect the
+             * client and backend.
+             */
+            if (!APR_BRIGADE_EMPTY(pass_bb)) {
+                /* Pass what we have still */
+                ap_pass_brigade(r->output_filters, pass_bb);
+                apr_brigade_cleanup(pass_bb);
+            }
+            ap_proxy_fill_error_brigade(r, HTTP_INTERNAL_SERVER_ERROR,
+                                        pass_bb, 1);
+            ap_pass_brigade(r->output_filters, pass_bb);
+            apr_brigade_cleanup(pass_bb);
+
+            req->backend_broke = 1;
+            backend->close = 1;
+            break;
+        }
+
+        /* found the last brigade? */
+        if (APR_BUCKET_IS_EOS(APR_BRIGADE_LAST(pass_bb))) {
+
+            /* signal that we must leave */
+            finish = TRUE;
+
+            /* the brigade may contain transient buckets that contain
+             * data that lives only as long as the backend connection.
+             * Force a setaside so these transient buckets become heap
+             * buckets that live as long as the request.
+             */
+            for (e = APR_BRIGADE_FIRST(pass_bb); e
+                    != APR_BRIGADE_SENTINEL(pass_bb); e
+                    = APR_BUCKET_NEXT(e)) {
+                apr_bucket_setaside(e, r->pool);
+            }
+
+            /* finally it is safe to clean up the brigade from the
+             * connection pool, as we have forced a setaside on all
+             * buckets.
+             */
+            apr_brigade_cleanup(bb);
+
+            /* make sure we release the backend connection as soon
+             * as we know we are done, so that the backend isn't
+             * left waiting for a slow client to eventually
+             * acknowledge the data.
+             */
+            proxy_run_detach_backend(r, backend);
+            ap_proxy_release_connection(backend->worker->s->scheme,
+                    backend, r->server);
+            /* Ensure that the backend is not reused */
+            req->backend = NULL;
+
+        }
+        else if (req->body_async) {
+            /* Don't block on the client (WC), see below */
+            e = ap_bucket_wc_create(c->bucket_alloc);
+            APR_BRIGADE_INSERT_TAIL(pass_bb, e);
+        }
+
+        /* try send what we read */
+        if (ap_pass_brigade(r->output_filters, pass_bb) != APR_SUCCESS
+            || c->aborted) {
+            /* Ack! Phbtt! Die! User aborted! */
+            /* Only close backend if we haven't got all from the
+             * backend. Furthermore if req->backend is NULL it is no
+             * longer safe to fiddle around with backend as it might
+             * be already in use by another thread.
+             */
+            if (req->backend) {
+                /* this causes socket close below */
+                req->backend->close = 1;
+            }
+            finish = TRUE;
+        }
+
+        /* make sure we always clean up after ourselves */
+        apr_brigade_cleanup(pass_bb);
+        apr_brigade_cleanup(bb);
+
+        if (!finish && req->body_async && ap_filter_should_yield(c->output_filters)) {
+            /* The client is slower than the backend: wait for it to drain
+             * the pending output before reading more (backpressure).
+             */
+            if (proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT) == SUSPENDED) {
+                return SUSPENDED;
+            }
+            req->body_async = 0; /* can't wait: block */
+        }
+    } while (!finish);
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r, "end body send");
+    return OK;
+}
+
+/* The status of a response whose body was streamed (as returned by
+ * ap_proxy_http_process_response()).
+ */
+static int proxy_http_response_body_status(proxy_http_req_t *req)
+{
+    /* We have to cleanup bb brigade, because buckets inserted to it could be
+     * created from scpool and this pool can be freed before this brigade. */
+    apr_brigade_cleanup(req->response_bb);
+
+    /* If our connection with the client is to be aborted, return DONE. */
+    if (req->r->connection->aborted || req->backend_broke) {
+        return DONE;
+    }
+    return OK;
+}
+
+/* The continuation of proxy_http_response_body_wait(), called when the client
+ * or the backend is ready (or on timeout or error): continue streaming the
+ * response body, and finish the request once done.
+ */
+static void proxy_http_response_body_continuation(conn_rec *c, request_rec *r,
+                                                  ap_mpm_wait_result_e why,
+                                                  const apr_array_header_t *pfds,
+                                                  void *baton)
+{
+    proxy_http_req_t *req = baton;
+    int status;
+
+    AP_DEBUG_ASSERT(req->r == r);
+    if (why != AP_MPM_WAIT_READY) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: %s waiting for the %s while streaming the "
+                      "response body (async, %i)", req->proto,
+                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
+                      (req->direction == AP_PROXY_CLIENT_OUT) ? "client"
+                                                              : "backend",
+                      (int)why);
+        /* Half way through the response, our only option is to disconnect
+         * the client (as for a backend failure).
+         */
+        apr_brigade_cleanup(req->response_bb);
+        ap_proxy_fill_error_brigade(r, HTTP_GATEWAY_TIME_OUT, req->response_bb, 1);
+        ap_pass_brigade(r->output_filters, req->response_bb);
+        req->backend_broke = 1;
+        if (req->backend) {
+            req->backend->close = 1;
+        }
+        proxy_http_async_finish(req, proxy_http_response_body_status(req));
+        return;
+    }
+
+    if (req->direction == AP_PROXY_CLIENT_OUT) {
+        /* Write what's pending to the client */
+        int rc = ap_check_output_pending(c);
+        if (rc == AGAIN) {
+            if (proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT) == SUSPENDED) {
+                return;
+            }
+            req->body_async = 0; /* can't wait: block */
+        }
+        else if (rc != OK) {
+            /* The client is gone */
+            if (req->backend) {
+                req->backend->close = 1;
+            }
+            proxy_http_async_finish(req, proxy_http_response_body_status(req));
+            return;
+        }
+    }
+
+    status = proxy_http_response_body(req);
+    if (status == SUSPENDED) {
+        return; /* continued later */
+    }
+    proxy_http_async_finish(req, proxy_http_response_body_status(req));
+}
+
 static
 int ap_proxy_http_process_response(proxy_http_req_t *req)
 {
@@ -1189,7 +1565,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                                * are being read. */
     apr_size_t response_field_size = 0;
     apr_table_t *save_table;
-    int backend_broke = 0;
     static const char *const hop_by_hop_hdrs[] =
         {"Keep-Alive", "Proxy-Authenticate", "TE", "Trailer", "Upgrade", NULL};
     int i;
@@ -1783,8 +2158,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
         r->sent_bodyct = 1;
         /* send body - but only if a body is expected */
         if (!r->header_only && !AP_STATUS_IS_HEADER_ONLY(proxy_status)) {
-            apr_read_type_e mode;
-            int finish;
 
             /* We need to copy the output headers and treat them as input
              * headers as well.  BUT, we need to do this before we remove
@@ -1817,169 +2190,19 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                 r->status_line = original_status_line;
             }
 
-            mode = APR_NONBLOCK_READ;
-            finish = FALSE;
-            do {
-                apr_off_t readbytes;
-                apr_status_t rv;
-
-                rv = ap_get_brigade(backend->r->input_filters, bb,
-                                    AP_MODE_READBYTES, mode,
-                                    req->sconf->io_buffer_size);
-
-                /* ap_get_brigade will return success with an empty brigade
-                 * for a non-blocking read which would block: */
-                if (mode == APR_NONBLOCK_READ
-                    && (APR_STATUS_IS_EAGAIN(rv)
-                        || (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(bb)))) {
-                    /* flush to the client and switch to blocking mode */
-                    e = apr_bucket_flush_create(c->bucket_alloc);
-                    APR_BRIGADE_INSERT_TAIL(bb, e);
-                    if (ap_pass_brigade(r->output_filters, bb)
-                        || c->aborted) {
-                        backend->close = 1;
-                        break;
-                    }
-                    apr_brigade_cleanup(bb);
-                    mode = APR_BLOCK_READ;
-                    continue;
-                }
-                if (rv == APR_EOF) {
-                    backend->close = 1;
-                    break;
-                }
-                if (rv != APR_SUCCESS || APR_BRIGADE_EMPTY(bb)) {
-                    int error_status = HTTP_BAD_GATEWAY;
-                    if (rv == APR_ENOSPC) {
-                        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02475)
-                                      "Response chunk/line was too large to parse");
-                    }
-                    else if (rv == APR_ENOTIMPL) {
-                        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02476)
-                                      "Response Transfer-Encoding was not recognised");
-                    }
-                    else if (rv != APR_SUCCESS) {
-                        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01110)
-                                      "Network error reading response");
-                    }
-                    else {
-                        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10293)
-                                      "Unexpected empty data reading response");
-                        error_status = HTTP_INTERNAL_SERVER_ERROR;
-                    }
-
-                    /* In this case, we are in real trouble because
-                     * our backend bailed on us. Given we're half way
-                     * through a response, our only option is to
-                     * disconnect the client too.
-                     */
-                    apr_brigade_cleanup(bb);
-                    ap_proxy_fill_error_brigade(r, error_status, bb, 1);
-                    ap_pass_brigade(r->output_filters, bb);
-
-                    backend_broke = 1;
-                    backend->close = 1;
-                    break;
-                }
-                /* next time try a non-blocking read */
-                mode = APR_NONBLOCK_READ;
-
-                if (!apr_is_empty_table(backend->r->trailers_in)) {
-                    apr_table_do(add_trailers, r->trailers_out,
-                            backend->r->trailers_in, NULL);
-                    apr_table_clear(backend->r->trailers_in);
-                }
-
-                apr_brigade_length(bb, 0, &readbytes);
-                backend->worker->s->read += readbytes;
-#if DEBUGGING
-                {
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01111)
-                              "readbytes: %#x", readbytes);
-                }
-#endif
-
-                /* Switch the allocator lifetime of the buckets */
-                rv = ap_proxy_buckets_lifetime_transform(r, bb, pass_bb);
-                if (rv != APR_SUCCESS) {
-                    /* Same, half way through a response, our only option is
-                     * to notice the output filters and then disconnect the
-                     * client and backend.
-                     */
-                    if (!APR_BRIGADE_EMPTY(pass_bb)) {
-                        /* Pass what we have still */
-                        ap_pass_brigade(r->output_filters, pass_bb);
-                        apr_brigade_cleanup(pass_bb);
-                    }
-                    ap_proxy_fill_error_brigade(r, HTTP_INTERNAL_SERVER_ERROR,
-                                                pass_bb, 1);
-                    ap_pass_brigade(r->output_filters, pass_bb);
-                    apr_brigade_cleanup(pass_bb);
-
-                    backend_broke = 1;
-                    backend->close = 1;
-                    break;
-                }
-
-                /* found the last brigade? */
-                if (APR_BUCKET_IS_EOS(APR_BRIGADE_LAST(pass_bb))) {
-
-                    /* signal that we must leave */
-                    finish = TRUE;
-
-                    /* the brigade may contain transient buckets that contain
-                     * data that lives only as long as the backend connection.
-                     * Force a setaside so these transient buckets become heap
-                     * buckets that live as long as the request.
-                     */
-                    for (e = APR_BRIGADE_FIRST(pass_bb); e
-                            != APR_BRIGADE_SENTINEL(pass_bb); e
-                            = APR_BUCKET_NEXT(e)) {
-                        apr_bucket_setaside(e, r->pool);
-                    }
-
-                    /* finally it is safe to clean up the brigade from the
-                     * connection pool, as we have forced a setaside on all
-                     * buckets.
-                     */
-                    apr_brigade_cleanup(bb);
-
-                    /* make sure we release the backend connection as soon
-                     * as we know we are done, so that the backend isn't
-                     * left waiting for a slow client to eventually
-                     * acknowledge the data.
-                     */
-                    proxy_run_detach_backend(r, backend);
-                    ap_proxy_release_connection(backend->worker->s->scheme,
-                            backend, r->server);
-                    /* Ensure that the backend is not reused */
-                    req->backend = NULL;
-
-                }
-
-                /* try send what we read */
-                if (ap_pass_brigade(r->output_filters, pass_bb) != APR_SUCCESS
-                    || c->aborted) {
-                    /* Ack! Phbtt! Die! User aborted! */
-                    /* Only close backend if we haven't got all from the
-                     * backend. Furthermore if req->backend is NULL it is no
-                     * longer safe to fiddle around with backend as it might
-                     * be already in use by another thread.
-                     */
-                    if (req->backend) {
-                        /* this causes socket close below */
-                        req->backend->close = 1;
-                    }
-                    finish = TRUE;
-                }
-
-                /* make sure we always clean up after ourselves */
-                apr_brigade_cleanup(pass_bb);
-                apr_brigade_cleanup(bb);
-
-            } while (!finish);
-
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r, "end body send");
+            req->response_bb = bb;
+            req->response_pass_bb = pass_bb;
+            req->response_mode = APR_NONBLOCK_READ;
+            /* Stream asynchronously, as when waiting for the response head
+             * (see proxy_http_handler()).
+             */
+            req->body_async = (req->can_suspend
+                               && !req->do_100_continue && !req->upgrade);
+            status = proxy_http_response_body(req);
+            if (status == SUSPENDED) {
+                /* Continues in proxy_http_response_body_continuation() */
+                return SUSPENDED;
+            }
         }
         else {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r, "header only");
@@ -2017,7 +2240,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     }
 
     /* If our connection with the client is to be aborted, return DONE. */
-    if (c->aborted || backend_broke) {
+    if (c->aborted || req->backend_broke) {
         return DONE;
     }
 
