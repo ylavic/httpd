@@ -225,6 +225,9 @@ static int num_cpus = 0;                    /* Number of CPUs usable (the
                                                affinity where known, else
                                                the online ones) */
 
+static int workers_backlog_limit = 0;       /* Max number of events in the workers' backlog
+                                               (above which not accepting new connections) */
+
 static /*atomic*/ apr_uint32_t dying = 0;
 static /*atomic*/ apr_uint32_t workers_may_exit = 0;
 static /*atomic*/ apr_uint32_t start_thread_may_exit = 0;
@@ -1079,6 +1082,13 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
         break;
     case AP_MPMQ_CAN_REGISTER_WAIT:
         *result = 1;
+        break;
+    case AP_MPMQ_MAX_CONNECTIONS:
+        /* Not a hard limit (connections_above_limit() doesn't bound the
+         * suspended ones), but what a child processes or queues for its
+         * workers at once: its threads plus the workers' backlog limit.
+         */
+        *result = threads_per_child + workers_backlog_limit;
         break;
     default:
         *rv = APR_ENOTIMPL;
@@ -5056,6 +5066,8 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
     else {
         max_spare_threads = max_workers;
     }
+
+    workers_backlog_limit = threads_per_child * async_factor;
 
     /* For the PODs of the next restart (see above) */
     retained->gen_daemons_limit = active_daemons_limit;

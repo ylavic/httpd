@@ -185,8 +185,12 @@ AP_DECLARE(apr_status_t) ap_os_create_privileged_process(
 #define AP_MPMQ_CAN_WAITIO           19
 /** MPM implements the poll_suspended hook */
 #define AP_MPMQ_CAN_POLL_SUSPENDED   20
-/** MPM implements the suspend_wait hook */
-#define AP_MPMQ_CAN_REGISTER_WAIT     21
+/** MPM implements the register_wait hook */
+#define AP_MPMQ_CAN_REGISTER_WAIT    21
+/** Number of connections a child is meant to handle at once, those waiting
+ *  asynchronously (without holding a thread) included; not necessarily a
+ *  hard limit */
+#define AP_MPMQ_MAX_CONNECTIONS      22
 /** @} */
 
 /**

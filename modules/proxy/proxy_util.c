@@ -2315,7 +2315,7 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
 {
     APR_OPTIONAL_FN_TYPE(http2_get_num_workers) *get_h2_num_workers;
     apr_status_t rv = APR_SUCCESS;
-    int max_threads, minw, maxw;
+    int max_threads, minw, maxw, can_wait = 0;
 
     if (worker->s->status & PROXY_WORKER_INITIALIZED) {
         /* The worker is already initialized */
@@ -2364,12 +2364,31 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
              */
             max_threads = max_threads - 1 + maxw;
         }
-        if (max_threads > 1) {
+        /* With an MPM that can suspend the requests waiting for their backend
+         * (they don't hold a thread then, see ProxyAsyncDelay), a child has
+         * more requests in flight than threads, even with a single thread.
+         */
+        if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &can_wait) != APR_SUCCESS) {
+            can_wait = 0;
+        }
+        if (max_threads > 1 || can_wait) {
             /* Default hmax is max_threads to scale with the load and never
              * wait for an idle connection to proceed.
              */
             if (worker->s->hmax == 0) {
+                int max_conns = 0;
+
                 worker->s->hmax = max_threads;
+
+                /* With an MPM that can suspend the requests waiting for their
+                 * backend, scale with the connections a child handles at once
+                 * instead.
+                 */
+                if (can_wait
+                    && ap_mpm_query(AP_MPMQ_MAX_CONNECTIONS, &max_conns) == APR_SUCCESS
+                    && max_conns > worker->s->hmax) {
+                    worker->s->hmax = max_conns;
+                }
             }
             if (worker->s->smax == -1 || worker->s->smax > worker->s->hmax) {
                 worker->s->smax = worker->s->hmax;
