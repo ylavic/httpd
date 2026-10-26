@@ -4,7 +4,10 @@ included) and the server's backlog stats (mpm_event's "backlog sojourn"
 lines) aggregated over the measured window, with httpd's CPU use.
 
 usage: python3 -I queue.py HTTPD_PREFIX APTEST_SO WORKDIR [scenario...]
-env: CONF_EXTRA (appended to the httpd.conf, e.g. "AsyncRequestWorkerFactor 4")
+env: CONF_EXTRA (appended to the httpd.conf, e.g. "AsyncRequestWorkerFactor 4"),
+THREADS (the threads per child of the scenarios not setting theirs, 4 by
+default), FLOOD (the flood's query in the "progress" scenario, "cpu=1" by
+default)
 """
 
 import calendar
@@ -25,6 +28,8 @@ WARM, SECONDS = 2, 10
 TICK = os.sysconf("SC_CLK_TCK")
 HTTPD_CPUS, LOADGEN_CPUS = "0-3", "6,7"
 CONF_EXTRA = os.environ.get("CONF_EXTRA", "")
+THREADS = int(os.environ.get("THREADS", "4"))
+FLOOD = os.environ.get("FLOOD", "cpu=1")
 
 CONF = """
 ServerRoot "{prefix}"
@@ -63,7 +68,7 @@ SCENARIOS = {
     "blocked": dict(groups=[("bg", "block=200", "c", 16, True), PROBES]),
     "async-mix": dict(groups=[("bg", "suspend=100", "c", 200, True), PROBES]),
     "progress": dict(groups=[("inprogress", "suspend=20", "c", 32, True),
-                             ("flood", "cpu=1", "c", 64, False)]),
+                             ("flood", FLOOD, "c", 64, False)]),
     # One child at start, the second spawned once the first one's threads are
     # all blocked (MinSpareThreads): the probes should go to the second one.
     "two-children": dict(children=2, start=1, minspare=4,
@@ -190,7 +195,7 @@ def server_stats(t_from, t_to):
 
 def run(name, sc):
     children = sc.get("children", 1)
-    threads = sc.get("threads", 4)
+    threads = sc.get("threads", THREADS)
     extra = sc.get("extra", "") + "\n" + CONF_EXTRA
     p = start_httpd(children, threads, extra, sc.get("start"),
                     sc.get("minspare", 1))
