@@ -1456,9 +1456,6 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
     case AP_MPMQ_CAN_WAITIO:
         *result = 1;
         break;
-    case AP_MPMQ_CAN_POLL_SUSPENDED:
-        *result = 1;
-        break;
     case AP_MPMQ_CAN_REGISTER_WAIT:
         *result = 1;
         break;
@@ -2363,37 +2360,6 @@ static apr_status_t user_wait_cleanup(void *data)
         signal_threads(ST_GRACEFUL);
     }
     return final_rc;
-}
-
-/* Put some user pollfds into the listener pollset for a SUSPENDED connection */
-static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
-                                         const apr_array_header_t *user_pfds,
-                                         apr_interval_time_t timeout)
-{
-    event_conn_state_t *cs = c->suspended_baton;
-    struct user_wait *user_wait;
-
-    AP_DEBUG_ASSERT(cs != NULL);
-    AP_DEBUG_ASSERT(cs->suspended);
-    AP_DEBUG_ASSERT(user_pfds->nelts > 0);
-    if (cs == NULL) {
-        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
-                "event_poll_suspended: suspended_baton is NULL");
-        return APR_EINVAL;
-    }
-    if (!cs->suspended) {
-        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
-                "event_poll_suspended: thread isn't suspended");
-        return APR_EINVAL;
-    }
-    if (user_pfds->nelts <= 0) {
-        ap_log_cerror (APLOG_MARK, LOG_WARNING, 0, c, APLOGNO()
-                "event_poll_suspended: no poll FDs");
-        return APR_EINVAL;
-    }
-
-    user_wait = make_user_wait(cs, p, user_pfds, timeout);
-    return arm_user_wait(cs, user_wait);
 }
 
 /* A wait of a SUSPENDED connection, to be armed by arm_user_wait() */
@@ -6005,7 +5971,6 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_post_read_request(event_post_read_request, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_mpm_poll_suspended(event_poll_suspended, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_register_wait(event_register_wait, NULL, NULL, APR_HOOK_MIDDLE);
 
     ap_hook_pre_connection(event_pre_connection, NULL, NULL, APR_HOOK_REALLY_FIRST);

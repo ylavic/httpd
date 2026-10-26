@@ -183,8 +183,6 @@ AP_DECLARE(apr_status_t) ap_os_create_privileged_process(
 /* 18 was AP_MPMQ_CAN_POLL (trunk only), removed with the poll callbacks */
 /** MPM supports CONN_STATE_ASYNC_WAITIO */
 #define AP_MPMQ_CAN_WAITIO           19
-/** MPM implements the poll_suspended hook */
-#define AP_MPMQ_CAN_POLL_SUSPENDED   20
 /** MPM implements the register_wait hook */
 #define AP_MPMQ_CAN_REGISTER_WAIT    21
 /** Number of connections a child is meant to handle at once, those waiting
@@ -212,10 +210,6 @@ typedef void (ap_mpm_callback_fn_t)(void *baton);
 
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c);
-/* only added support in the Event MPM....  check for APR_ENOTIMPL */
-AP_DECLARE(apr_status_t) ap_mpm_poll_suspended(conn_rec *c, apr_pool_t *p,
-                                               const apr_array_header_t *pfds,
-                                               apr_interval_time_t timeout);
 /** Why a suspended request is resumed by the MPM (ap_mpm_register_wait()) */
 typedef enum {
     AP_MPM_WAIT_READY,    /**< Some of the pfds are ready (their rtnevents set) */

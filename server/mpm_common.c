@@ -71,7 +71,6 @@
     APR_HOOK_LINK(mpm_register_timed_callback) \
     APR_HOOK_LINK(mpm_get_name) \
     APR_HOOK_LINK(mpm_resume_suspended) \
-    APR_HOOK_LINK(mpm_poll_suspended) \
     APR_HOOK_LINK(mpm_register_wait) \
     APR_HOOK_LINK(end_generation) \
     APR_HOOK_LINK(child_status) \
@@ -112,11 +111,6 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_timed_callback,
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_resume_suspended,
                             (conn_rec *c),
                             (c), APR_ENOTIMPL)
-AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_poll_suspended,
-                            (conn_rec *c, apr_pool_t *p,
-                             const apr_array_header_t *pfds,
-                             apr_interval_time_t timeout),
-                            (c, p, pfds, timeout), APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_wait,
                             (conn_rec *c, apr_pool_t *p,
                              const apr_array_header_t *pfds,
@@ -619,13 +613,6 @@ void ap_core_child_status(server_rec *s, pid_t pid,
 AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c)
 {
     return ap_run_mpm_resume_suspended(c);
-}
-
-AP_DECLARE(apr_status_t) ap_mpm_poll_suspended(conn_rec *c, apr_pool_t *p,
-                                               const apr_array_header_t *pfds,
-                                               apr_interval_time_t timeout)
-{
-    return ap_run_mpm_poll_suspended(c, p, pfds, timeout);
 }
 
 AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
