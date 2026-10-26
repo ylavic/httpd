@@ -1229,24 +1229,35 @@ static int proxy_needsdomain(request_rec *r, const char *url, const char *domain
 /* -------------------------------------------------------------- */
 /* Invoke handler */
 
+/* The state of proxy_handler()'s worker loop, kept when a scheme handler
+ * suspends the request (SUSPENDED) until it calls ap_proxy_handler_resume().
+ */
+typedef struct proxy_handler_ctx {
+    char *uri;
+    char *scheme;
+    proxy_server_conf *conf;
+    proxy_balancer *balancer;
+    proxy_worker *worker;
+    int attempts, max_attempts;
+    int direct_connect;
+    int via_proxy; /* suspended while trying a ProxyRemote */
+} proxy_handler_ctx;
+
+static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
+                             int resumed, int access_status);
+
 static int proxy_handler(request_rec *r)
 {
     char *uri, *scheme, *p;
-    const char *p2;
     void *sconf = r->server->module_config;
     proxy_server_conf *conf = (proxy_server_conf *)
         ap_get_module_config(sconf, &proxy_module);
-    apr_array_header_t *proxies = conf->proxies;
-    struct proxy_remote *ents = (struct proxy_remote *) proxies->elts;
-    int rc = DECLINED, access_status, i;
+    int rc = DECLINED, i;
     int direct_connect = 0;
     const char *str;
     apr_int64_t maxfwd;
-    proxy_balancer *balancer = NULL;
-    proxy_worker *worker = NULL;
-    int attempts = 0, max_attempts = 0;
     struct dirconn_entry *list = (struct dirconn_entry *)conf->dirconn->elts;
-    int saved_status;
+    proxy_handler_ctx *x;
 
     /* is this for us? */
     if (!r->filename) {
@@ -1383,6 +1394,45 @@ static int proxy_handler(request_rec *r)
                 r->uri);
 #endif
 
+    x = apr_pcalloc(r->pool, sizeof(*x));
+    x->uri = uri;
+    x->scheme = scheme;
+    x->conf = conf;
+    x->direct_connect = direct_connect;
+    return proxy_handler_run(r, x, 0, DECLINED);
+}
+
+/* The worker loop of proxy_handler(): elect a worker, run the scheme handler
+ * on it, fail over to another one (balancer) if needed, and run the
+ * post_request hooks once done. If the scheme handler suspends the request,
+ * the loop is resumed by ap_proxy_handler_resume() with the status of the
+ * attempt (resumed != 0), as if the scheme handler had returned it.
+ */
+static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
+                             int resumed, int access_status)
+{
+    char *uri = x->uri;
+    char *scheme = x->scheme;
+    proxy_server_conf *conf = x->conf;
+    apr_array_header_t *proxies = conf->proxies;
+    struct proxy_remote *ents = (struct proxy_remote *) proxies->elts;
+    proxy_balancer *balancer = x->balancer;
+    proxy_worker *worker = x->worker;
+    int attempts = x->attempts, max_attempts = x->max_attempts;
+    int direct_connect = x->direct_connect;
+    const char *p2;
+    int i, saved_status;
+
+    if (resumed) {
+        if (x->via_proxy) {
+            /* No fallback to a direct connection after an async attempt
+             * through a ProxyRemote (yet).
+             */
+            goto cleanup;
+        }
+        goto resumed;
+    }
+
     do {
         char *url = uri;
         /* Try to obtain the most suitable worker */
@@ -1440,6 +1490,11 @@ static int proxy_handler(request_rec *r)
 
                     if (ents[i].creds) apr_table_unset(r->notes, "proxy-basic-creds");
 
+                    if (access_status == SUSPENDED) {
+                        x->via_proxy = 1;
+                        goto suspended;
+                    }
+
                     /* Did the scheme handler process the request? */
                     if (access_status != DECLINED) {
                         const char *cl_a;
@@ -1489,6 +1544,10 @@ static int proxy_handler(request_rec *r)
         AP_PROXY_RUN(r, worker, conf, url, attempts);
         access_status = proxy_run_scheme_handler(r, worker, conf,
                                                  url, NULL, 0);
+        if (access_status == SUSPENDED) {
+            goto suspended;
+        }
+resumed:
         if (access_status == OK
                 || apr_table_get(r->notes, "proxy-error-override"))
             break;
@@ -1568,6 +1627,31 @@ cleanup:
     AP_PROXY_RUN_FINISHED(r, attempts, access_status);
 
     return access_status;
+
+suspended:
+    /* The scheme handler continues asynchronously, and calls
+     * ap_proxy_handler_resume() with its status once done.
+     */
+    x->balancer = balancer;
+    x->worker = worker;
+    x->attempts = attempts;
+    x->max_attempts = max_attempts;
+    ap_proxy_req_async(r)->handler = x;
+    return SUSPENDED;
+}
+
+PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status)
+{
+    proxy_req_conf *rconf = ap_get_module_config(r->request_config,
+                                                 &proxy_module);
+    proxy_handler_ctx *x = (rconf && rconf->async) ? rconf->async->handler
+                                                   : NULL;
+
+    if (!x) {
+        return status; /* not suspended by proxy_handler()'s loop */
+    }
+    rconf->async->handler = NULL;
+    return proxy_handler_run(r, x, 1, status);
 }
 
 /* -------------------------------------------------------------- */

@@ -2773,6 +2773,15 @@ static void proxy_http_finish_request(request_rec *r, int status)
 {
     conn_rec *c = r->connection;
 
+    /* Let mod_proxy's handler continue as if we had returned this status:
+     * it may fail over to another balancer member (suspending again), and
+     * runs the post_request hooks once the request is done.
+     */
+    status = ap_proxy_handler_resume(r, status);
+    if (status == SUSPENDED) {
+        return;
+    }
+
     if (status != OK && status != DONE) {
         r->status = HTTP_OK;
     }

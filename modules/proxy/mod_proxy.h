@@ -257,10 +257,14 @@ typedef struct {
 /* if we interpolate env vars per-request, we'll need a per-request
  * copy of the reverse proxy config
  */
+struct proxy_req_async; /* opaque, mod_proxy's own */
+
 typedef struct {
     apr_array_header_t *raliases;
     apr_array_header_t* cookie_paths;
     apr_array_header_t* cookie_domains;
+    /* The states of the request's asynchronous processing */
+    struct proxy_req_async *async;
 } proxy_req_conf;
 
 struct proxy_address; /* opaque TTL'ed and refcount'ed address */
@@ -1081,6 +1085,21 @@ PROXY_DECLARE(int) ap_proxy_post_request(proxy_worker *worker,
                                          proxy_balancer *balancer,
                                          request_rec *r,
                                          proxy_server_conf *conf);
+
+/**
+ * Resume mod_proxy's handler after a scheme handler suspended the request
+ * @param r        current request
+ * @param status   the status the scheme handler would have returned
+ * @return         the status to finish the request with, or SUSPENDED if the
+ *                 request was suspended again (e.g. failing over to another
+ *                 balancer member whose scheme handler suspended it too)
+ * @note A scheme handler that returned SUSPENDED calls this once done, as
+ * proxy_handler() would have continued: marking the worker in error and
+ * failing over to another balancer member on recoverable errors, then
+ * running the post_request hooks. It returns the status as is when the
+ * request was not suspended by proxy_handler().
+ */
+PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
 
 /* Bitmask for ap_proxy_determine_address() */
 #define PROXY_DETERMINE_ADDRESS_CHECK   (1u << 0)

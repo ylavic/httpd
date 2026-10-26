@@ -93,6 +93,29 @@ PROXY_DECLARE(const char *) ap_proxy_interpolate(request_rec *r,
  */
 PROXY_DECLARE(int) ap_proxy_canon_url(request_rec *r);
 
+/* The states of a request's asynchronous processing, in its proxy_req_conf
+ * (request_config rather than r->pool's userdata, which an internally
+ * redirected request shares)
+ */
+struct proxy_req_async {
+    struct proxy_handler_ctx *handler;  /* proxy_handler() suspended, see
+                                         * ap_proxy_handler_resume() */
+};
+
+/*
+ * Get the request's proxy_req_conf, created (zeroed) if needed
+ * @param r    current request
+ * @return     the request's proxy_req_conf
+ */
+proxy_req_conf *ap_proxy_req_conf(request_rec *r);
+
+/*
+ * Get the request's asynchronous states, created (zeroed) if needed
+ * @param r    current request
+ * @return     the request's proxy_req_async
+ */
+struct proxy_req_async *ap_proxy_req_async(request_rec *r);
+
 /** @} */
 
 #endif /* PROXY_UTIL_H_ */

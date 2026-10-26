@@ -2626,6 +2626,26 @@ PROXY_DECLARE(const char *) ap_proxy_interpolate(request_rec *r,
     }
 }
 
+proxy_req_conf *ap_proxy_req_conf(request_rec *r)
+{
+    proxy_req_conf *rconf = ap_get_module_config(r->request_config,
+                                                 &proxy_module);
+    if (!rconf) {
+        rconf = apr_pcalloc(r->pool, sizeof(*rconf));
+        ap_set_module_config(r->request_config, &proxy_module, rconf);
+    }
+    return rconf;
+}
+
+struct proxy_req_async *ap_proxy_req_async(request_rec *r)
+{
+    proxy_req_conf *rconf = ap_proxy_req_conf(r);
+    if (!rconf->async) {
+        rconf->async = apr_pcalloc(r->pool, sizeof(*rconf->async));
+    }
+    return rconf->async;
+}
+
 static apr_array_header_t *proxy_vars(request_rec *r, apr_array_header_t *hdr)
 {
     int i;
@@ -2668,8 +2688,7 @@ PROXY_DECLARE(int) ap_proxy_canon_url(request_rec *r)
         /* create per-request copy of reverse proxy conf,
          * and interpolate vars in it
          */
-        proxy_req_conf *rconf = apr_palloc(r->pool, sizeof(proxy_req_conf));
-        ap_set_module_config(r->request_config, &proxy_module, rconf);
+        proxy_req_conf *rconf = ap_proxy_req_conf(r);
         rconf->raliases = proxy_vars(r, dconf->raliases);
         rconf->cookie_paths = proxy_vars(r, dconf->cookie_paths);
         rconf->cookie_domains = proxy_vars(r, dconf->cookie_domains);
