@@ -2348,6 +2348,16 @@ MPM for asynchronous processing</description>
     <code>-1</code> disables asynchronous handling entirely (all proxy
     connections remain synchronous).</p>
 
+    <p>Tunnels (protocols upgraded with a <code>101 Switching
+    Protocols</code> response, e.g. WebSocket, see the
+    <code>upgrade</code> parameter of
+    <directive module="mod_proxy">ProxyPass</directive>) are handled
+    asynchronously by default, a synchronous tunnel holding a worker
+    thread for its whole life: unless this directive is explicitly set
+    to <code>-1</code>, the worker thread forwards what is available on
+    either side, then the MPM waits for more. Tunnels of HTTP/2 streams
+    remain synchronous.</p>
+
     <p>This directive has no effect unless the MPM supports polling
     (e.g., <module>event</module>).</p>
 
@@ -2392,7 +2402,8 @@ MPM for asynchronous processing</description>
 
     <p>This directive has no effect unless
     <directive module="mod_proxy">ProxyAsyncDelay</directive> is also
-    set to enable asynchronous handling.</p>
+    set to enable asynchronous handling, or for asynchronous tunnels
+    (where it is the time without data on either side).</p>
 </usage>
 
 <seealso><directive module="mod_proxy">ProxyAsyncDelay</directive></seealso>

@@ -23,7 +23,6 @@
 
 module AP_MODULE_DECLARE_DATA proxy_http_module;
 
-static int mpm_can_poll_suspended = 0;
 static int mpm_can_wait = 0;
 
 static int (*ap_proxy_clear_connection_fn)(request_rec *r, apr_table_t *headers) =
@@ -356,7 +355,6 @@ typedef struct {
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
-                 suspended              :1,
                  upgraded               :1;
 } proxy_http_req_t;
 
@@ -399,140 +397,42 @@ typedef struct {
     apr_status_t rv;
 } proxy_head_line_t;
 
-static int proxy_http_tunnel_pump(proxy_http_req_t *req)
-{
-    int status = ap_proxy_tunnel_run(req->tunnel);
-    if (status == HTTP_GATEWAY_TIME_OUT) {
-        if (!req->can_suspend) {
-            /* ap_proxy_tunnel_run() didn't log this */
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req->r, APLOGNO()
-                          "proxy: %s tunneling timed out",
-                          req->proto);
-        }
-        else {
-            status = SUSPENDED;
-        }
-    }
-    return status;
-}
+static void proxy_http_async_finish(proxy_http_req_t *req, int status);
 
-/* The backend and SUSPENDED client connections are done,
- * release them (the latter in the MPM).
+/* The end of a tunnel (after a 101 Switching Protocols), with its status:
+ * account for the bytes exchanged by the backend, and we are done with both
+ * connections.
  */
-static void proxy_http_async_done(proxy_http_req_t *req, int cancelled)
-{ 
-    request_rec *r = req->r;
-    conn_rec *c = r->connection;
+static void proxy_http_tunnel_end(proxy_http_req_t *req, int status)
+{
     proxy_conn_rec *backend = req->backend;
-    proxy_tunnel_rec *tunnel = req->tunnel;
-    int reusable = (!cancelled && !req->upgraded);
 
-    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r, "proxy %s: %s async",
-                  req->proto, cancelled ? "cancel" : "finish");
-
-    if (req->async_pool) {
-        apr_pool_destroy(req->async_pool);
-        req->async_pool = NULL;
+    if (status == HTTP_GATEWAY_TIME_OUT) {
+        /* ap_proxy_tunnel_run{,_ex}() didn't log this */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req->r, APLOGNO()
+                      "proxy: %s tunneling timed out", req->proto);
     }
 
-    if (!reusable) {
-        c->keepalive = AP_CONN_CLOSE;
-        backend->close = 1;
-    }
-
-    /* Report bytes exchanged by the backend */
     backend->worker->s->read +=
-        ap_proxy_tunnel_conn_bytes_in(tunnel->origin);
+        ap_proxy_tunnel_conn_bytes_in(req->tunnel->origin);
     backend->worker->s->transferred +=
-        ap_proxy_tunnel_conn_bytes_out(tunnel->origin);
+        ap_proxy_tunnel_conn_bytes_out(req->tunnel->origin);
 
-    proxy_run_detach_backend(r, backend);
-    ap_proxy_release_connection(req->proto, backend, r->server);
-
-    ap_finalize_request_protocol(r);
-    ap_process_request_after_handler(r);
-    /* don't dereference req or r from here! */
-
-    /* Return the client connection to the MPM */
-    if (reusable) {
-        c->cs->state = CONN_STATE_WRITE_COMPLETION;
-    }
-    else {
-        c->cs->state = CONN_STATE_LINGER;
-    }
-    ap_mpm_resume_suspended(c);
+    req->r->connection->keepalive = AP_CONN_CLOSE;
+    backend->close = 1;
 }
 
-/* Tell the MPM to poll the connections and resume when ready */
-static void proxy_http_async_poll(proxy_http_req_t *req)
+/* The end of a tunnel run asynchronously (ap_proxy_tunnel_run_ex()):
+ * proxy_http_tunnel_end(), then finish the request as any async one
+ * (proxy_http_async_finish()) with DONE, the status of a tunnel's end.
+ */
+static void proxy_http_tunnel_done(proxy_tunnel_rec *tunnel, int status,
+                                   void *baton)
 {
-    conn_rec *c = req->r->connection;
-    proxy_tunnel_rec *tunnel = req->tunnel;
+    proxy_http_req_t *req = baton;
 
-    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, req->r,
-                  "proxy %s: going async", req->proto);
-
-    /* Create/clear the subpool used by the MPM to allocate
-     * the temporary data needed for this polling.
-     */
-    if (req->async_pool) {
-        apr_pool_clear(req->async_pool);
-    }
-    else {
-        apr_pool_create(&req->async_pool, req->p);
-    }
-
-    ap_mpm_poll_suspended(c, req->async_pool, tunnel->pfds, req->idle_timeout);
-}
-
-/* The resume_connection hook called by the MPM when async polling completes (or times out) */
-static void proxy_http_resume_connection(conn_rec *c, request_rec *r)
-{
-    proxy_http_req_t *req = NULL;
-    int status;
-
-    if (r) {
-        req = proxy_http_req(r);
-    }
-    if (!req || !req->suspended) {
-        return;
-    }
-    ap_assert(req->r == r);
-
-    if (c->cs->state == CONN_STATE_SUSPENDED) {
-        status = proxy_http_tunnel_pump(req);
-    }
-    else {
-        AP_DEBUG_ASSERT(c->cs->state == CONN_STATE_LINGER);
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
-                      "proxy: %s async tunneling timed out (state %i)",
-                      req->proto, c->cs->state);
-        status = DONE;
-    }
-    if (status == SUSPENDED) {
-        /* Keep polling in the MPM */
-        proxy_http_async_poll(req);
-    }
-    else {
-        /* Done with tunneling */
-        proxy_http_async_done(req, status != OK);
-    }
-}
-
-/* The suspend_connection hook called once the MPM gets the SUSPENDED connection */
-static void proxy_http_suspend_connection(conn_rec *c, request_rec *r)
-{
-    proxy_http_req_t *req = NULL;
-
-    if (r) {
-        req = proxy_http_req(r);
-    }
-    if (!req || !req->suspended) {
-        return;
-    }
-    ap_assert(req->r == r);
-
-    proxy_http_async_poll(req);
+    proxy_http_tunnel_end(req, status);
+    proxy_http_async_finish(req, DONE);
 }
 
 static int ap_proxy_http_process_response(proxy_http_req_t *req);
@@ -2676,6 +2576,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
 
         if (proxy_status == HTTP_SWITCHING_PROTOCOLS) {
             apr_status_t rv;
+            int tunnel_async;
 
             /* If we didn't send the full body yet, do it now */
             if (do_100_continue) {
@@ -2696,49 +2597,31 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                               "can't create tunnel for %s", upgrade);
                 return HTTP_INTERNAL_SERVER_ERROR;
             }
-            if (req->can_suspend) {
-                /* If the MPM allows async polling, this thread will tunnel
-                 * all it can now so long as it's not timeouting on the (short)
-                 * async delay, returning to the MPM otherwise to get scheduled
-                 * again when the connections are ready.
-                 */
-                req->tunnel->timeout = dconf->async_delay;
-            }
-            else {
-                /* If the MPM doesn't allow async polling, the full tunneling
-                 * happens now in this thread and timeouting is a showstopper.
-                 */
-                req->tunnel->timeout = req->idle_timeout;
-            }
-
             r->status = HTTP_SWITCHING_PROTOCOLS;
             req->proto = upgrade;
             req->upgraded = 1;
 
-            status = proxy_http_tunnel_pump(req);
+            /* Tunnel asynchronously by default (when the MPM can wait, see
+             * ap_proxy_tunnel_run_ex()), a tunnel holding a thread for its
+             * whole life otherwise, unless disabled (ProxyAsyncDelay -1, not
+             * unset): with ProxyAsyncIdleTimeout if set, this thread forwards
+             * what's ready, then the MPM waits for the connections, and
+             * proxy_http_tunnel_done() finishes. Otherwise the whole tunneling
+             * happens now in this thread, with the proxy's timeout.
+             */
+            tunnel_async = !(dconf->async_delay_set && dconf->async_delay < 0);
+            if (tunnel_async && dconf->async_idle_timeout_set) {
+                req->idle_timeout = dconf->async_idle_timeout;
+            }
+            status = ap_proxy_tunnel_run_ex(req->tunnel, req->idle_timeout,
+                                            tunnel_async ? proxy_http_tunnel_done
+                                                         : NULL,
+                                            req);
             if (status == SUSPENDED) {
-                /* Let the MPM call proxy_http_suspend_connection() when
-                 * the connection is returned to it (i.e. not handled anywhere
-                 * else anymore). This prevents the connection from being seen
-                 * or handled by multiple threads at the same time, which could
-                 * happen if we'd call ap_mpm_poll_suspended() directly from
-                 * here, during the time for the connection to actually reaches
-                 * the MPM whilst a new IO causes the connection to be
-                 * rescheduled quickly.
-                 */
-                req->suspended = 1;
+                /* The MPM arms the wait once the handler returns SUSPENDED */
                 return SUSPENDED;
             }
-
-            /* Report bytes exchanged by the backend */
-            backend->worker->s->read +=
-                ap_proxy_tunnel_conn_bytes_in(req->tunnel->origin);
-            backend->worker->s->transferred +=
-                ap_proxy_tunnel_conn_bytes_out(req->tunnel->origin);
-
-            /* We are done with both connections */
-            r->connection->keepalive = AP_CONN_CLOSE;
-            backend->close = 1;
+            proxy_http_tunnel_end(req, status);
             return DONE;
         }
 
@@ -3935,11 +3818,6 @@ static int proxy_http_post_config(apr_pool_t *pconf, apr_pool_t *plog,
         return OK;
     }
 
-#ifdef AP_MPMQ_CAN_POLL_SUSPENDED
-    if (ap_mpm_query(AP_MPMQ_CAN_POLL_SUSPENDED, &mpm_can_poll_suspended)) {
-        mpm_can_poll_suspended = 0;
-    }
-#endif
 #ifdef AP_MPMQ_CAN_REGISTER_WAIT
     if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &mpm_can_wait)) {
         mpm_can_wait = 0;
@@ -3963,10 +3841,6 @@ static void ap_proxy_http_register_hook(apr_pool_t *p)
     proxy_hook_scheme_handler(proxy_http_handler, NULL, NULL, APR_HOOK_FIRST);
     proxy_hook_canon_handler(proxy_http_canon, NULL, NULL, APR_HOOK_FIRST);
     warn_rx = ap_pregcomp(p, "[0-9]{3}[ \t]+[^ \t]+[ \t]+\"[^\"]*\"([ \t]+\"([^\"]+)\")?", 0);
-
-    /* For when the tunnel connections are suspended to and resumed from the MPM */
-    ap_hook_suspend_connection(proxy_http_suspend_connection, NULL, NULL, APR_HOOK_FIRST);
-    ap_hook_resume_connection(proxy_http_resume_connection, NULL, NULL, APR_HOOK_FIRST);
 }
 
 AP_DECLARE_MODULE(proxy_http) = {
