@@ -3384,8 +3384,8 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
  * (proxy_http_acquire()), with what it needs to run the handler again.
  */
 typedef struct proxy_http_acquire {
-    proxy_conn_waiter waiter;
-    apr_file_t *wakeup_in;
+    ap_proxy_conn_pool_waiter *waiter;
+    ap_mpm_notifier_t *notifier;  /* The MPM's notifier of the current wait */
     apr_pool_t *wait_pool;
     proxy_worker *worker;
     proxy_server_conf *conf;
@@ -3393,6 +3393,16 @@ typedef struct proxy_http_acquire {
     const char *proxyname;
     apr_port_t proxyport;
 } proxy_http_acquire_t;
+
+/* Called by the pool when a connection is released for the waiter (from any
+ * thread, under the pool's lock): notify the wait in the MPM.
+ */
+static void proxy_http_acquire_released(void *baton)
+{
+    proxy_http_acquire_t *aw = baton;
+
+    ap_mpm_notify(aw->notifier);
+}
 
 /* The continuation of proxy_http_acquire(), called when a connection was
  * released to the pool (or on timeout or error): run the handler again,
@@ -3404,17 +3414,10 @@ static void proxy_http_acquire_continuation(conn_rec *c, request_rec *r,
                                             void *baton)
 {
     proxy_http_acquire_t *aw = baton;
-    char buf[16];
-    apr_size_t n;
     int status;
 
-    /* Drain the wakeup(s) */
-    do {
-        n = sizeof(buf);
-    } while (apr_file_read(aw->wakeup_in, buf, &n) == APR_SUCCESS && n);
-
-    if (why != AP_MPM_WAIT_READY) {
-        ap_proxy_cancel_conn_waiter(aw->worker, &aw->waiter);
+    if (why != AP_MPM_WAIT_NOTIFIED) {
+        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
                       "proxy: %s waiting for a connection to (%s:%d) "
                       "(async, %i)",
@@ -3662,8 +3665,8 @@ static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
 /* Acquire a backend connection, without blocking on an exhausted pool when
  * waiting asynchronously is possible (ProxyAsyncDelay): the request then
  * waits in the MPM for a connection to be released (the pool wakes up its
- * waiter through a pipe), and the handler runs again. Returns OK, SUSPENDED,
- * or an HTTP error.
+ * waiter, which notifies the wait from the releasing thread), and
+ * the handler runs again. Returns OK, SUSPENDED, or an HTTP error.
  */
 static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
                               const char *scheme, proxy_worker *worker,
@@ -3673,8 +3676,6 @@ static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
 {
     proxy_http_rctx_t *rctx;
     proxy_http_acquire_t *aw;
-    apr_array_header_t *pfds;
-    apr_pollfd_t *pfd;
     apr_status_t rv;
     int status;
 
@@ -3682,17 +3683,14 @@ static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
         return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
     }
 
-    /* Reuse this request's waiter (and its wakeup pipe), if any */
+    /* Reuse this request's waiter, if any (not queued anymore) */
     rctx = proxy_http_rctx(r);
     aw = rctx->acquire;
     if (!aw) {
         aw = apr_pcalloc(r->pool, sizeof(*aw));
-        rv = apr_file_pipe_create_ex(&aw->wakeup_in, &aw->waiter.notifier,
-                                     APR_FULL_NONBLOCK, r->pool);
-        if (rv != APR_SUCCESS) {
-            return ap_proxy_acquire_connection(scheme, backend, worker,
-                                               r->server);
-        }
+        aw->waiter = ap_proxy_conn_pool_waiter_make(r->pool,
+                                                    proxy_http_acquire_released,
+                                                    aw);
         rctx->acquire = aw;
     }
     aw->worker = worker;
@@ -3701,31 +3699,32 @@ static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
     aw->proxyname = proxyname;
     aw->proxyport = proxyport;
 
-    status = ap_proxy_acquire_connection_ex(scheme, backend, worker,
-                                            r->server, &aw->waiter);
-    if (status != SUSPENDED) {
-        return status;
-    }
-
+    /* A new notifier for the wait, created before the waiter is queued: a
+     * connection released before the wait is armed wakes it up once armed.
+     */
     if (aw->wait_pool) {
         apr_pool_clear(aw->wait_pool);
     }
     else {
         apr_pool_create(&aw->wait_pool, r->pool);
     }
-    pfds = apr_array_make(aw->wait_pool, 1, sizeof(apr_pollfd_t));
-    pfd = apr_array_push(pfds);
-    memset(pfd, 0, sizeof(*pfd));
-    pfd->p = aw->wait_pool;
-    pfd->desc_type = APR_POLL_FILE;
-    pfd->desc.f = aw->wakeup_in;
-    pfd->reqevents = APR_POLLIN;
-    rv = ap_mpm_register_wait(r->connection, aw->wait_pool, pfds,
-                             worker->s->acquire_set ? worker->s->acquire
-                                                    : r->server->timeout,
-                             NULL, proxy_http_acquire_continuation, aw);
+    rv = ap_mpm_notifier_create(&aw->notifier, r->connection, aw->wait_pool);
     if (rv != APR_SUCCESS) {
-        ap_proxy_cancel_conn_waiter(worker, &aw->waiter);
+        return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
+    }
+
+    status = ap_proxy_acquire_connection_ex(scheme, backend, worker,
+                                            r->server, aw->waiter);
+    if (status != SUSPENDED) {
+        return status;
+    }
+
+    rv = ap_mpm_register_wait(r->connection, aw->wait_pool, NULL,
+                              worker->s->acquire_set ? worker->s->acquire
+                                                       : r->server->timeout,
+                              aw->notifier, proxy_http_acquire_continuation, aw);
+    if (rv != APR_SUCCESS) {
+        ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
         return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
     }
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,

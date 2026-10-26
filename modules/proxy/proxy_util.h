@@ -116,6 +116,34 @@ proxy_req_conf *ap_proxy_req_conf(request_rec *r);
  */
 struct proxy_req_async *ap_proxy_req_async(request_rec *r);
 
+/* A waiter for a connection of an exhausted pool, see
+ * ap_proxy_acquire_connection_ex()
+ */
+struct ap_proxy_conn_pool_waiter {
+    ap_proxy_conn_pool_waiter_fn *fn;            /* Called on release */
+    void *baton;                                 /* For fn */
+    APR_RING_ENTRY(ap_proxy_conn_pool_waiter) link; /* In the pool's queue */
+    int queued;
+    int notified;                                /* Dequeued by a release,
+                                                  * not acquired yet */
+};
+
+/* The waiters of a connection pool (FIFO) */
+struct proxy_conn_pool_waiters {
+#if APR_HAS_THREADS
+    apr_thread_mutex_t *mutex; /* Protects the queue and the waiters' state */
+#endif
+    APR_RING_HEAD(proxy_conn_pool_waiter_ring, ap_proxy_conn_pool_waiter) ring;
+    /* Connections promised to the notified waiters or the acquirers, not
+     * acquired yet
+     */
+    /*atomic*/ apr_uint32_t reserved;
+    /* Connections acquired from the reslist */
+    /*atomic*/ apr_uint32_t acquired;
+    /* Waiters queued, or checking whether they have to */
+    /*atomic*/ apr_uint32_t nqueued;
+};
+
 /** @} */
 
 #endif /* PROXY_UTIL_H_ */

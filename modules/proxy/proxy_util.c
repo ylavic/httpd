@@ -1649,22 +1649,20 @@ static proxy_conn_rec *connection_make(apr_pool_t *p, proxy_worker *worker)
 }
 
 #if APR_HAS_THREADS
-/* Notify the first waiter of an exhausted pool, if any, waiters_mutex held */
-static void notify_first_conn_waiter(proxy_conn_pool *cp)
+/* Notify the first waiter of an exhausted pool, if any, the waiters' mutex
+ * held. The released connection is reserved for it, so that the acquirers
+ * coming meanwhile don't take it (they'd go before the waiters).
+ */
+static void notify_first_conn_pool_waiter(struct proxy_conn_pool_waiters *pw)
 {
-    proxy_conn_waiter *waiter = cp->waiters_head;
-
-    if (waiter) {
-        char b = 0;
-        apr_size_t n = 1;
-        cp->waiters_head = waiter->next;
-        if (!cp->waiters_head) {
-            cp->waiters_tail = NULL;
-        }
-        waiter->next = NULL;
+    if (!APR_RING_EMPTY(&pw->ring, ap_proxy_conn_pool_waiter, link)) {
+        ap_proxy_conn_pool_waiter *waiter = APR_RING_FIRST(&pw->ring);
+        APR_RING_REMOVE(waiter, link);
         waiter->queued = 0;
         waiter->notified = 1;
-        (void)apr_file_write(waiter->notifier, &b, &n);
+        apr_atomic_inc32(&pw->reserved);
+        apr_atomic_dec32(&pw->nqueued);
+        waiter->fn(waiter->baton);
     }
 }
 #endif
@@ -1714,13 +1712,23 @@ static void connection_cleanup(void *theconn)
         apr_reslist_release(worker->cp->res, (void *)conn);
 #if APR_HAS_THREADS
         /* Notify the first waiter (ap_proxy_acquire_connection_ex()), under
-         * the lock so that it can't be canceled (and its wakeup file closed)
-         * meanwhile.
+         * the lock so that it can't be canceled (and go away) meanwhile, if
+         * any: the acquirers count themselves in nqueued before checking the
+         * acquired connections, and we check nqueued after releasing ours,
+         * both with atomic read-modify-writes (ordered whatever the atomics'
+         * implementation), so either they see the release or we see them.
+         * Hence apr_atomic_add32(x, 0) for these reads: apr_atomic_read32()
+         * isn't ordered after a previous update everywhere (e.g. the mutex
+         * based or ppc implementations, a plain load there).
          */
-        if (worker->cp->waiters_mutex) {
-            apr_thread_mutex_lock(worker->cp->waiters_mutex);
-            notify_first_conn_waiter(worker->cp);
-            apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+        if (worker->cp->pool_waiters) {
+            struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+            apr_atomic_dec32(&pw->acquired);
+            if (apr_atomic_add32(&pw->nqueued, 0)) {
+                apr_thread_mutex_lock(pw->mutex);
+                notify_first_conn_pool_waiter(pw);
+                apr_thread_mutex_unlock(pw->mutex);
+            }
         }
 #endif
     }
@@ -2457,9 +2465,15 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
 #if APR_HAS_THREADS
                 /* For ap_proxy_acquire_connection_ex()'s waiters */
                 if (rv == APR_SUCCESS) {
-                    rv = apr_thread_mutex_create(&worker->cp->waiters_mutex,
+                    struct proxy_conn_pool_waiters *pw;
+                    pw = apr_pcalloc(worker->cp->pool, sizeof(*pw));
+                    APR_RING_INIT(&pw->ring, ap_proxy_conn_pool_waiter, link);
+                    rv = apr_thread_mutex_create(&pw->mutex,
                                                  APR_THREAD_MUTEX_DEFAULT,
                                                  worker->cp->pool);
+                    if (rv == APR_SUCCESS) {
+                        worker->cp->pool_waiters = pw;
+                    }
                 }
 #endif
 
@@ -2898,35 +2912,38 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
                                           NULL);
 }
 
-PROXY_DECLARE(void) ap_proxy_cancel_conn_waiter(proxy_worker *worker,
-                                                proxy_conn_waiter *waiter)
+PROXY_DECLARE(ap_proxy_conn_pool_waiter *) ap_proxy_conn_pool_waiter_make(apr_pool_t *p,
+                                                                          ap_proxy_conn_pool_waiter_fn *fn,
+                                                                          void *baton)
+{
+    ap_proxy_conn_pool_waiter *waiter = apr_pcalloc(p, sizeof(*waiter));
+
+    waiter->fn = fn;
+    waiter->baton = baton;
+    return waiter;
+}
+
+PROXY_DECLARE(void) ap_proxy_cancel_conn_pool_waiter(proxy_worker *worker,
+                                                     ap_proxy_conn_pool_waiter *waiter)
 {
 #if APR_HAS_THREADS
-    if (worker->cp && worker->cp->waiters_mutex) {
-        apr_thread_mutex_lock(worker->cp->waiters_mutex);
+    if (worker->cp && worker->cp->pool_waiters) {
+        struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+        apr_thread_mutex_lock(pw->mutex);
         if (waiter->queued) {
-            proxy_conn_waiter **pw = &worker->cp->waiters_head, *prev = NULL;
-            while (*pw && *pw != waiter) {
-                prev = *pw;
-                pw = &(*pw)->next;
-            }
-            if (*pw) {
-                *pw = waiter->next;
-                if (worker->cp->waiters_tail == waiter) {
-                    worker->cp->waiters_tail = prev;
-                }
-            }
-            waiter->next = NULL;
+            APR_RING_REMOVE(waiter, link);
             waiter->queued = 0;
+            apr_atomic_dec32(&pw->nqueued);
         }
         else if (waiter->notified) {
             /* Notified for a released connection that it won't acquire:
              * the next waiter takes it, or its notification would be lost.
              */
             waiter->notified = 0;
-            notify_first_conn_waiter(worker->cp);
+            apr_atomic_dec32(&pw->reserved);
+            notify_first_conn_pool_waiter(pw);
         }
-        apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+        apr_thread_mutex_unlock(pw->mutex);
     }
 #endif
 }
@@ -2935,9 +2952,12 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
                                                   proxy_conn_rec **conn,
                                                   proxy_worker *worker,
                                                   server_rec *s,
-                                                  proxy_conn_waiter *waiter)
+                                                  ap_proxy_conn_pool_waiter *waiter)
 {
     apr_status_t rv;
+#if APR_HAS_THREADS
+    struct proxy_conn_pool_waiters *reserved = NULL;
+#endif
 
     if (!PROXY_WORKER_IS_USABLE(worker)) {
         /* Retry the worker */
@@ -2957,34 +2977,74 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
      * queue the waiter (notified when a connection is released). The check
      * and the queuing are under the lock taken by the release to notify a
      * waiter, so no notification is lost.
+     *
+     * The connections reserved for the notified waiters count as acquired
+     * (FIFO), and so does the one reserved here until apr_reslist_acquire()
+     * returns, so that no other acquirer can make it block.
+     *
+     * The release takes the lock only if nqueued says that a waiter may be
+     * queued, so count ourselves there before the check (see
+     * connection_cleanup()).
      */
-    if (waiter && worker->s->hmax && worker->cp->res && worker->cp->waiters_mutex) {
-        apr_thread_mutex_lock(worker->cp->waiters_mutex);
-        waiter->notified = 0; /* acquiring now, the wakeup is used */
-        if (apr_reslist_acquired_count(worker->cp->res)
+    if (waiter && worker->s->hmax && worker->cp->res && worker->cp->pool_waiters) {
+        struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+        int notified;
+
+        apr_thread_mutex_lock(pw->mutex);
+        notified = waiter->notified;
+        if (notified) {
+            /* Acquiring now, the notification and its reservation are used */
+            waiter->notified = 0;
+            apr_atomic_dec32(&pw->reserved);
+        }
+        if (!waiter->queued) {
+            apr_atomic_inc32(&pw->nqueued);
+        }
+        if (apr_atomic_add32(&pw->acquired, 0) + apr_atomic_read32(&pw->reserved)
                 >= (apr_uint32_t)worker->s->hmax) {
-            waiter->next = NULL;
-            waiter->queued = 1;
-            if (worker->cp->waiters_tail) {
-                worker->cp->waiters_tail->next = waiter;
+            /* A notified waiter keeps its place, its connection was taken
+             * by an acquirer which doesn't wait (blocking).
+             */
+            if (!waiter->queued) {
+                if (notified) {
+                    APR_RING_INSERT_HEAD(&pw->ring, waiter,
+                                         ap_proxy_conn_pool_waiter, link);
+                }
+                else {
+                    APR_RING_INSERT_TAIL(&pw->ring, waiter,
+                                         ap_proxy_conn_pool_waiter, link);
+                }
+                waiter->queued = 1;
             }
-            else {
-                worker->cp->waiters_head = waiter;
-            }
-            worker->cp->waiters_tail = waiter;
-            apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+            apr_thread_mutex_unlock(pw->mutex);
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO()
                          "%s: connection pool exhausted for (%s:%d), "
                          "waiting", proxy_function, worker->s->hostname_ex,
                          (int)worker->s->port);
             return SUSPENDED;
         }
-        apr_thread_mutex_unlock(worker->cp->waiters_mutex);
+        if (!waiter->queued) {
+            apr_atomic_dec32(&pw->nqueued);
+        }
+        apr_atomic_inc32(&pw->reserved);
+        reserved = pw;
+        apr_thread_mutex_unlock(pw->mutex);
     }
 #endif
 
     if (worker->s->hmax && worker->cp->res) {
         rv = apr_reslist_acquire(worker->cp->res, (void **)conn);
+#if APR_HAS_THREADS
+        /* Count the acquired connection before giving up the reservation:
+         * the check above may over-count meanwhile, never under-count.
+         */
+        if (rv == APR_SUCCESS && worker->cp->pool_waiters) {
+            apr_atomic_inc32(&worker->cp->pool_waiters->acquired);
+        }
+        if (reserved) {
+            apr_atomic_dec32(&reserved->reserved);
+        }
+#endif
     }
     else {
         /* create the new connection if the previous was destroyed */
