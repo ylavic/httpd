@@ -320,6 +320,15 @@ typedef struct {
     /* The request's sending state (stream_reqbody()) */
     apr_off_t bytes_streamed;
 
+    /* The response head(s), pre-read without blocking by
+     * proxy_http_response_preread() and then served to the parsing by
+     * ap_proxygetline().
+     */
+    apr_array_header_t *head_lines;
+    int head_next;
+    ap_getline_state_t *head_state;
+    apr_bucket_brigade *head_bb;
+
     unsigned int can_suspend            :1,
                  body_async             :1,
                  direction              :2, /* ap_proxy_direction_e */
@@ -328,12 +337,22 @@ typedef struct {
                  send_wait_backend      :1,
                  request_timed_out         :1, /* the wait for the client did */
                  request_eos               :1,
+                 head_in_headers        :1,
+                 head_interim           :1,
+                 head_stray             :1,
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
                  suspended              :1,
                  upgraded               :1;
 } proxy_http_req_t;
+
+/* A response head line pre-read by proxy_http_response_preread() */
+typedef struct {
+    char *line;
+    apr_size_t len;
+    apr_status_t rv;
+} proxy_head_line_t;
 
 static int proxy_http_tunnel_pump(proxy_http_req_t *req)
 {
@@ -517,9 +536,12 @@ static void proxy_http_async_finish(proxy_http_req_t *req, int status)
     ap_mpm_resume_suspended(c);
 }
 
+static int proxy_http_response_preread(proxy_http_req_t *req);
+static int proxy_http_response_suspend(proxy_http_req_t *req);
+
 /* The continuation of proxy_http_response_head_wait(), called when the
- * backend's response is available (or on timeout or error): process it and
- * finish the request.
+ * backend's response is available (or on timeout or error): read its head,
+ * process it and finish the request.
  */
 static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
                                                   ap_mpm_wait_result_e why,
@@ -535,6 +557,9 @@ static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
     case AP_MPM_WAIT_READY:
         ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                       "proxy %s: response ready (async)", req->proto);
+        if (proxy_http_response_preread(req) == SUSPENDED) {
+            return; /* waiting for the rest of the head */
+        }
         status = ap_proxy_http_process_response(req);
         break;
     case AP_MPM_WAIT_TIMEOUT:
@@ -572,7 +597,6 @@ static int proxy_http_response_head_wait(proxy_http_req_t *req)
 {
     request_rec *r = req->r;
     proxy_conn_rec *backend = req->backend;
-    apr_array_header_t *pfds;
     apr_pollfd_t pfd;
     apr_int32_t nready = 0;
     apr_status_t rv;
@@ -584,9 +608,23 @@ static int proxy_http_response_head_wait(proxy_http_req_t *req)
     pfd.reqevents = APR_POLLIN;
     rv = apr_poll(&pfd, 1, &nready, req->dconf->async_delay);
     if (!APR_STATUS_IS_TIMEUP(rv)) {
-        /* Readable, or an error the (blocking) read will report */
-        return OK;
+        /* Readable (or an error the read will report): read the head */
+        return proxy_http_response_preread(req);
     }
+
+    return proxy_http_response_suspend(req);
+}
+
+/* Suspend until the backend is readable, then read its response head in
+ * proxy_http_response_head_continuation(). Returns SUSPENDED, or OK if we
+ * can't wait asynchronously (the caller then blocks).
+ */
+static int proxy_http_response_suspend(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    apr_array_header_t *pfds;
+    apr_pollfd_t *pfd;
+    apr_status_t rv;
 
     if (req->async_pool) {
         apr_pool_clear(req->async_pool);
@@ -595,8 +633,12 @@ static int proxy_http_response_head_wait(proxy_http_req_t *req)
         apr_pool_create(&req->async_pool, req->p);
     }
     pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
-    pfd.p = req->async_pool;
-    *(apr_pollfd_t *)apr_array_push(pfds) = pfd;
+    pfd = apr_array_push(pfds);
+    memset(pfd, 0, sizeof(*pfd));
+    pfd->p = req->async_pool;
+    pfd->desc_type = APR_POLL_SOCKET;
+    pfd->desc.s = req->backend->sock;
+    pfd->reqevents = APR_POLLIN;
     rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
                              req->idle_timeout, proxy_http_response_head_continuation,
                              req);
@@ -620,6 +662,105 @@ static int proxy_http_response_head_wait(proxy_http_req_t *req)
 static apr_interval_time_t proxy_http_request_read_timeout(request_rec *r)
 {
     return ap_get_connection_timeout(r->connection, r->server);
+}
+
+/* The status code of a status line, 0 if it doesn't look like one */
+static int proxy_head_status(const char *line)
+{
+    if (!apr_date_checkmask(line, "HTTP/#.# ###*")) {
+        return 0;
+    }
+    return (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
+}
+
+/* Pre-read the backend's response head(s) without blocking (ap_fgetline_ex()
+ * with AP_GETLINE_NONBLOCK, keeping the parsing state in req).
+ * ap_proxygetline() then serves these lines to the parsing in
+ * ap_proxy_http_process_response(), which therefore doesn't block. The status
+ * line is read as is, and the header lines are folded as
+ * ap_proxy_read_headers() would fold them; interim (1xx) heads are included.
+ * Returns OK once the head is read (an error is kept for the parsing to
+ * report), or SUSPENDED if waiting for the backend
+ * (proxy_http_response_head_continuation() is called then).
+ */
+static int proxy_http_response_preread(proxy_http_req_t *req)
+{
+    proxy_conn_rec *backend = req->backend;
+    conn_rec *origin = req->origin;
+    apr_size_t size = HUGE_STRING_LEN;
+    int nonblock = AP_GETLINE_NONBLOCK;
+
+    if (backend->worker->s->response_field_size_set) {
+        size = backend->worker->s->response_field_size;
+    }
+    if (!req->head_lines) {
+        req->head_lines = apr_array_make(req->p, 20, sizeof(proxy_head_line_t));
+        req->head_bb = apr_brigade_create(req->p, origin->bucket_alloc);
+    }
+
+    for (;;) {
+        proxy_head_line_t *hl;
+        char *line = NULL;
+        apr_size_t len = 0;
+        apr_status_t rv;
+        int flags = (req->head_in_headers ? AP_GETLINE_FOLD_COL : 0);
+
+        rv = ap_fgetline_ex(&line, size, &len, origin->input_filters,
+                            flags | nonblock, req->head_bb,
+                            &req->head_state, req->p);
+        apr_brigade_cleanup(req->head_bb);
+        if (APR_STATUS_IS_EAGAIN(rv)) {
+            if (proxy_http_response_suspend(req) == SUSPENDED) {
+                return SUSPENDED;
+            }
+            nonblock = 0; /* can't wait: block (the parsing state is kept) */
+            continue;
+        }
+
+        hl = apr_array_push(req->head_lines);
+        hl->line = line ? line : "";
+        hl->len = line ? len : 0;
+        hl->rv = rv;
+        if (rv != APR_SUCCESS || req->head_lines->nelts > 1000) {
+            /* Leave it to the parsing to report: it reads (and fails) as
+             * usual.
+             */
+            return OK;
+        }
+
+        if (!req->head_in_headers) {
+            int status;
+            if (hl->len == 0 && !req->head_stray) {
+                /* Skip one potential stray CRLF, as
+                 * ap_proxy_http_process_response() does.
+                 */
+                req->head_stray = 1;
+                continue;
+            }
+            status = proxy_head_status(hl->line);
+            if (!status) {
+                /* Not an HTTP response (no head): an error, which the
+                 * parsing reports (502).
+                 */
+                return OK;
+            }
+            if (status == 101) {
+                /* An upgrade: stop pre-reading */
+                return OK;
+            }
+            req->head_interim = (status >= 100 && status < 200);
+            req->head_in_headers = 1;
+        }
+        else if (hl->len == 0) {
+            /* End of a head: another one follows an interim response */
+            if (req->head_interim) {
+                req->head_in_headers = 0;
+                req->head_stray = 0;
+                continue;
+            }
+            return OK;
+        }
+    }
 }
 
 static void proxy_http_request_forward_continuation(conn_rec *c, request_rec *r,
@@ -1404,10 +1545,29 @@ static int addit_dammit(void *v, const char *key, const char *val)
 static apr_status_t ap_proxygetline(apr_bucket_brigade *bb, char *s, int n,
                                     request_rec *r, int flags, int *read)
 {
+    proxy_http_req_t *req;
     apr_status_t rv;
     apr_size_t len;
 
-    rv = ap_rgetline(&s, n, &len, r, flags, bb);
+    /* Serve the lines pre-read without blocking
+     * (proxy_http_response_preread()), as ap_rgetline() would have read them.
+     */
+    req = ap_get_module_config(r->request_config, &proxy_http_module);
+    if (req && req->head_lines && req->head_next < req->head_lines->nelts) {
+        proxy_head_line_t *hl = &APR_ARRAY_IDX(req->head_lines, req->head_next,
+                                               proxy_head_line_t);
+        req->head_next++;
+        len = hl->len;
+        if (len >= (apr_size_t)n) {
+            len = n - 1;
+        }
+        memcpy(s, hl->line, len);
+        s[len] = '\0';
+        rv = hl->rv;
+    }
+    else {
+        rv = ap_rgetline(&s, n, &len, r, flags, bb);
+    }
     apr_brigade_cleanup(bb);
 
     if (rv == APR_SUCCESS || APR_STATUS_IS_ENOSPC(rv)) {
@@ -1890,6 +2050,8 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
      */
 
     backend->r = make_fake_req(origin, r);
+    /* So that ap_proxygetline() can serve the pre-read head lines, if any */
+    ap_set_module_config(backend->r->request_config, &proxy_http_module, req);
     /* In case anyone needs to know, this is a fake request that is really a
      * response.
      */
