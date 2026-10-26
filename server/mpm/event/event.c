@@ -1830,6 +1830,19 @@ static struct {
     CACHE_LINE_ALIGNED
     /*atomic*/ apr_uint32_t rung;
 } doorbell_state;
+
+/* worker_poll: a worker notifying a wait (ap_mpm_notify(), e.g. releasing a
+ * backend connection to a pool waiter) completes it itself rather than
+ * through the listener (its wakeup, then the doorbell): it queues the
+ * continuation without ringing the doorbell and pops it when back to
+ * worker_poll_next(), right after its current work, before polling
+ * anything (event_notify()).
+ */
+#ifdef AP_THREAD_LOCAL
+#define EVENT_WORKER_NOTIFY 1
+static AP_THREAD_LOCAL int worker_thread_polls;   /* a polling worker */
+static AP_THREAD_LOCAL int worker_wake_queued;  /* to pop, not rung */
+#endif
 #endif
 
 static void recycle_connection_pool(apr_pool_t *p);
@@ -1924,9 +1937,9 @@ static void kill_connection_at(event_conn_state_t *cs, apr_status_t status,
 
 /* forward declare */
 static void set_conn_state_sense(event_conn_state_t *cs, int sense);
-static void push2worker(event_conn_state_t *cs, timer_event_t *te,
-                        backlog_class_e qclass, apr_time_t now,
-                        int *above_limit);
+static int push2worker(event_conn_state_t *cs, timer_event_t *te,
+                       backlog_class_e qclass, apr_time_t now,
+                       int *above_limit, int by_worker);
 static void cancel_timer_event(timer_event_t *te);
 
 /* Shutdown the connection in case of timeout, error or resources shortage.
@@ -1958,7 +1971,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
         }
         cs->pub.timed_out = 1;
         cs->pub.state = CONN_STATE_PROCESSING;
-        push2worker(cs, NULL, BACKLOG_WAITIO, now, NULL);
+        push2worker(cs, NULL, BACKLOG_WAITIO, now, NULL, 0);
         return;
     }
 
@@ -2006,7 +2019,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
                 cs->linger_since = now;
             }
             cs->pub.state = CONN_STATE_LINGER;
-            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL);
+            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL, 0);
         }
         else if (!in_backlog && !cs->linger_shutdown) {
             /* Its output timed out (shutdown_q): abort it and let a worker
@@ -2017,7 +2030,7 @@ static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
              */
             cs->c->aborted = 1;
             cs->linger_since = now;
-            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL);
+            push2worker(cs, NULL, BACKLOG_LINGER, now, NULL, 0);
         }
         else {
             /* Closed by the listener: no worker's scoreboard slot */
@@ -2607,6 +2620,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 static void arm_pending_wait(event_conn_state_t *cs);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 static int claim_user_wait(struct user_wait *user_wait);
+static void claimed_user_wait_timer(struct user_wait *user_wait);
 
 /* The continuation to run since the wait fired (claimed), for why */
 static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
@@ -2882,20 +2896,62 @@ static apr_status_t event_notifier_rearm(ap_mpm_notifier_t *notifier)
  * the wait has completed, user_wait_cleanup() has disarmed it so nothing is
  * done, but for the notification recorded, which a re-arm drops
  * (event_notifier_rearm()).
+ *
+ * A polling worker completes an armed wait itself (EVENT_WORKER_NOTIFY): it
+ * claims it under notifiers_mutex, so that it can't complete otherwise
+ * meanwhile (user_wait_cleanup() disarms it there), but frees its timer
+ * after (claimed_user_wait_timer()), then completes it like the listener
+ * does and queues the continuation for itself (worker_wake_queued).
  */
 static int event_notify(ap_mpm_notifier_t *notifier)
 {
     int wake = 0;
+#ifdef EVENT_WORKER_NOTIFY
+    struct user_wait *user_wait = NULL;
+#endif
 
     apr_thread_mutex_lock(notifiers_mutex);
     notifier->notified = 1;
     if (notifier->armed && !notifier->queued) {
-        APR_RING_INSERT_TAIL(notified_user_waits, notifier, ap_mpm_notifier_t,
-                             link);
-        notifier->queued = 1;
-        wake = 1;
+#ifdef EVENT_WORKER_NOTIFY
+        if (worker_thread_polls) {
+            if (apr_atomic_cas32(&notifier->wait->claim, WAIT_CLAIMED,
+                                 WAIT_ARMED) == WAIT_ARMED) {
+                user_wait = notifier->wait;
+            }
+            /* else completed otherwise already, nothing to do */
+        }
+        else
+#endif
+        {
+            APR_RING_INSERT_TAIL(notified_user_waits, notifier, ap_mpm_notifier_t,
+                                 link);
+            notifier->queued = 1;
+            wake = 1;
+        }
     }
     apr_thread_mutex_unlock(notifiers_mutex);
+
+#ifdef EVENT_WORKER_NOTIFY
+    if (user_wait) {
+        event_conn_state_t *cs = user_wait->cs;
+
+        AP_DEBUG_ASSERT(cs->user_wait == user_wait);
+        AP_DEBUG_ASSERT(cs->pub.state == CONN_STATE_SUSPENDED);
+        claimed_user_wait_timer(user_wait);
+        if (user_wait->continuation.fn) {
+            set_user_continuation(cs, user_wait, AP_MPM_WAIT_NOTIFIED);
+        }
+        apr_pool_cleanup_run(user_wait->pool, user_wait,
+                             user_wait_cleanup);
+        cs->user_wait = NULL;
+        if (push2worker(cs, NULL, BACKLOG_CONTINUATION, event_time_now(),
+                        NULL, 1)) {
+            worker_wake_queued = 1;
+        }
+        return OK;
+    }
+#endif
 
     if (wake) {
         apr_pollset_wakeup(event_pollset);
@@ -3250,11 +3306,14 @@ static void timer_event_backlog_cb(void *baton, int pushed)
 
 /*
  * Pre-condition: cs is neither in event_pollset nor a queue
- * this function may only be called by the listener
+ * this function may only be called by the listener, or by a worker for a
+ * wait it notified (event_notify(), by_worker), which neither rings the
+ * doorbell nor stops accepting (the listener's): returns whether the event
+ * was queued.
  */
-static void push2worker(event_conn_state_t *cs, timer_event_t *te,
-                        backlog_class_e qclass, apr_time_t now,
-                        int *above_limit)
+static int push2worker(event_conn_state_t *cs, timer_event_t *te,
+                       backlog_class_e qclass, apr_time_t now,
+                       int *above_limit, int by_worker)
 {
     ap_queue_event_t *qe;
     apr_status_t rc;
@@ -3263,7 +3322,7 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
     ap_assert((cs != NULL) ^ (te != NULL));
 
     busy = (ap_queue_info_idlers_dec(worker_queue_info) < 0);
-    if (busy) {
+    if (busy && !by_worker) {
         /* Might need to kindle the fire by not accepting new connections until
          * the situation settles down. The listener and new idling workers will
          * test for should_enable_listensocks() to recover (when suitable).
@@ -3293,7 +3352,7 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
              */
             ap_queue_info_idlers_inc(worker_queue_info);
             close_connection(cs);
-            return;
+            return 0;
         }
 
         if (cs->c) {
@@ -3315,7 +3374,10 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
 
     rc = ap_queue_push_event(worker_queue, qe, 0);
     if (rc == APR_SUCCESS) {
-        ring_doorbell(); /* a worker blocked polling (worker_poll) */
+        if (!by_worker) {
+            ring_doorbell(); /* a worker blocked polling (worker_poll) */
+        }
+        return 1;
     }
     else {
         int mode = ST_GRACEFUL;
@@ -3339,6 +3401,7 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
 
         AP_DEBUG_ASSERT(0);
         signal_threads(mode);
+        return 0;
     }
 }
 
@@ -3505,13 +3568,22 @@ static APR_INLINE int stale_user_wait(listener_poll_type *pt)
  */
 static int claim_user_wait(struct user_wait *user_wait)
 {
-    timer_event_t *te;
-
     if (apr_atomic_cas32(&user_wait->claim, WAIT_CLAIMED,
                          WAIT_ARMED) != WAIT_ARMED) {
         return 0;
     }
-    te = user_wait->timer;
+    claimed_user_wait_timer(user_wait);
+    return 1;
+}
+
+/* Free the timer of a wait just claimed, see claim_user_wait(): separately
+ * for a claim made under notifiers_mutex (event_notify()), since the listener
+ * takes g_timer_skiplist_mtx first.
+ */
+static void claimed_user_wait_timer(struct user_wait *user_wait)
+{
+    timer_event_t *te = user_wait->timer;
+
     if (te) {
         apr_thread_mutex_lock(g_timer_skiplist_mtx);
         if (te->node) {
@@ -3524,7 +3596,6 @@ static int claim_user_wait(struct user_wait *user_wait)
         user_wait->cs->te = NULL;
         apr_thread_mutex_unlock(g_timer_skiplist_mtx);
     }
-    return 1;
 }
 
 #ifdef APR_POLLONESHOT
@@ -3986,7 +4057,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 }
 
                 /* A timed out wait completes, else a timer */
-                push2worker(cs, te, BACKLOG_CONTINUATION, now, &above_limit);
+                push2worker(cs, te, BACKLOG_CONTINUATION, now, &above_limit, 0);
             }
             if (te) {
                 next_expiry = te->when;
@@ -4023,7 +4094,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 if (!cs->continuation.fn) {
                     cs->pub.state = CONN_STATE_LINGER;
                 }
-                push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit);
+                push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit, 0);
             }
         }
         if (next_expiry) {
@@ -4213,10 +4284,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 }
 
 #ifdef APR_POLLONESHOT
-                push2worker(cs, NULL, qclass, now, &above_limit);
+                push2worker(cs, NULL, qclass, now, &above_limit, 0);
 #else
                 if (pollset_del_fired(cs)) {
-                    push2worker(cs, NULL, qclass, now, &above_limit);
+                    push2worker(cs, NULL, qclass, now, &above_limit, 0);
                 }
                 else {
                     /* Can't go anywhere, kill (and log) and next. */
@@ -4279,7 +4350,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                         ap_assert(csd != NULL);
                         cs = make_conn_state(ptrans, csd);
                         push2worker(cs, NULL, BACKLOG_NEW, now,
-                                    &above_limit);
+                                    &above_limit, 0);
                     }
                     else {
                         if (rc == APR_EGENERAL) {
@@ -4403,7 +4474,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             cs->user_wait = NULL;
 
             /* Schedule ap_run_resume_connection() */
-            push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit);
+            push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit, 0);
         }
 
         if (worker_poll) {
@@ -4833,10 +4904,15 @@ static apr_status_t worker_poll_next(int slot,
     worker_poll_round_charge(round, now);
     for (;;) {
         event_conn_state_t *cs;
-        int doorbell = 0;
+        int doorbell = 0, pop_first = 0;
         apr_status_t rv;
 
-        if (round->polled < BACKLOG_WEIGHT_WAITING) {
+#ifdef EVENT_WORKER_NOTIFY
+        /* Its own continuation queued without ringing (event_notify()) */
+        pop_first = worker_wake_queued;
+        worker_wake_queued = 0;
+#endif
+        if (!pop_first && round->polled <= round->queued) {
             cs = worker_poll_one(slot, 0, &doorbell);
             if (cs) {
                 round->since = now;
@@ -4915,6 +4991,9 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
     ws->generation = retained->mpm->my_generation;
     ap_update_child_status_from_indexes(process_slot, thread_slot,
                                         SERVER_STARTING, NULL);
+#ifdef EVENT_WORKER_NOTIFY
+    worker_thread_polls = worker_poll;
+#endif
 #ifdef AP_THREAD_LOCAL
     worker_current_slot = &worker_slots[thread_slot];
 #endif
@@ -5076,6 +5155,14 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         /* Not idling anymore */
         ap_queue_info_idlers_dec(worker_queue_info);
     }
+#ifdef EVENT_WORKER_NOTIFY
+    worker_thread_polls = 0;
+    if (worker_wake_queued) {
+        /* Exiting before popping it, another worker will */
+        worker_wake_queued = 0;
+        ring_doorbell();
+    }
+#endif
 
     ap_update_child_status_from_indexes(process_slot, thread_slot,
                                         (apr_atomic_read32(&dying)
