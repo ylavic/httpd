@@ -340,6 +340,7 @@ typedef struct {
     apr_pool_t *pool;
     char buffer[AP_IOBUFSIZE];
     ssl_filter_ctx_t *filter_ctx;
+    int bio_retry; /* the BIO had nothing to read (EAGAIN) */
 } bio_filter_in_ctx_t;
 
 /*
@@ -547,6 +548,7 @@ static int bio_filter_in_read(BIO *bio, char *in, int inlen)
         if (APR_STATUS_IS_EAGAIN(inctx->rc) || APR_STATUS_IS_EINTR(inctx->rc)
                || (inctx->rc == APR_SUCCESS && APR_BRIGADE_EMPTY(inctx->bb))) {
             BIO_set_retry_read(bio);
+            inctx->bio_retry = 1;
             return -1;
         }
 
@@ -573,6 +575,7 @@ static int bio_filter_in_read(BIO *bio, char *in, int inlen)
     if (APR_STATUS_IS_EAGAIN(inctx->rc)
             || APR_STATUS_IS_EINTR(inctx->rc)) {
         BIO_set_retry_read(bio);
+        inctx->bio_retry = 1;
         return (int)inl;
     }
 
@@ -717,6 +720,7 @@ static apr_status_t ssl_io_input_read(bio_filter_in_ctx_t *inctx,
          * from the stack.  This is where we want to consider all of
          * the blocking and SPECULATIVE semantics
          */
+        inctx->bio_retry = 0;
         rc = SSL_read(inctx->filter_ctx->pssl, buf + bytes, wanted - bytes);
 
         if (rc > 0) {
@@ -777,6 +781,16 @@ static apr_status_t ssl_io_input_read(bio_filter_in_ctx_t *inctx,
                     break;
                 }
                 if (inctx->block == APR_NONBLOCK_READ) {
+                    if (!inctx->bio_retry) {
+                        /* OpenSSL consumed a non-application record (e.g.
+                         * a TLSv1.3 session ticket; SSL_MODE_AUTO_RETRY is
+                         * off) without the BIO running out of data. What
+                         * follows may already be buffered in the filters
+                         * below, where a poll on the socket wouldn't see
+                         * it, so keep reading until the BIO reports EAGAIN.
+                         */
+                        continue;
+                    }
                     break;
                 }
                 continue;  /* Blocking and nothing yet?  Try again. */
@@ -2411,6 +2425,7 @@ static apr_status_t ssl_io_input_add_filter(ssl_filter_ctx_t *filter_ctx, conn_r
     memset(&inctx->cbuf, 0, sizeof(inctx->cbuf));
     inctx->bb = apr_brigade_create(c->pool, c->bucket_alloc);
     inctx->block = APR_BLOCK_READ;
+    inctx->bio_retry = 0;
     inctx->pool = c->pool;
     inctx->filter_ctx = filter_ctx;
     return APR_SUCCESS;
