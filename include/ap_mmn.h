@@ -755,6 +755,39 @@
  *                         AP_MPMQ_CAN_POLL
  * 20260601.5  (2.5.1-dev) Axe ap_mpm_poll_suspended() and
  *                         AP_MPMQ_CAN_POLL_SUSPENDED
+ * 20260601.6  (2.5.1-dev) Add ap_mpm_register_wait(), ap_mpm_continuation_fn_t,
+ *                         ap_mpm_wait_result_e, AP_MPM_WAIT_KEEP_PFDS,
+ *                         AP_MPM_WAIT_DRAINED, ap_mpm_release_pfd(),
+ *                         ap_mpm_release_pfds(), ap_mpm_notifier_t,
+ *                         ap_mpm_notifier_create(), ap_mpm_notify(),
+ *                         ap_mpm_notifier_rearm(),
+ *                         AP_MPMQ_CAN_REGISTER_WAIT and
+ *                         AP_MPMQ_MAX_CONNECTIONS to ap_mpm.h, and the
+ *                         mpm_register_wait, mpm_release_pfd,
+ *                         mpm_notifier_create and mpm_notify hooks to
+ *                         mpm_common.h; conn_rec->partial_request,
+ *                         conn_state_t->timed_out and
+ *                         AP_EXPECT_100_NONBLOCK to httpd.h;
+ *                         ap_read_request_ex(), ap_get_mime_headers_ex(),
+ *                         ap_fgetline_ex(), AP_GETLINE_ALLOC,
+ *                         AP_GETLINE_FOLD_COL, ap_send_interim_response_ex()
+ *                         and AP_SEND_INTERIM_NONBLOCK to http_protocol.h;
+ *                         process_score->shutdown and ->backlog to
+ *                         scoreboard.h;
+ *                         AP_SHUTDOWN_CONN_* to http_connection.h;
+ *                         ap_h1_header_in_filter_handle to mod_core.h;
+ *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
+ *                         ap_proxy_handler_done(), proxy_req_conf->async,
+ *                         ap_proxy_conn_pool_waiter,
+ *                         ap_proxy_conn_pool_waiter_make(),
+ *                         ap_proxy_acquire_connection_ex(),
+ *                         ap_proxy_cancel_conn_pool_waiter(),
+ *                         ap_proxy_connect_state,
+ *                         ap_proxy_connect_backend_ex(),
+ *                         ap_proxy_connect_backend_cancel(),
+ *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
+ *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
+ *                         ap_proxy_tunnel_run_ex() to mod_proxy.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -762,7 +795,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 5     /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 6     /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a
