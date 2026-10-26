@@ -1632,7 +1632,7 @@ static apr_status_t decrement_connection_count(void *cs_)
 }
 
 static void arm_pending_wait(event_conn_state_t *cs);
-static void run_user_continuation(event_conn_state_t *cs);
+static int run_user_continuation(event_conn_state_t *cs, int in_place);
 
 static void enter_suspended(event_conn_state_t *cs)
 {
@@ -2153,11 +2153,14 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
                       "resuming connection %" CS_FMT, CS_ARG(cs));
         take_suspended(cs);
         if (cs->resume_fn) {
-            /* The continuation of an ap_mpm_register_wait(), this worker
-             * busy meanwhile (SERVER_BUSY_WRITE, the handler's status)
+            /* The continuation of an ap_mpm_register_wait(), which may give
+             * the connection back to this thread, this worker busy meanwhile
+             * (SERVER_BUSY_WRITE, the handler's status).
              */
             ap_update_child_status(cs->sbh, SERVER_BUSY_WRITE, cs->r);
-            run_user_continuation(cs);
+            if (run_user_continuation(cs, 1)) {
+                goto resumed;
+            }
         }
         return;
     }
@@ -2289,6 +2292,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         return; /* queued */
     }
 
+ resumed:
     if (cs->pub.state == CONN_STATE_WRITE_COMPLETION) {
         int pending = OK;
 
@@ -2358,7 +2362,7 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
 static apr_status_t arm_user_wait(event_conn_state_t *cs,
                                   struct user_wait *user_wait);
 static void arm_pending_wait(event_conn_state_t *cs);
-static void run_user_continuation(event_conn_state_t *cs);
+static int run_user_continuation(event_conn_state_t *cs, int in_place);
 
 static apr_status_t user_wait_cleanup(void *data)
 {
@@ -2628,11 +2632,13 @@ static void arm_pending_wait(event_conn_state_t *cs)
     cs->resume_baton = user_wait->fn_baton;
     cs->resume_pfds = user_wait->pfds;
     cs->resume_why = AP_MPM_WAIT_ERROR;
-    run_user_continuation(cs);
+    (void)run_user_continuation(cs, 0);
 }
 
-/* Put a SUSPENDED connection back into a queue. */
-static void leave_suspended(event_conn_state_t *cs)
+/* Mark a SUSPENDED connection as resumed, for write completion (or lingering
+ * close).
+ */
+static void leave_suspended_state(event_conn_state_t *cs)
 {
     apr_atomic_dec32(&suspended_count);
     cs->c->suspended_baton = NULL;
@@ -2642,6 +2648,14 @@ static void leave_suspended(event_conn_state_t *cs)
     cs->pub.sense = CONN_SENSE_DEFAULT;
     if (cs->pub.state != CONN_STATE_LINGER) {
         cs->pub.state = CONN_STATE_WRITE_COMPLETION;
+    }
+}
+
+/* Put a SUSPENDED connection back into a queue. */
+static void leave_suspended(event_conn_state_t *cs)
+{
+    leave_suspended_state(cs);
+    if (cs->pub.state != CONN_STATE_LINGER) {
         if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
             return; /* queued */
         }
@@ -2679,10 +2693,15 @@ static apr_status_t event_resume_suspended(conn_rec *c)
     return APR_SUCCESS;
 }
 
-/* Run the continuation of a resumed wait (on a worker thread), then arm the
- * next wait or resume the connection, as the continuation asked.
+/* Run the continuation of a fired wait (on a worker thread), then arm the
+ * next wait or resume the connection, as the continuation asked. With
+ * in_place (from process_socket()), a resumed connection is given back to the
+ * caller to go on with its write completion in this thread (returns 1),
+ * rather than queued to the listener for writing: it would be dispatched
+ * right back to a worker, being writable most of the time, for a round trip
+ * through the listener and an idle worker's wakeup per request.
  */
-static void run_user_continuation(event_conn_state_t *cs)
+static int run_user_continuation(event_conn_state_t *cs, int in_place)
 {
     ap_mpm_continuation_fn_t *fn = cs->resume_fn;
     void *baton = cs->resume_baton;
@@ -2702,19 +2721,23 @@ static void run_user_continuation(event_conn_state_t *cs)
         cs->continuation_pending = 0;
         arm_pending_wait(cs);
     }
-    else if (cs->continuation_pending) {
-        cs->continuation_pending = 0;
-        leave_suspended(cs);
-    }
     else {
-        /* The continuation neither waits again nor gives the connection
-         * back: close it.
-         */
-        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, cs->c, APLOGNO()
-                      "suspended connection abandoned by its continuation");
-        cs->pub.state = CONN_STATE_LINGER;
+        if (!cs->continuation_pending) {
+            /* The continuation neither registers a wait again nor gives
+             * the connection back: close it.
+             */
+            ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, cs->c, APLOGNO()
+                          "suspended connection abandoned by its continuation");
+            cs->pub.state = CONN_STATE_LINGER;
+        }
+        cs->continuation_pending = 0;
+        if (in_place) {
+            leave_suspended_state(cs);
+            return 1;
+        }
         leave_suspended(cs);
     }
+    return 0;
 }
 
 /* conns_this_child has gone to zero or below.  See if the admin coded
