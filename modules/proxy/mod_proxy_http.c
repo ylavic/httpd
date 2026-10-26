@@ -1383,6 +1383,80 @@ skip_body:
     return OK;
 }
 
+/* With 100-continue, send the request's head only (the body follows the
+ * backend's 100 Continue, see send_continue_body()). When async, without
+ * blocking: if the backend doesn't take it all now, wait for it in the MPM,
+ * then proxy_http_request_forward_continuation() flushes the rest and waits
+ * for the response (req->request_eos, nothing more to send before the 100).
+ * Returns OK, SUSPENDED or an error.
+ */
+static int send_continue_head(proxy_http_req_t *req)
+{
+    int rv;
+
+    for (;;) {
+        if (req->send_async) {
+            /* Don't block on the backend (WC) */
+            APR_BRIGADE_INSERT_TAIL(req->header_brigade,
+                                    ap_bucket_wc_create(req->bucket_alloc));
+        }
+        /* (When blocking after a nonblocking pass, the brigade is empty and
+         * this flushes what's pending.)
+         */
+        rv = ap_proxy_pass_brigade(req->bucket_alloc, req->r, req->backend,
+                                   req->origin, req->header_brigade,
+                                   !req->send_async);
+        if (rv != OK || !req->send_async
+            || ap_check_output_pending(req->origin) != AGAIN) {
+            return rv;
+        }
+        req->request_eos = 1;
+        if (proxy_http_request_forward_wait(req, AP_PROXY_BACKEND_OUT) == SUSPENDED) {
+            return SUSPENDED;
+        }
+        /* can't wait: block */
+        req->send_async = 0;
+    }
+}
+
+/* With 100-continue, send the request's body once the backend says so
+ * (ap_proxy_http_process_response()): fully, or SUSPENDED if req->send_async
+ * then proxy_http_request_forward_continuation() continues.
+ */
+static int send_continue_body(proxy_http_req_t *req)
+{
+    int status;
+
+    /* The body is to be sent now, send_continue_head() may have left
+     * req->request_eos set (nothing more to send before the 100) if it waited.
+     */
+    req->request_eos = 0;
+
+    switch(req->rb_method) {
+    case RB_SPOOL_CL:
+    case RB_STREAM_CL:
+    case RB_STREAM_CHUNKED:
+        status = stream_reqbody(req);
+        break;
+    default:
+        /* Shouldn't happen */
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        break;
+    }
+    if (status != OK && status != SUSPENDED) {
+        conn_rec *c = req->r->connection;
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req->r,
+                APLOGNO(10154) "pass request body failed "
+                "to %pI (%s) from %s (%s) with status %i",
+                req->backend->addr,
+                req->backend->hostname ? req->backend->hostname : "",
+                c->client_ip, c->remote_host ? c->remote_host : "",
+                status);
+        req->backend->close = 1;
+    }
+    return status;
+}
+
 static int ap_proxy_http_request(proxy_http_req_t *req)
 {
     int rv;
@@ -1394,8 +1468,7 @@ static int ap_proxy_http_request(proxy_http_req_t *req)
     case RB_STREAM_CL:
     case RB_STREAM_CHUNKED:
         if (req->do_100_continue) {
-            rv = ap_proxy_pass_brigade(req->bucket_alloc, r, req->backend,
-                                       req->origin, req->header_brigade, 1);
+            rv = send_continue_head(req);
         }
         else {
             rv = stream_reqbody(req);
@@ -1663,38 +1736,6 @@ static int add_trailers(void *data, const char *key, const char *val)
         apr_table_add((apr_table_t*)data, key, val);
     }
     return 1;
-}
-
-static int send_continue_body(proxy_http_req_t *req)
-{
-    int status;
-
-    /* Send the request body (fully, or SUSPENDED if req->send_async, then
-     * proxy_http_request_forward_continuation() continues).
-     */
-    switch(req->rb_method) {
-    case RB_SPOOL_CL:
-    case RB_STREAM_CL:
-    case RB_STREAM_CHUNKED:
-        status = stream_reqbody(req);
-        break;
-    default:
-        /* Shouldn't happen */
-        status = HTTP_INTERNAL_SERVER_ERROR;
-        break;
-    }
-    if (status != OK && status != SUSPENDED) {
-        conn_rec *c = req->r->connection;
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req->r,
-                APLOGNO(10154) "pass request body failed "
-                "to %pI (%s) from %s (%s) with status %i",
-                req->backend->addr,
-                req->backend->hostname ? req->backend->hostname : "",
-                c->client_ip, c->remote_host ? c->remote_host : "",
-                status);
-        req->backend->close = 1;
-    }
-    return status;
 }
 
 static void proxy_http_response_body_continuation(conn_rec *c, request_rec *r,
@@ -3205,9 +3246,9 @@ handshake:
         /* Don't hold the thread while the client or the backend is slow
          * (as for the response, see Step Five below).
          */
-        /* With 100-continue only the header is sent here (blocking, as small
-         * as it is on a fresh or idle connection), the body once the backend
-         * says so (ap_proxy_http_process_response()).
+        /* With 100-continue only the header is sent here (see
+         * send_continue_head()), the body once the backend says so
+         * (ap_proxy_http_process_response()).
          */
         req->send_async = req->can_suspend;
         req->request_eos = 0;
