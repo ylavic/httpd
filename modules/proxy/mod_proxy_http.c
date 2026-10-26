@@ -419,14 +419,19 @@ static proxy_http_req_t *proxy_http_req(request_rec *r)
  * (AP_MPM_WAIT_KEEP_PFDS), the backend's until its connection is given up
  * (mod_proxy releases it then), the client's until the request is done. A
  * request registering a single wait doesn't keep, it would pay a release
- * for nothing.
+ * for nothing. With drained, the request waits only after the read or write
+ * it waits for failed with EAGAIN (AP_MPM_WAIT_DRAINED): an empty brigade
+ * from a nonblocking read is the core's EAGAIN (ap_http_filter() turns it into
+ * APR_EAGAIN), and output is left pending only after the core's nonblocking
+ * write got EAGAIN.
  */
-static unsigned int proxy_http_wait_flags(proxy_http_req_t *req)
+static unsigned int proxy_http_wait_flags(proxy_http_req_t *req,
+                                          int drained)
 {
     if (req->waits++ == 0) {
         return 0;
     }
-    return AP_MPM_WAIT_KEEP_PFDS;
+    return AP_MPM_WAIT_KEEP_PFDS | (drained ? AP_MPM_WAIT_DRAINED : 0);
 }
 
 /* A response head line pre-read by proxy_http_response_preread() */
@@ -647,7 +652,7 @@ static int proxy_http_response_suspend(proxy_http_req_t *req)
                                && req->worker->s->ping_timeout_set)
                               ? req->worker->s->ping_timeout
                               : req->idle_timeout,
-                              NULL, proxy_http_wait_flags(req),
+                              NULL, proxy_http_wait_flags(req, 0),
                               proxy_http_response_head_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
@@ -849,7 +854,7 @@ static int proxy_http_request_forward_wait(proxy_http_req_t *req,
         break;
     }
     rv = ap_mpm_register_wait(c, req->async_pool, pfds, timeout, NULL,
-                              proxy_http_wait_flags(req),
+                              proxy_http_wait_flags(req, 1),
                               proxy_http_request_forward_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
@@ -1885,7 +1890,7 @@ static int proxy_http_response_body_wait(proxy_http_req_t *req,
     rv = ap_mpm_register_wait(c, req->async_pool, pfds,
                               for_client ? r->server->timeout
                                             : req->idle_timeout,
-                              NULL, proxy_http_wait_flags(req),
+                              NULL, proxy_http_wait_flags(req, 1),
                               proxy_http_response_body_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
