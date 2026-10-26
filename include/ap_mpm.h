@@ -253,7 +253,9 @@ typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
  * @param baton The baton passed to @a fn
  * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
  * AP_MPMQ_CAN_REGISTER_WAIT) or the connection isn't handled by the MPM,
- * APR_EINVAL if nothing could complete the wait, or an error.
+ * APR_EINVAL if nothing could complete the wait, APR_EBUSY if a wait is
+ * registered already or @a notifier served a wait and wasn't re-armed
+ * (ap_mpm_notifier_rearm()), or an error.
  * @remark It can be called from a handler (which then returns SUSPENDED), or
  * from the continuation of a previous wait. Either way the MPM arms the
  * wait once no thread is processing the connection anymore, so @a fn can't
@@ -276,9 +278,11 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
  * @param p The pool to allocate the notifier from, which must outlive the wait
  * @return APR_SUCCESS, or APR_ENOTIMPL if the MPM doesn't support notifiers
  * or the connection isn't handled by the MPM
- * @remark A notifier serves a single wait. It can be notified before the
- * wait is registered or armed: the wait then completes as soon as it is
- * armed, so nothing is lost between the creation and the wait.
+ * @remark A notifier serves a single wait, unless re-armed
+ * (ap_mpm_notifier_rearm()) once that wait completed. It can be notified
+ * before the wait is registered or armed: the wait then completes as soon
+ * as it is armed, so nothing is lost between the creation (or the re-arm)
+ * and the wait.
  */
 AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
                                                 conn_rec *c, apr_pool_t *p);
@@ -288,11 +292,31 @@ AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
  * AP_MPM_WAIT_NOTIFIED.
  * @param notifier The notifier
  * @remark Once the wait has completed (its continuation called for
- * whatever reason) this does nothing. The caller must ensure that
- * @a notifier is not used after its pool is cleared or destroyed, e.g. by
- * notifying it and canceling the reason to notify it under the same lock.
+ * whatever reason) this does nothing, and a re-arm drops the notification
+ * (ap_mpm_notifier_rearm()): it never completes the next wait. After the
+ * re-arm, it counts for the next wait as for a new notifier. The caller
+ * must ensure that @a notifier is not used after its pool is cleared or
+ * destroyed, e.g. by notifying it and canceling the reason to notify it
+ * under the same lock.
  */
 AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier);
+
+/**
+ * Re-arm a notifier for another wait (ap_mpm_register_wait()), once its
+ * previous wait has completed: it's then as newly created, without any
+ * allocation, a notification made before the re-arm dropped.
+ * @param notifier The notifier
+ * @return APR_SUCCESS once its previous wait has completed (its
+ * continuation called for whatever reason), or if no wait was registered
+ * with it since its creation or last re-arm, or was dropped unarmed;
+ * APR_EBUSY while its wait is registered or armed (nothing changed); or
+ * APR_ENOTIMPL if the MPM doesn't support notifiers
+ * @remark Re-arming is opt-in: a notifier not re-armed serves a single wait.
+ * It's called from the thread processing the request, as the waits are
+ * registered (e.g. the continuation of the previous wait). The notifier's
+ * pool must outlive every wait it serves.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier);
 
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(

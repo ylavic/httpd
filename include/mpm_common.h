@@ -461,6 +461,12 @@ AP_DECLARE_HOOK(apr_status_t, mpm_notifier_create,
  */
 AP_DECLARE_HOOK(int, mpm_notify, (ap_mpm_notifier_t *notifier))
 
+/** Re-arm a notifier for another wait (see ap_mpm_notifier_rearm())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_rearm,
+                (ap_mpm_notifier_t *notifier))
+
 /**
  * Get MPM name (e.g., "prefork" or "event")
  * @ingroup hooks

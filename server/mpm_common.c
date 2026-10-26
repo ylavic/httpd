@@ -74,6 +74,7 @@
     APR_HOOK_LINK(mpm_register_wait) \
     APR_HOOK_LINK(mpm_notifier_create) \
     APR_HOOK_LINK(mpm_notify) \
+    APR_HOOK_LINK(mpm_notifier_rearm) \
     APR_HOOK_LINK(end_generation) \
     APR_HOOK_LINK(child_status) \
     APR_HOOK_LINK(output_pending) \
@@ -127,6 +128,9 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_create,
                             (notifier, c, p), APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm_notify,
                             (ap_mpm_notifier_t *notifier), (notifier), DECLINED)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_rearm,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, output_pending,
                             (conn_rec *c), (c), DECLINED)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, input_pending,
@@ -644,6 +648,11 @@ AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
 AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier)
 {
     (void)ap_run_mpm_notify(notifier);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier)
+{
+    return ap_run_mpm_notifier_rearm(notifier);
 }
 
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(apr_time_t t,
