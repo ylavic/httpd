@@ -1776,6 +1776,7 @@ static apr_status_t connection_constructor(void **resource, void *params,
                                            apr_pool_t *pool)
 {
     apr_pool_t *p;
+    apr_allocator_t *alloc;
     proxy_conn_rec *conn;
     proxy_worker *worker = (proxy_worker *)params;
 
@@ -1783,8 +1784,22 @@ static apr_status_t connection_constructor(void **resource, void *params,
      * Create a subpool for each connection
      * This keeps the memory consumption constant
      * when it's recycled or destroyed.
+     *
+     * It has its own allocator, without a mutex: a connection is used by one
+     * thread at a time (handed over through the reslist and its lock), while
+     * the worker's pool allocator (shared by all its connections) has a mutex
+     * that the threads using connections at the same time contend on. Like
+     * the MPM's connections, its free memory is bounded by MaxMemFree.
      */
-    apr_pool_create(&p, pool);
+    if (apr_allocator_create(&alloc) != APR_SUCCESS) {
+        return APR_ENOMEM;
+    }
+    apr_allocator_max_free_set(alloc, ap_max_mem_free);
+    if (apr_pool_create_ex(&p, pool, NULL, alloc) != APR_SUCCESS) {
+        apr_allocator_destroy(alloc);
+        return APR_ENOMEM;
+    }
+    apr_allocator_owner_set(alloc, p);
     apr_pool_tag(p, "proxy_conn_pool");
     conn = connection_make(p, worker);
     conn->inreslist = 1;
