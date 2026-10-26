@@ -539,10 +539,8 @@ static int ap_proxy_http_process_response(proxy_http_req_t *req);
 
 /* Finish a request whose processing was suspended (status as returned by
  * proxy_http_handler()): release the backend, finish the request and give
- * the client connection back to the MPM.
+ * the client connection back to the MPM (ap_proxy_handler_done()).
  */
-static void proxy_http_finish_request(request_rec *r, int status);
-
 static void proxy_http_async_finish(proxy_http_req_t *req, int status)
 {
     request_rec *r = req->r;
@@ -564,7 +562,7 @@ static void proxy_http_async_finish(proxy_http_req_t *req, int status)
         req->async_pool = NULL;
     }
 
-    proxy_http_finish_request(r, status);
+    ap_proxy_handler_done(r, status);
 }
 
 static int proxy_http_response_preread(proxy_http_req_t *req);
@@ -2898,39 +2896,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     return OK;
 }
 
-/* Finish a request whose processing was suspended, as
- * ap_process_async_request() does, and give the client connection back to
- * the MPM. Don't dereference r afterward.
- */
-static void proxy_http_finish_request(request_rec *r, int status)
-{
-    conn_rec *c = r->connection;
-
-    /* Let mod_proxy's handler continue as if we had returned this status:
-     * it may fail over to another balancer member (suspending again), and
-     * runs the post_request hooks once the request is done.
-     */
-    status = ap_proxy_handler_resume(r, status);
-    if (status == SUSPENDED) {
-        return;
-    }
-
-    if (status != OK && status != DONE) {
-        r->status = HTTP_OK;
-    }
-    ap_die(status, r);
-    ap_process_request_after_handler(r);
-    /* don't dereference r from here! */
-
-    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
-        c->cs->state = CONN_STATE_LINGER;
-    }
-    else {
-        c->cs->state = CONN_STATE_WRITE_COMPLETION;
-    }
-    ap_mpm_resume_suspended(c);
-}
-
 static int proxy_http_process(proxy_http_req_t *req);
 
 /* Finish a request whose continuation ran before Step Five, cleaning up as
@@ -3414,7 +3379,7 @@ static void proxy_http_acquire_continuation(conn_rec *c, request_rec *r,
                       why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
                       aw->worker->s->hostname_ex, (int)aw->worker->s->port,
                       (int)why);
-        proxy_http_finish_request(r, HTTP_SERVICE_UNAVAILABLE);
+        ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
         return;
     }
 
@@ -3426,7 +3391,7 @@ static void proxy_http_acquire_continuation(conn_rec *c, request_rec *r,
     if (status == SUSPENDED) {
         return; /* waiting again (for the pool, or in a later step) */
     }
-    proxy_http_finish_request(r, status);
+    ap_proxy_handler_done(r, status);
 }
 
 /* A request whose body is read before acquiring a backend connection
@@ -3472,7 +3437,7 @@ static void proxy_http_request_preread_continuation(conn_rec *c, request_rec *r,
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
                       "proxy: error waiting for the client's request body "
                       "(async, %i)", (int)why);
-        proxy_http_finish_request(r, HTTP_INTERNAL_SERVER_ERROR);
+        ap_proxy_handler_done(r, HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
 
@@ -3481,7 +3446,7 @@ static void proxy_http_request_preread_continuation(conn_rec *c, request_rec *r,
     if (status == SUSPENDED) {
         return; /* waiting again (for the body, the pool, or in a later step) */
     }
-    proxy_http_finish_request(r, status);
+    ap_proxy_handler_done(r, status);
 }
 
 /* Read the request body before acquiring a backend connection, so that a slow

@@ -6449,6 +6449,174 @@ done:
     return status;
 }
 
+PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
+{
+    conn_rec *c = r->connection;
+
+    /* Let mod_proxy's handler continue as if the scheme handler had returned
+     * this status: it may fail over to another balancer member (suspending
+     * again), and runs the post_request hooks once the request is done.
+     */
+    status = ap_proxy_handler_resume(r, status);
+    if (status == SUSPENDED) {
+        return;
+    }
+
+    /* An error is not a recursive one, as for ap_process_async_request()'s
+     * ap_die_r(access_status, r, HTTP_OK) (not public).
+     */
+    if (status != OK && status != DONE) {
+        r->status = HTTP_OK;
+    }
+    ap_die(status, r);
+    ap_process_request_after_handler(r);
+    /* don't dereference r from here! */
+
+    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
+        c->cs->state = CONN_STATE_LINGER;
+    }
+    else {
+        c->cs->state = CONN_STATE_WRITE_COMPLETION;
+    }
+    ap_mpm_resume_suspended(c);
+}
+
+/* Whether the MPM can wait for a tunnel (ap_mpm_register_wait()), resolved
+ * by proxy_util_post_config().
+ */
+static int mpm_can_wait = 0;
+
+/* Whether a request can be suspended (its handler returning SUSPENDED): when
+ * the MPM can wait, but not for a subrequest nor an internally redirected
+ * request, whose caller goes on once the handler returns
+ * (ap_internal_redirect() would ap_die() with SUSPENDED), nor for an HTTP/2
+ * stream's connection: mod_http2 doesn't support its secondary connections
+ * being suspended (it asserts in its beams).
+ */
+static int proxy_can_suspend(request_rec *r)
+{
+    return (mpm_can_wait && !r->main && !r->prev && !r->connection->master);
+}
+
+/* The state of a tunnel run by ap_proxy_tunnel_run_ex() */
+typedef struct {
+    proxy_tunnel_rec *tunnel;
+    apr_pool_t *pool; /* for the MPM's waits, cleared at each */
+    apr_interval_time_t timeout;
+    ap_proxy_tunnel_done_fn *done;
+    void *baton;
+} proxy_tunnel_async_t;
+
+static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
+                                            ap_mpm_wait_result_e why,
+                                            const apr_array_header_t *pfds,
+                                            void *baton);
+
+/* Step the tunnel with what's ready, then wait in the MPM for what it needs,
+ * or when the MPM can't wait tunnel synchronously from now on. Returns
+ * SUSPENDED, or the tunnel's status once done.
+ */
+static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
+                                   const apr_array_header_t *ready)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    request_rec *r = tunnel->r;
+    apr_status_t rv;
+    int status;
+
+    status = ap_proxy_tunnel_step(tunnel, ready);
+    if (status != SUSPENDED) {
+        return status;
+    }
+
+    if (ta->pool) {
+        apr_pool_clear(ta->pool);
+    }
+    else {
+        apr_pool_create(&ta->pool, r->pool);
+        apr_pool_tag(ta->pool, "proxy_tunnel_async");
+    }
+    rv = ap_mpm_register_wait(r->connection, ta->pool, tunnel->pfds,
+                             ta->timeout, proxy_tunnel_async_continuation, ta);
+    if (rv == APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                      "proxy: %s: tunnel: waiting (async)", tunnel->scheme);
+        return SUSPENDED;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                  "proxy: %s: can't tunnel asynchronously", tunnel->scheme);
+
+    tunnel->timeout = ta->timeout;
+    return ap_proxy_tunnel_run(tunnel);
+}
+
+/* The continuation of the MPM's wait: step the tunnel again until it's over,
+ * then call the done callback.
+ */
+static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
+                                            ap_mpm_wait_result_e why,
+                                            const apr_array_header_t *pfds,
+                                            void *baton)
+{
+    proxy_tunnel_async_t *ta = baton;
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    int status;
+
+    AP_DEBUG_ASSERT(tunnel->r == r);
+    switch (why) {
+    case AP_MPM_WAIT_READY:
+        status = proxy_tunnel_async_pump(ta, pfds);
+        if (status == SUSPENDED) {
+            return; /* continued later */
+        }
+        break;
+    case AP_MPM_WAIT_TIMEOUT:
+        status = HTTP_GATEWAY_TIME_OUT;
+        break;
+    case AP_MPM_WAIT_ERROR:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy: %s: tunneling failed (async)", tunnel->scheme);
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        break;
+    default:
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "proxy: %s: tunneling interrupted (async, %i)",
+                      tunnel->scheme, (int)why);
+        status = DONE;
+        break;
+    }
+
+    if (ta->pool) {
+        apr_pool_destroy(ta->pool);
+        ta->pool = NULL;
+    }
+    ta->done(tunnel, status, ta->baton);
+}
+
+PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
+                                          apr_interval_time_t timeout,
+                                          ap_proxy_tunnel_done_fn *done,
+                                          void *baton)
+{
+    request_rec *r = tunnel->r;
+    proxy_tunnel_async_t *ta;
+
+    /* Not asynchronous if not asked (!done), nor if the request can't be
+     * suspended.
+     */
+    if (!done || !proxy_can_suspend(r)) {
+        tunnel->timeout = timeout;
+        return ap_proxy_tunnel_run(tunnel);
+    }
+
+    ta = apr_pcalloc(r->pool, sizeof(*ta));
+    ta->tunnel = tunnel;
+    ta->timeout = timeout;
+    ta->done = done;
+    ta->baton = baton;
+    return proxy_tunnel_async_pump(ta, NULL);
+}
+
 PROXY_DECLARE (const char *) ap_proxy_show_hcmethod(hcmethod_t method)
 {
     proxy_hcmethods_t *m = proxy_hcmethods;
@@ -6460,8 +6628,20 @@ PROXY_DECLARE (const char *) ap_proxy_show_hcmethod(hcmethod_t method)
     return "???";
 }
 
+static int proxy_util_post_config(apr_pool_t *pconf, apr_pool_t *plog,
+                                  apr_pool_t *ptemp, server_rec *s)
+{
+    /* For ap_proxy_tunnel_run_ex() */
+    if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &mpm_can_wait)) {
+        mpm_can_wait = 0;
+    }
+    return OK;
+}
+
 void proxy_util_register_hooks(apr_pool_t *p)
 {
+    ap_hook_post_config(proxy_util_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+
     APR_REGISTER_OPTIONAL_FN(ap_proxy_retry_worker);
     APR_REGISTER_OPTIONAL_FN(ap_proxy_clear_connection);
     APR_REGISTER_OPTIONAL_FN(proxy_balancer_get_best_worker);

@@ -1101,6 +1101,17 @@ PROXY_DECLARE(int) ap_proxy_post_request(proxy_worker *worker,
  */
 PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
 
+/**
+ * Finish a request that a scheme handler suspended (returned SUSPENDED for),
+ * once done with it: let mod_proxy's handler continue as if the handler had
+ * returned status (ap_proxy_handler_resume()), then unless suspended again
+ * finish the request and give its connection back to the MPM.
+ * @param r       the request
+ * @param status  the scheme handler's status
+ * @remark Don't dereference r afterwards.
+ */
+PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status);
+
 /* Bitmask for ap_proxy_determine_address() */
 #define PROXY_DETERMINE_ADDRESS_CHECK   (1u << 0)
 /**
@@ -1603,6 +1614,41 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel);
  */
 PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
                                         const apr_array_header_t *ready);
+
+/**
+ * The callback of ap_proxy_tunnel_run_ex() once the asynchronous tunnel
+ * is over, called by the MPM's thread waking it up.
+ * @param tunnel  the tunnel
+ * @param status  OK if completion is full, HTTP_GATEWAY_TIME_OUT if idle for
+ *                longer than the timeout, DONE if the wait ended otherwise
+ *                (e.g. the MPM stopping), or an HTTP_ error
+ * @param baton   the baton given to ap_proxy_tunnel_run_ex()
+ */
+typedef void (ap_proxy_tunnel_done_fn)(proxy_tunnel_rec *tunnel, int status,
+                                       void *baton);
+
+/**
+ * Run the tunnel, asynchronously if possible: forward what's ready
+ * (ap_proxy_tunnel_step()), then let the MPM wait for either side
+ * (ap_mpm_register_wait()), and so on until it's over, without holding a
+ * thread meanwhile. Otherwise (no done callback, the MPM can't wait, or the
+ * tunnel is for an HTTP/2 stream's connection) the whole tunneling happens
+ * now, as with ap_proxy_tunnel_run().
+ * @param tunnel   tunnel to run
+ * @param timeout  the time either side can stay idle (negative for none)
+ * @param done     called once an asynchronous tunnel is over, or NULL to
+ *                 run the tunnel synchronously
+ * @param baton    for done
+ * @return         SUSPENDED if the tunnel continues asynchronously (the
+ *                 request handler returns SUSPENDED, done is called later),
+ *                 or the tunnel's status as ap_proxy_tunnel_run()'s (done is
+ *                 not called).
+ * @remark The status of a timeout (HTTP_GATEWAY_TIME_OUT) is not logged.
+ */
+PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
+                                          apr_interval_time_t timeout,
+                                          ap_proxy_tunnel_done_fn *done,
+                                          void *baton);
 
 /*
  * Number of incoming bytes on the tunnel connection.
