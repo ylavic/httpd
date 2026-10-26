@@ -1465,6 +1465,37 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
                                         apr_off_t *bytes_spooled,
                                         apr_off_t max_mem_spool);
 
+/* The state of a request body being spooled, see ap_proxy_spool_input_ex() */
+typedef struct {
+    apr_bucket_brigade *body_brigade;   /* (opaque) spooled in memory */
+    apr_file_t *tmpfile;                /* (opaque) spooled on disk */
+    apr_off_t fsize;                    /* (opaque) size on disk */
+    apr_off_t bytes_spooled;            /* (opaque) size overall */
+} ap_proxy_spool_state;
+
+/**
+ * Spool the client request body to memory, or to disk above the given limit,
+ * possibly without blocking.
+ * @param r             client request
+ * @param backend       backend connection
+ * @param input_brigade input brigade to use/fill
+ * @param bytes_spooled number of bytes spooled
+ * @param max_mem_spool maximum number of in-memory bytes
+ * @param block         APR_BLOCK_READ or APR_NONBLOCK_READ
+ * @param state         zeroed to start spooling, or as left by a previous
+ *                      call that returned SUSPENDED
+ * @return              OK, SUSPENDED for APR_NONBLOCK_READ when the client
+ *                      has nothing to read yet (the caller calls again once
+ *                      it's readable), or HTTP_* error code
+ */
+PROXY_DECLARE(int) ap_proxy_spool_input_ex(request_rec *r,
+                                           proxy_conn_rec *backend,
+                                           apr_bucket_brigade *input_brigade,
+                                           apr_off_t *bytes_spooled,
+                                           apr_off_t max_mem_spool,
+                                           apr_read_type_e block,
+                                           ap_proxy_spool_state *state);
+
 /**
  * Read what's in the client pipe. If the read would block (EAGAIN),
  * pass a FLUSH bucket to the backend and read again in blocking mode.

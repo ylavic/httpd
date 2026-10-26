@@ -360,13 +360,14 @@ typedef struct {
 } proxy_http_req_t;
 
 /* The state of a request across the runs of proxy_http_handler(): after
- * waiting for a backend connection (the same attempt), and for each attempt
- * (balancer failover). In mod_proxy_http's request_config, see
- * proxy_http_rctx().
+ * waiting for the client's body or for a backend connection (the same
+ * attempt), and for each attempt (balancer failover). In mod_proxy_http's
+ * request_config, see proxy_http_rctx().
  */
 typedef struct {
     proxy_http_req_t *req;              /* The current attempt, if any */
     apr_bucket_brigade *input;          /* The request body read so far */
+    struct proxy_http_preread *preread; /* See proxy_http_request_preread() */
     struct proxy_http_acquire *acquire; /* See proxy_http_acquire() */
 } proxy_http_rctx_t;
 
@@ -3073,6 +3074,230 @@ static void proxy_http_acquire_continuation(conn_rec *c, request_rec *r,
     proxy_http_finish_request(r, status);
 }
 
+/* A request whose body is read before acquiring a backend connection
+ * (proxy_http_request_preread()), with what it needs to run the handler again.
+ */
+typedef struct proxy_http_preread {
+    apr_bucket_brigade *bb;     /* The request's rctx->input */
+    apr_bucket_brigade *tmp_bb;
+    ap_proxy_spool_state spool;
+    apr_pool_t *wait_pool;
+    proxy_worker *worker;
+    proxy_server_conf *conf;
+    char *url;
+    const char *proxyname;
+    apr_port_t proxyport;
+    unsigned int spool_needed :1,
+                 spooling     :1,
+                 timed_out    :1, /* the wait for the client did */
+                 done         :1;
+} proxy_http_request_preread_t;
+
+/* The continuation of proxy_http_request_preread(), called when the client
+ * sent more of the body (or on timeout or error): run the handler again, which
+ * continues reading where it stopped.
+ */
+static void proxy_http_request_preread_continuation(conn_rec *c, request_rec *r,
+                                                    ap_mpm_wait_result_e why,
+                                                    const apr_array_header_t *pfds,
+                                                    void *baton)
+{
+    proxy_http_request_preread_t *pr = baton;
+    int status;
+
+    if (why == AP_MPM_WAIT_TIMEOUT) {
+        /* Read the body once more: the read fails on mod_reqtimeout's
+         * deadline, or proxy_http_request_preread() answers the timeout if
+         * there's still nothing to read (a 408 either way), unless the client
+         * sent some in the meantime.
+         */
+        pr->timed_out = 1;
+    }
+    else if (why != AP_MPM_WAIT_READY) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy: error waiting for the client's request body "
+                      "(async, %i)", (int)why);
+        proxy_http_finish_request(r, HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    status = proxy_http_handler(r, pr->worker, pr->conf, pr->url,
+                                pr->proxyname, pr->proxyport);
+    if (status == SUSPENDED) {
+        return; /* waiting again (for the body, the pool, or in a later step) */
+    }
+    proxy_http_finish_request(r, status);
+}
+
+/* Read the request body before acquiring a backend connection, so that a slow
+ * client doesn't hold one: up to MAX_MEM_SPOOL bytes or EOS, or all of it when
+ * it will have to be spooled (what ap_proxy_http_prefetch() reads), waiting
+ * for the client in the MPM when waiting asynchronously is possible
+ * (ProxyAsyncDelay). The body is saved as the request's rctx->input, where
+ * ap_proxy_http_prefetch() starts from: finding enough there, it doesn't read
+ * more. Returns OK, SUSPENDED (the handler then runs again from
+ * proxy_http_request_preread_continuation()), or an HTTP error.
+ */
+static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
+                                      proxy_worker *worker,
+                                      proxy_server_conf *conf, char *url,
+                                      const char *proxyname,
+                                      apr_port_t proxyport)
+{
+    conn_rec *c = r->connection;
+    proxy_http_rctx_t *rctx = proxy_http_rctx(r);
+    proxy_http_request_preread_t *pr = rctx->preread;
+    apr_array_header_t *pfds;
+    apr_pollfd_t *pfd;
+    apr_status_t rv;
+
+    if (!pr) {
+        const char *te, *cl;
+
+        if (!(mpm_can_wait && dconf->async_delay_set && dconf->async_delay >= 0)
+            || r->main
+            || r->expecting_100     /* the client waits for 100 */
+            || !ap_request_has_body(r)
+            || apr_table_get(r->headers_in, "Upgrade")
+            || apr_table_get(r->subprocess_env, "proxy-prefetch-nonblocking")) {
+            return OK;
+        }
+        if (rctx->input) {
+            return OK; /* read already (e.g. balancer fallback) */
+        }
+
+        pr = apr_pcalloc(r->pool, sizeof(*pr));
+        pr->bb = apr_brigade_create(r->pool, c->bucket_alloc);
+        pr->tmp_bb = apr_brigade_create(r->pool, c->bucket_alloc);
+        /* The body will be spooled (RB_SPOOL_CL) if it can't be streamed, as
+         * ap_proxy_http_prefetch() decides when it couldn't prefetch all of
+         * it.
+         */
+        te = apr_table_get(r->headers_in, "Transfer-Encoding");
+        cl = apr_table_get(r->headers_in, "Content-Length");
+        if (!(cl && !te && r->input_filters == r->proto_input_filters)
+            && (apr_table_get(r->subprocess_env, "force-proxy-request-1.0")
+                || apr_table_get(r->subprocess_env, "proxy-sendcl"))
+            && !apr_table_get(r->subprocess_env, "proxy-sendextracrlf")) {
+            pr->spool_needed = 1;
+        }
+        rctx->preread = pr;
+        rctx->input = pr->bb;
+    }
+    else if (pr->done) {
+        return OK;
+    }
+    pr->worker = worker;
+    pr->conf = conf;
+    pr->url = url;
+    pr->proxyname = proxyname;
+    pr->proxyport = proxyport;
+
+    for (;;) {
+        apr_off_t bytes = 0;
+
+        if (pr->spooling) {
+            int status = ap_proxy_spool_input_ex(r, NULL, pr->bb, &bytes,
+                                                 MAX_MEM_SPOOL,
+                                                 APR_NONBLOCK_READ,
+                                                 &pr->spool);
+            if (status != SUSPENDED) {
+                pr->done = 1;
+                return status;
+            }
+            break; /* wait */
+        }
+
+        if (!APR_BRIGADE_EMPTY(pr->bb) && APR_BUCKET_IS_EOS(APR_BRIGADE_LAST(pr->bb))) {
+            pr->done = 1;
+            return OK;
+        }
+        apr_brigade_length(pr->bb, 0, &bytes);
+        if (bytes >= MAX_MEM_SPOOL - 80) {
+            if (!pr->spool_needed) {
+                pr->done = 1;
+                return OK;
+            }
+            pr->spooling = 1;
+            continue;
+        }
+
+        rv = ap_get_brigade(r->input_filters, pr->tmp_bb, AP_MODE_READBYTES,
+                            APR_NONBLOCK_READ, MAX_MEM_SPOOL - bytes);
+        if (APR_STATUS_IS_EAGAIN(rv) || (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(pr->tmp_bb))) {
+            apr_brigade_cleanup(pr->tmp_bb);
+            break; /* wait */
+        }
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "prefetch request body failed from %s (%s)",
+                          c->client_ip, c->remote_host ? c->remote_host : "");
+            pr->done = 1;
+            return ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
+        }
+        /* Set the buckets aside (they may be transient, e.g. with SSL) */
+        rv = ap_save_brigade(NULL, &pr->bb, &pr->tmp_bb, r->pool);
+        if (rv != APR_SUCCESS) {
+            pr->done = 1;
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+        pr->timed_out = 0; /* data came in the meantime */
+    }
+
+    if (pr->timed_out) {
+        /* The wait for the client timed out and there is still nothing to
+         * read (the server's Timeout, a deadline of mod_reqtimeout's would
+         * have failed the read): a 408. (When spooling, a few bytes read at
+         * that very moment don't save it.)
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO()
+                      "proxy: timeout reading the request body from the "
+                      "client (async)");
+        pr->done = 1;
+        return HTTP_REQUEST_TIME_OUT;
+    }
+
+    /* Wait for the client with the time left to read
+     * (proxy_http_request_read_timeout()).
+     */
+    if (pr->wait_pool) {
+        apr_pool_clear(pr->wait_pool);
+    }
+    else {
+        apr_pool_create(&pr->wait_pool, r->pool);
+    }
+    pfds = apr_array_make(pr->wait_pool, 1, sizeof(apr_pollfd_t));
+    pfd = apr_array_push(pfds);
+    memset(pfd, 0, sizeof(*pfd));
+    pfd->p = pr->wait_pool;
+    pfd->desc_type = APR_POLL_SOCKET;
+    pfd->desc.s = ap_get_conn_socket(c);
+    pfd->reqevents = APR_POLLIN;
+    rv = ap_mpm_register_wait(c, pr->wait_pool, pfds, proxy_http_request_read_timeout(r),
+                             proxy_http_request_preread_continuation, pr);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy: can't wait for the request body "
+                      "asynchronously");
+        pr->done = 1;
+        if (pr->spooling) {
+            /* Finish spooling (blocking): the state holds what's spooled
+             * already.
+             */
+            apr_off_t bytes = 0;
+            return ap_proxy_spool_input_ex(r, NULL, pr->bb, &bytes,
+                                           MAX_MEM_SPOOL, APR_BLOCK_READ,
+                                           &pr->spool);
+        }
+        /* The handler's prefetch (or spool) continues, blocking */
+        return OK;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: %s the request body: waiting for the client "
+                  "(async)", pr->spooling ? "spooling" : "prefetching");
+    return SUSPENDED;
+}
+
 /* Acquire a backend connection, without blocking on an exhausted pool when
  * waiting asynchronously is possible (ProxyAsyncDelay): the request then
  * waits in the MPM for a connection to be released (the pool wakes up its
@@ -3202,10 +3427,19 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
     dconf = ap_get_module_config(r->per_dir_config, &proxy_module);
 
     /* The state kept across the runs of this handler (a new attempt, or
-     * after waiting for a connection), and no attempt yet.
+     * after waiting for the client or for a connection), and no attempt yet.
      */
     rctx = proxy_http_rctx(r);
     rctx->req = NULL;
+
+    /* Read the request body before holding a backend connection, without
+     * blocking. On SUSPENDED we wait for the client, and the handler runs
+     * again from proxy_http_request_preread_continuation().
+     */
+    if ((status = proxy_http_request_preread(r, dconf, worker, conf, url,
+                                             proxyname, proxyport)) != OK) {
+        return status;
+    }
 
     /* create space for state information. On SUSPENDED we wait for a
      * connection, and the handler runs again from

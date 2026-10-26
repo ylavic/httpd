@@ -5211,24 +5211,71 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
                                         apr_off_t *bytes_spooled,
                                         apr_off_t max_mem_spool)
 {
+    ap_proxy_spool_state state;
+
+    memset(&state, 0, sizeof(state));
+    return ap_proxy_spool_input_ex(r, backend, input_brigade, bytes_spooled,
+                                   max_mem_spool, APR_BLOCK_READ, &state);
+}
+
+PROXY_DECLARE(int) ap_proxy_spool_input_ex(request_rec *r,
+                                           proxy_conn_rec *backend,
+                                           apr_bucket_brigade *input_brigade,
+                                           apr_off_t *bytes_spooled,
+                                           apr_off_t max_mem_spool,
+                                           apr_read_type_e block,
+                                           ap_proxy_spool_state *state)
+{
     apr_pool_t *p = r->pool;
     int seen_eos = 0, rv = OK;
     apr_status_t status = APR_SUCCESS;
     apr_bucket_alloc_t *bucket_alloc = input_brigade->bucket_alloc;
     apr_bucket_brigade *body_brigade;
     apr_bucket *e;
-    apr_off_t bytes, fsize = 0;
-    apr_file_t *tmpfile = NULL;
+    apr_off_t bytes, fsize = state->fsize;
+    apr_file_t *tmpfile = state->tmpfile;
 
-    *bytes_spooled = 0;
-    body_brigade = apr_brigade_create(p, bucket_alloc);
+    *bytes_spooled = state->bytes_spooled;
+    if (!state->body_brigade) {
+        state->body_brigade = apr_brigade_create(p, bucket_alloc);
+    }
+    body_brigade = state->body_brigade;
 
     do {
         if (APR_BRIGADE_EMPTY(input_brigade)) {
-            rv = ap_proxy_read_input(r, backend, input_brigade,
-                                     HUGE_STRING_LEN);
-            if (rv != OK) {
-                return rv;
+            if (block == APR_NONBLOCK_READ || !backend) {
+                /* Nonblocking, or no backend connection yet: read from the
+                 * client directly.
+                 */
+                status = ap_get_brigade(r->input_filters, input_brigade,
+                                        AP_MODE_READBYTES, block,
+                                        HUGE_STRING_LEN);
+                if (block == APR_NONBLOCK_READ
+                    && (APR_STATUS_IS_EAGAIN(status)
+                        || (status == APR_SUCCESS && APR_BRIGADE_EMPTY(input_brigade)))) {
+                    /* Nothing to read yet: the caller will call again */
+                    apr_brigade_cleanup(input_brigade);
+                    state->tmpfile = tmpfile;
+                    state->fsize = fsize;
+                    state->bytes_spooled = *bytes_spooled;
+                    return SUSPENDED;
+                }
+                if (status != APR_SUCCESS) {
+                    conn_rec *c = r->connection;
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                                  "spool request body failed from %s (%s)",
+                                  c->client_ip,
+                                  c->remote_host ? c->remote_host : "");
+                    return ap_map_http_request_error(status,
+                                                     HTTP_BAD_REQUEST);
+                }
+            }
+            else {
+                rv = ap_proxy_read_input(r, backend, input_brigade,
+                                         HUGE_STRING_LEN);
+                if (rv != OK) {
+                    return rv;
+                }
             }
         }
 
