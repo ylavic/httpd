@@ -88,8 +88,8 @@ struct timer_event_t
     apr_time_t when;
     ap_mpm_callback_fn_t *cbfunc;
     void *baton;
-    int canceled;
     apr_interval_time_t timeout;
+    struct apr_skiplistnode *node; /* the node in the timers skiplist, if any */
 };
 typedef struct timer_event_t timer_event_t;
 

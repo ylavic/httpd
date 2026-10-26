@@ -1300,6 +1300,7 @@ static void kill_connection_at(event_conn_state_t *cs, apr_status_t status,
 static void set_conn_state_sense(event_conn_state_t *cs, int sense);
 static void push2worker(event_conn_state_t *cs, timer_event_t *te,
                         apr_time_t now, int *busy);
+static void cancel_timer_event(timer_event_t *te);
 
 /* Shutdown the connection in case of timeout, error or resources shortage.
  * This starts lingering close if not already there, or directly closes
@@ -1523,7 +1524,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
             apr_thread_mutex_unlock(timeout_mutex);
         }
         else {
-            te->canceled = 1;
+            cancel_timer_event(te);
             cs->te = NULL;
         }
 
@@ -1580,7 +1581,7 @@ static int pollset_del_at(event_conn_state_t *cs, int locked,
         }
     }
     else if (cs->te) {
-        cs->te->canceled = 1;
+        cancel_timer_event(cs->te);
         cs->te = NULL;
     }
 
@@ -2133,7 +2134,7 @@ static void arm_pending_wait(event_conn_state_t *cs)
         }
     }
     if (cs->te) {
-        cs->te->canceled = 1;
+        cancel_timer_event(cs->te);
         cs->te = NULL;
     }
     apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
@@ -2488,7 +2489,7 @@ static volatile apr_time_t timers_next_expiry;
  * not available before APR 1.6). Thus duplicates are sorted by order of
  * insertion and timers are never equal for the skiplist (not an issue
  * because MPM event does not use apr_skiplist_{find,remove}() but
- * apr_skiplist_pop() only).
+ * apr_skiplist_pop() and apr_skiplist_remove_node(), which don't compare).
  */
 static int timer_comp(void *a, void *b)
 {
@@ -2507,7 +2508,7 @@ static int timer_insert_locked(timer_event_t *te)
     apr_time_t next_expiry;
 
     /* Okay, add sorted by when.. */
-    apr_skiplist_insert(timer_skiplist, te);
+    te->node = apr_skiplist_insert(timer_skiplist, te);
 
     /* Cheaply update the global timers_next_expiry with this event's
      * if it expires before.
@@ -2599,6 +2600,25 @@ static void put_timer_event(timer_event_t *te, int locked)
     if (!locked) {
         apr_thread_mutex_unlock(g_timer_skiplist_mtx);
     }
+}
+
+/* Cancel a timer event that won't be needed anymore (e.g. the wait it times
+ * out completed first): remove it from the skiplist and recycle it now,
+ * rather than keeping it until it expires, which would hold it allocated for
+ * its whole timeout (the free ring then empty and each new timer allocated,
+ * scanning apr_skiplist_alloc()'s growing memlist). If it's not in the
+ * skiplist anymore, the listener has popped and handled it already (under
+ * the same mutex), so there's nothing left to do.
+ */
+static void cancel_timer_event(timer_event_t *te)
+{
+    apr_thread_mutex_lock(g_timer_skiplist_mtx);
+    if (te->node) {
+        apr_skiplist_remove_node(timer_skiplist, te->node, NULL);
+        te->node = NULL;
+        put_timer_event(te, 1);
+    }
+    apr_thread_mutex_unlock(g_timer_skiplist_mtx);
 }
 
 static apr_status_t event_register_timed_callback(apr_time_t timeout,
@@ -2948,11 +2968,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     break;
                 }
                 apr_skiplist_pop(timer_skiplist, NULL);
-
-                if (te->canceled) {
-                    put_timer_event(te, 1);
-                    continue;
-                }
+                te->node = NULL;
 
                 /* A timer without a callback is a cancel event for a cs in
                  * either:
@@ -3285,7 +3301,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
             /* Not expirable anymore */
             if (cs->te) {
-                cs->te->canceled = 1;
+                cancel_timer_event(cs->te);
                 cs->te = NULL;
             }
 
