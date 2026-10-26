@@ -232,6 +232,18 @@ static int conns_this_child = 0;            /* MaxConnectionsPerChild, only acce
                                                in listener thread */
 static double async_factor = DEFAULT_ASYNC_FACTOR; /* AsyncRequestWorkerFactor */
 
+/* Idle workers poll the connections themselves (worker_poll_next()): needs
+ * one-shot pfds and APR to poll a pollset from several threads. Building with
+ * AP_EVENT_NO_WORKER_POLL defined disables it: the listener then polls
+ * everything, in a single pollset.
+ */
+#if !defined(AP_EVENT_NO_WORKER_POLL) \
+    && defined(HAVE_APR_POLLSET_POLL_INTO) \
+    && defined(APR_POLLONESHOT)
+#define EVENT_WORKER_POLL 1
+#endif
+static int worker_poll; /* set before the threads start, then constant */
+
 static int auto_settings = 0;               /* Auto settings based on max_workers
                                                and num_cpus */
 static int num_cpus = 0;                    /* Number of CPUs usable (the
@@ -245,6 +257,25 @@ static /*atomic*/ apr_uint32_t dying = 0;
 static /*atomic*/ apr_uint32_t workers_may_exit = 0;
 static /*atomic*/ apr_uint32_t start_thread_may_exit = 0;
 static /*atomic*/ apr_uint32_t listener_may_exit = 0;
+
+/* The size of a cache line, to keep what a thread writes often away from what
+ * the others read (false sharing).
+ */
+#define CACHE_LINE_SIZE 64
+
+/* On the first member of a struct, aligns it on a cache line and rounds its
+ * size up to whole lines, so that nothing else shares them. Without compiler
+ * support the struct is laid out as usual (only the isolation is lost).
+ */
+#if defined(__GNUC__) || defined(__clang__) || defined(__IBMC__) \
+    || defined(__xlc__) || defined(__SUNPRO_C)
+#define CACHE_LINE_ALIGNED __attribute__((aligned(CACHE_LINE_SIZE)))
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define CACHE_LINE_ALIGNED _Alignas(CACHE_LINE_SIZE)
+#else
+#define CACHE_LINE_ALIGNED
+#endif
+
 static /*atomic*/ apr_uint32_t connection_count = 0; /* Number of open connections */
 static /*atomic*/ apr_uint32_t timers_count = 0;     /* Number of queued timers */
 static /*atomic*/ apr_uint32_t suspended_count = 0;  /* Number of suspended connections */
@@ -340,6 +371,18 @@ struct user_wait;
  * XXX: cases.
  */
 static apr_pollset_t *event_pollset;
+
+/* The pollset of the connections and the waits' pfds: event_pollset itself
+ * when the listener polls everything, or a pollset of its own with worker_poll,
+ * polled by the idle workers (one blocked there is woken up by ring_doorbell()
+ * when something is queued for it).
+ */
+static apr_pollset_t *conn_pollset;
+#ifdef EVENT_WORKER_POLL
+static void ring_doorbell(void);
+#else
+#define ring_doorbell() ((void)0)
+#endif
 #define POLLSET_RESERVE_SIZE 10000
 
 struct backlog_timer_event {
@@ -672,11 +715,12 @@ typedef struct
 typedef enum
 {
     PT_CSD,
-    PT_ACCEPT
+    PT_ACCEPT,
 #if HAVE_SERF
-    , PT_SERF
+    PT_SERF,
 #endif
-    , PT_USER
+    PT_USER,
+    PT_QUEUE   /* the doorbell (worker_poll) */
 } poll_type_e;
 
 typedef struct
@@ -858,10 +902,18 @@ static int ap_child_slot;       /* Current child process slot in scoreboard */
  */
 #define LISTENER_SIGNAL     SIGHUP
 
-/* An array of socket descriptors in use by each thread used to
- * perform a non-graceful (forced) shutdown of the server.
+/* What each worker publishes for the other threads, written by the worker
+ * only, in a cache line of its own (worker_slots[threads_per_child], aligned
+ * on a cache line): the socket it processes, closed by a non-graceful (forced)
+ * shutdown of the server (close_worker_sockets()), and its drain epoch
+ * (drain_epoch_enter()).
  */
-static apr_socket_t **worker_sockets;
+struct worker_slot {
+    CACHE_LINE_ALIGNED
+    apr_socket_t *csd;
+    apr_uint32_t drain_epoch;
+};
+static struct worker_slot *worker_slots;
 
 /* Disabling / enabling listening sockets can only happen in the listener
  * thread, which is the only one to set 'dying' to 1 too, so it's all thread
@@ -1157,6 +1209,19 @@ static void accept_off_record(apr_time_t duration)
     }
 }
 
+/* The workers polling conn_pollset (worker_poll_one()): their polls, the
+ * connections and waits they claimed, and the events they dropped (expired,
+ * completed or claimed otherwise meanwhile, or stale). Counted only with the
+ * backlog stats (backlog_stats_on).
+ */
+static /*atomic*/ apr_uint32_t drain_polls, drain_csd, drain_user, drain_dropped;
+
+#define DRAIN_STAT_INC(counter) do { \
+    if (backlog_stats_on) { \
+        apr_atomic_inc32(&(counter)); \
+    } \
+} while (0)
+
 /* Log the backlog stats of the last period and reset them (listener) */
 static void backlog_stats_report(apr_time_t now)
 {
@@ -1198,11 +1263,17 @@ static void backlog_stats_report(apr_time_t now)
 
     ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
                  "backlog sojourn:%s; dropped %u; accept off %u times, %"
-                 APR_TIME_T_FMT "ms,"
-                 " resumed woken %u recheck %u other %u; accept offs ended %u: p50<%uus,max=%uus",
+                 APR_TIME_T_FMT "ms, backstop %u,"
+                 " resumed woken %u recheck %u other %u;"
+                 " drain polls=%u csd=%u user=%u dropped=%u; accept offs ended %u: p50<%uus,max=%uus",
                  len ? buf : " none", backlog_dropped,
                  toggles, apr_time_as_msec(off),
+                 apr_atomic_xchg32(&admission_backstops, 0),
                  resumes_woken, resumes_recheck, resumes_other,
+                 apr_atomic_xchg32(&drain_polls, 0),
+                 apr_atomic_xchg32(&drain_csd, 0),
+                 apr_atomic_xchg32(&drain_user, 0),
+                 apr_atomic_xchg32(&drain_dropped, 0),
                  accept_off_ended,
                  (accept_off_ended
                   ? backlog_hist_bound(accept_off_hist, accept_off_ended, 50)
@@ -1371,9 +1442,9 @@ static void close_worker_sockets(void)
 {
     int i;
     for (i = 0; i < threads_per_child; i++) {
-        apr_socket_t *csd = worker_sockets[i];
+        apr_socket_t *csd = worker_slots[i].csd;
         if (csd) {
-            worker_sockets[i] = NULL;
+            worker_slots[i].csd = NULL;
             close_socket(csd);
         }
     }
@@ -1462,6 +1533,7 @@ static void signal_threads(int mode)
     if (mode == ST_UNGRACEFUL) {
         apr_atomic_set32(&workers_may_exit, 1);
         ap_queue_interrupt_all(worker_queue);
+        ring_doorbell(); /* blocked pollers (worker_poll) */
         close_worker_sockets(); /* forcefully kill all current connections */
     }
 
@@ -1667,6 +1739,7 @@ static apr_status_t decrement_connection_count(void *cs_)
     if (is_dying) {
         /* Help worker_thread_should_exit_early() */
         ap_queue_interrupt_one(worker_queue);
+        ring_doorbell();
     }
     return APR_SUCCESS;
 }
@@ -1705,6 +1778,26 @@ static void take_suspended(event_conn_state_t *cs)
     ap_run_resume_connection(cs->c, cs->r);
 }
 
+/* worker_poll: idle workers block polling conn_pollset (the connections and
+ * the waits) themselves, the listener keeping event_pollset (the listening
+ * sockets, its wakeup) with the timers, expiries, notifications and
+ * admission. What the listener queues for the workers rings the doorbell, a
+ * one-shot pipe in conn_pollset (PT_QUEUE), waking one blocked worker.
+ */
+#ifdef EVENT_WORKER_POLL
+static apr_file_t *doorbell_in, *doorbell_out;
+static apr_pollfd_t doorbell_pfd;
+
+/* Written at every ring and pop, in a cache line of its own */
+static struct {
+    CACHE_LINE_ALIGNED
+    /*atomic*/ apr_uint32_t rung;
+} doorbell_state;
+#endif
+
+static void recycle_connection_pool(apr_pool_t *p);
+static void flush_limbo(void);
+
 /* Close the connection and release its resources (ptrans), either because an
  * unrecoverable error occurred (queues or pollset add/remove) or more usually
  * if lingering close timed out.
@@ -1726,7 +1819,7 @@ static void close_connection_at(event_conn_state_t *cs,
     }
 
     close_socket_at(cs_sd(cs), at, line);
-    ap_queue_info_push_pool(worker_queue_info, cs->p);
+    recycle_connection_pool(cs->p);
 }
 #define close_connection(cs) \
     close_connection_at((cs), __FUNCTION__, __LINE__)
@@ -1988,7 +2081,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
         insert_timer_event(te);
     }
 
-    rv = apr_pollset_add(event_pollset, &cs->pfd);
+    rv = apr_pollset_add(conn_pollset, &cs->pfd);
     if (rv != APR_SUCCESS) {
         if (q) {
             TO_QUEUE_REMOVE(q, cs);
@@ -2067,7 +2160,7 @@ static int pollset_del_at(event_conn_state_t *cs, int locked, int fired,
         return 1; /* disarmed by the kernel already, nothing to remove */
     }
 #endif
-    rv = apr_pollset_remove(event_pollset, &cs->pfd);
+    rv = apr_pollset_remove(conn_pollset, &cs->pfd);
     if (rv != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rv)) {
         ap_log_cerror(APLOG_MARK, APLOG_ERR, rv, cs->c, APLOGNO(03094)
                       "pollset remove failed for connection %" CS_FMT " at %s:%i",
@@ -2468,7 +2561,7 @@ static void notifier_wait_done(ap_mpm_notifier_t *notifier)
 }
 
 /* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
- * nothing remains to remove from event_pollset: not with kqueue, a filter per
+ * nothing remains to remove from conn_pollset: not with kqueue, a filter per
  * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
  */
 static int oneshot_disarms_fd = 1;
@@ -2500,7 +2593,7 @@ static apr_status_t user_wait_cleanup(void *data)
                 continue;
             }
 #endif
-            rc = apr_pollset_remove(event_pollset, pfd);
+            rc = apr_pollset_remove(conn_pollset, pfd);
             if (rc != APR_SUCCESS && !APR_STATUS_IS_NOTFOUND(rc)) {
                 final_rc = rc;
             }
@@ -2635,7 +2728,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 #endif
             pfd->client_data = pt;
 
-            rc = apr_pollset_add(event_pollset, pfd);
+            rc = apr_pollset_add(conn_pollset, pfd);
             if (rc != APR_SUCCESS) {
                 final_rc = rc;
             }
@@ -2961,6 +3054,7 @@ static void set_child_dying(void)
 
     /* wake up idle worker threads */
     ap_queue_interrupt_all(worker_queue);
+    ring_doorbell();
     /* wake up the main thread */
     kill(ap_my_pid, SIGTERM);
 
@@ -3146,7 +3240,10 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
     qe->queued_at = now; /* the listener's, when the event was polled */
 
     rc = ap_queue_push_event(worker_queue, qe, 0);
-    if (rc != APR_SUCCESS) {
+    if (rc == APR_SUCCESS) {
+        ring_doorbell(); /* a worker blocked polling (worker_poll) */
+    }
+    else {
         int mode = ST_GRACEFUL;
 
         ap_queue_info_idlers_inc(worker_queue_info);
@@ -4174,6 +4271,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     }
                 }
                 break;
+
+            case PT_QUEUE:
+                /* The doorbell is in conn_pollset only (worker_poll) */
+                break;
             }
         } /* for processing poll */
 
@@ -4229,6 +4330,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
             /* Schedule ap_run_resume_connection() */
             push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit);
+        }
+
+        if (worker_poll) {
+            flush_limbo();
         }
 
         /* We process the timeout queues here only when the global
@@ -4310,6 +4415,7 @@ do_maintenance:
                  "listener thread exiting");
 
     ap_queue_term(worker_queue);
+    ring_doorbell();
 
     apr_thread_exit(thd, APR_SUCCESS);
     return NULL;
@@ -4345,6 +4451,370 @@ static int worker_thread_should_exit_early(int slot)
     }
 }
 
+/* Drain epochs: a worker polling conn_pollset (worker_poll_one()) publishes
+ * the current epoch in its slot until it's done with what it polled (claimed
+ * or dropped). A closed connection's pool is recycled only once no slot holds
+ * an epoch older than its close (its fd closed before, so no event for it can
+ * be returned to a later poll); otherwise it waits in the limbo, flushed when
+ * the slots move on. Only needed when the workers poll (worker_poll).
+ */
+static /*atomic*/ apr_uint32_t drain_epoch = 1;
+struct limbo_pool {
+    apr_pool_t *p;
+    apr_uint32_t epoch;
+    struct limbo_pool *next;
+};
+static struct limbo_pool *limbo_head, *limbo_tail;
+static apr_thread_mutex_t *limbo_mutex;
+
+#ifdef EVENT_WORKER_POLL
+static void drain_epoch_enter(int slot)
+{
+    apr_atomic_set32(&worker_slots[slot].drain_epoch,
+                     apr_atomic_read32(&drain_epoch));
+}
+
+static void drain_epoch_leave(int slot)
+{
+    apr_atomic_set32(&worker_slots[slot].drain_epoch, 0);
+
+    /* Leaving may let the pools in the limbo be recycled (their connections
+     * counted out, see decrement_connection_count()), so flush it now rather
+     * than at the listener's next loop. The check is racy: a pool added
+     * meanwhile and missed here is flushed by the next leave, or by the
+     * listener's loop which flushes too.
+     */
+    if (limbo_head) {
+        flush_limbo();
+    }
+}
+#endif
+
+/* Whether the pools closed at epoch can be recycled (wrap-safe) */
+static int drain_epoch_passed(apr_uint32_t epoch)
+{
+    int i;
+    for (i = 0; i < threads_per_child; i++) {
+        apr_uint32_t held = apr_atomic_read32(&worker_slots[i].drain_epoch);
+        if (held && (apr_int32_t)(held - epoch) <= 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void flush_limbo(void)
+{
+    struct limbo_pool *lp;
+
+    if (!limbo_head) { /* racy but rechecked under the lock */
+        return;
+    }
+    apr_thread_mutex_lock(limbo_mutex);
+    while ((lp = limbo_head) && drain_epoch_passed(lp->epoch)) {
+        limbo_head = lp->next;
+        if (!limbo_head) {
+            limbo_tail = NULL;
+        }
+        ap_queue_info_push_pool(worker_queue_info, lp->p);
+    }
+    apr_thread_mutex_unlock(limbo_mutex);
+}
+
+/* Recycle the pool of a closed connection (its socket closed already) */
+static void recycle_connection_pool(apr_pool_t *p)
+{
+    struct limbo_pool *lp;
+    apr_uint32_t epoch;
+
+    if (!worker_poll) {
+        ap_queue_info_push_pool(worker_queue_info, p);
+        return;
+    }
+
+    epoch = apr_atomic_inc32(&drain_epoch);
+    if (drain_epoch_passed(epoch)) {
+        ap_queue_info_push_pool(worker_queue_info, p);
+        flush_limbo();
+        return;
+    }
+
+    lp = apr_palloc(p, sizeof(*lp));
+    lp->p = p;
+    lp->epoch = epoch;
+    lp->next = NULL;
+    apr_thread_mutex_lock(limbo_mutex);
+    if (limbo_tail) {
+        limbo_tail->next = lp;
+    }
+    else {
+        limbo_head = lp;
+    }
+    limbo_tail = lp;
+    apr_thread_mutex_unlock(limbo_mutex);
+}
+
+#ifdef EVENT_WORKER_POLL
+/* worker_poll: a worker polls conn_pollset itself (one event, without waiting
+ * or blocking up to timeout when idle) and runs what it gets, without the
+ * listener -> worker hand-off (queue + futex wake/wait). One-shot pfds make a
+ * fired fd a single thread's, and the worker claims what the event is for
+ * (claim_connection(), claim_user_wait()), dropping it if another thread
+ * completed it already; what it holds stays valid until then (the
+ * connection's wait, drain epochs). Returns the connection to run, if any,
+ * *doorbell set if the doorbell is what it got.
+ */
+static event_conn_state_t *worker_poll_one(int slot,
+                                           apr_interval_time_t timeout,
+                                           int *doorbell)
+{
+    apr_pollfd_t out;
+    apr_int32_t num = 0;
+    listener_poll_type *pt;
+    event_conn_state_t *cs = NULL;
+
+    DRAIN_STAT_INC(drain_polls);
+    drain_epoch_enter(slot);
+    if (apr_pollset_poll_into(conn_pollset, timeout, 1, &out,
+                              &num) != APR_SUCCESS
+        || num != 1) {
+        drain_epoch_leave(slot);
+        return NULL;
+    }
+    pt = out.client_data;
+    if (!pt) {
+        /* a stale wait's pfd copy (its wait completed meanwhile) */
+        drain_epoch_leave(slot);
+        return NULL;
+    }
+
+    switch (pt->type) {
+    case PT_QUEUE:
+        *doorbell = 1;
+        break;
+
+    case PT_CSD:
+        cs = pt->baton;
+        if (!claim_connection(cs)) {
+            DRAIN_STAT_INC(drain_dropped);
+            cs = NULL;
+            break;
+        }
+        switch (cs->pub.state) {
+        case CONN_STATE_KEEPALIVE:
+        case CONN_STATE_ASYNC_WAITIO:
+            cs->pub.state = CONN_STATE_PROCESSING;
+            break;
+        case CONN_STATE_WRITE_COMPLETION:
+        case CONN_STATE_LINGER:
+            break;
+        default:
+            ap_assert(0);
+        }
+        DRAIN_STAT_INC(drain_csd);
+        break;
+
+    case PT_USER: {
+        struct user_wait *user_wait = pt->baton;
+        apr_array_header_t *pfds;
+        int i;
+
+        if (stale_user_wait(pt) || !claim_user_wait(user_wait)) {
+            DRAIN_STAT_INC(drain_dropped);
+            break;
+        }
+        cs = user_wait->cs;
+        AP_DEBUG_ASSERT(cs->user_wait == user_wait);
+
+        /* Tell the continuation which pfd is ready */
+        pfds = user_wait->pfds;
+        for (i = 0; i < pfds->nelts; i++) {
+            apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
+            if (pfd->desc_type == out.desc_type
+                && (pfd->desc_type == APR_POLL_SOCKET
+                    ? pfd->desc.s == out.desc.s
+                    : pfd->desc.f == out.desc.f)) {
+                pfd->rtnevents |= out.rtnevents;
+            }
+        }
+        if (user_wait->continuation.fn) {
+            set_user_continuation(cs, user_wait, AP_MPM_WAIT_READY);
+        }
+        apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
+        cs->user_wait = NULL;
+        DRAIN_STAT_INC(drain_user);
+        break;
+    }
+
+    default:
+        break; /* listening sockets (level-triggered, the listener's) */
+    }
+
+    /* A claimed connection is ours (can't be closed by others), done with
+     * the event otherwise
+     */
+    drain_epoch_leave(slot);
+    return cs;
+}
+
+static int worker_queue_empty(void)
+{
+    int i;
+    for (i = 0; i < BACKLOG_CLASSES; i++) {
+        if (ap_queue_lane_nelts(worker_queue, i)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* worker_poll: wake up one worker blocked polling conn_pollset, unless a
+ * ring is pending already (the woken worker rings again if more is queued).
+ */
+static void ring_doorbell(void)
+{
+    char c = 0;
+    apr_size_t n = 1;
+
+    if (worker_poll && apr_atomic_cas32(&doorbell_state.rung, 1, 0) == 0) {
+        (void)apr_file_write(doorbell_out, &c, &n);
+    }
+}
+
+/* A worker woken up by the doorbell: empty and re-arm it (one-shot) */
+static void answer_doorbell(void)
+{
+    char buf[64];
+    apr_size_t n;
+
+    do {
+        n = sizeof(buf);
+    } while (apr_file_read(doorbell_in, buf, &n) == APR_SUCCESS
+             && n == sizeof(buf));
+    apr_atomic_set32(&doorbell_state.rung, 0);
+    (void)apr_pollset_add(conn_pollset, &doorbell_pfd);
+}
+
+/* worker_poll: a worker shares its time between the connections it polls and
+ * the queued events (mostly new connections), BACKLOG_WEIGHT_WAITING to
+ * BACKLOG_WEIGHT_NEW, like the queue's lanes weigh them (the polled ones are
+ * mostly keepalive and waitio connections), so that the new connections are
+ * the ones waiting under load (what the admission measures); either source
+ * when the other is empty. By time rather than by count: polled events much
+ * longer than the queued ones (e.g. workers blocking) would otherwise keep the
+ * queue's share below its arrivals, which refusing new connections doesn't
+ * change. The time due to either source is capped to admission_interval, so
+ * that a long event doesn't make the other source wait for long after it.
+ */
+struct worker_poll_round {
+    apr_time_t polled, queued; /* weighted time spent on each source */
+    apr_time_t since;          /* when the current event was taken, if any */
+    int from_poll;             /* whether it was polled */
+};
+
+static void worker_poll_round_charge(struct worker_poll_round *round,
+                                     apr_time_t now)
+{
+    if (round->since) {
+        apr_time_t spent = (now > round->since) ? now - round->since : 0;
+        if (round->from_poll) {
+            round->polled += spent * BACKLOG_WEIGHT_NEW;
+        }
+        else {
+            round->queued += spent * BACKLOG_WEIGHT_WAITING;
+        }
+        round->since = 0;
+    }
+    if (round->polled > round->queued + admission_interval) {
+        round->polled = round->queued + admission_interval;
+    }
+    else if (round->queued > round->polled + admission_interval) {
+        round->queued = round->polled + admission_interval;
+    }
+}
+
+/* worker_poll: a worker blocked in conn_pollset holds the epoch it entered
+ * before polling (see worker_poll_one()), so the pools recycled meanwhile
+ * wait in the limbo until its poll returns. Nothing can make a given blocked
+ * worker return early (the doorbell or a pollset wakeup wake the threads
+ * blocked on an epoll in LIFO order, so never the ones blocked for long), so
+ * the timeout bounds that wait: 1s keeps the idle wakeups low (once per
+ * second per idle worker) and the limbo to the pools of the last second.
+ */
+#define WORKER_POLL_TIMEOUT apr_time_from_sec(1)
+
+/* worker_poll: the next queued event (*pqe), or a connection polled by
+ * this (idle) worker to run (*pcs), blocking in conn_pollset while there's
+ * none, in this worker's *round. APR_TIMEUP after WORKER_POLL_TIMEOUT
+ * without anything, for the caller to check the exit conditions (the exits
+ * ring the doorbell anyway) and this thread's drain epoch to move on.
+ */
+static apr_status_t worker_poll_next(int slot,
+                                     struct worker_poll_round *round,
+                                     ap_queue_event_t **pqe,
+                                     event_conn_state_t **pcs)
+{
+    apr_time_t now = event_time_now();
+
+    worker_poll_round_charge(round, now);
+    for (;;) {
+        event_conn_state_t *cs;
+        int doorbell = 0;
+        apr_status_t rv;
+
+        if (round->polled < BACKLOG_WEIGHT_WAITING) {
+            cs = worker_poll_one(slot, 0, &doorbell);
+            if (cs) {
+                round->since = now;
+                round->from_poll = 1;
+                *pcs = cs;
+                return APR_SUCCESS;
+            }
+            if (doorbell) {
+                answer_doorbell(); /* something queued */
+            }
+        }
+
+        rv = ap_queue_trypop_event(worker_queue, pqe);
+        if (rv == APR_SUCCESS) {
+            round->since = now;
+            round->from_poll = 0;
+            if (!worker_queue_empty()) {
+                ring_doorbell(); /* more for another worker */
+            }
+            return APR_SUCCESS;
+        }
+        /* Nothing queued, the time due starts again */
+        round->polled = round->queued = 0;
+        if (!APR_STATUS_IS_EAGAIN(rv)) {
+            /* APR_EOF, APR_EINTR: pass the doorbell on, the other blocked
+             * workers have to see it too (they'd wait for their timeout)
+             */
+            ring_doorbell();
+            return rv;
+        }
+        if (apr_atomic_read32(&workers_may_exit)) {
+            ring_doorbell(); /* the next blocked worker exits too */
+            return APR_EINTR;
+        }
+
+        /* Nothing either way, wait for something */
+        cs = worker_poll_one(slot, WORKER_POLL_TIMEOUT, &doorbell);
+        now = event_time_now();
+        if (cs) {
+            round->since = now;
+            round->from_poll = 1;
+            *pcs = cs;
+            return APR_SUCCESS;
+        }
+        if (!doorbell) {
+            return APR_TIMEUP;
+        }
+        answer_doorbell();
+    }
+}
+#endif /* EVENT_WORKER_POLL */
+
 /* XXX For ungraceful termination/restart, we definitely don't want to
  *     wait for active connections to finish but we may want to wait
  *     for idle workers to get out of the queue code and release mutexes,
@@ -4359,6 +4829,9 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
     int thread_slot = ti->tslot;
     worker_score *ws = &ap_scoreboard_image->servers[process_slot][thread_slot];
     int is_idler = 0;
+#ifdef EVENT_WORKER_POLL
+    struct worker_poll_round round = {0, 0, 0, 0}; /* worker_poll_next()'s */
+#endif
     apr_status_t rv;
 
     free(ti);
@@ -4404,6 +4877,26 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
             break;
         }
 
+#ifdef EVENT_WORKER_POLL
+        if (worker_poll) {
+            event_conn_state_t *cs = NULL;
+            rv = worker_poll_next(thread_slot, &round, &qe, &cs);
+            if (APR_STATUS_IS_TIMEUP(rv)) {
+                continue; /* still idle */
+            }
+            if (rv == APR_SUCCESS && cs) {
+                /* Polled here, no push2worker() accounted for it */
+                apr_socket_t *csd = cs_se(cs)->sd;
+                ap_queue_info_idlers_dec(worker_queue_info);
+                is_idler = 0;
+                worker_slots[thread_slot].csd = csd;
+                process_socket(thd, cs->p, csd, cs, process_slot, thread_slot);
+                worker_slots[thread_slot].csd = NULL;
+                continue;
+            }
+        }
+        else
+#endif
         rv = ap_queue_pop_event(worker_queue, &qe);
         if (rv != APR_SUCCESS) {
             /* We get APR_EOF during a graceful shutdown once all the
@@ -4471,9 +4964,9 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
             cs = qe->data.se->baton;
             ap_assert(p && csd && cs && qe == cs_qe(cs));
 
-            worker_sockets[thread_slot] = csd;
+            worker_slots[thread_slot].csd = csd;
             process_socket(thd, p, csd, cs, process_slot, thread_slot);
-            worker_sockets[thread_slot] = NULL;
+            worker_slots[thread_slot].csd = NULL;
         }
         else if (qe->type == AP_QUEUE_EVENT_TIMER) {
             timer_event_t *te;
@@ -4654,6 +5147,7 @@ static void setup_threads_runtime(void)
      * required (any method implements it with APR >= 1.4), we account for
      * the wakeup pipe explicitely with pollset_size+1 because some pollset
      * implementations don't do it implicitely in APR.
+     * APR_POLLSET_THREADSAFE since several threads add/remove concurrently.
      */
     pollset_flags = APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY |
                     APR_POLLSET_WAKEABLE | APR_POLLSET_NODEFAULT;
@@ -4669,7 +5163,51 @@ static void setup_threads_runtime(void)
                      "apr_pollset_create with Thread Safety failed.");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
-    oneshot_disarms_fd = (strcmp(apr_pollset_method_name(event_pollset),
+
+    /* The connections' pollset, the workers' own with its doorbell
+     * (worker_poll), or the main one if they can't poll (not built in). The
+     * workers poll it while others add/remove (APR_POLLSET_THREADSAFE), and
+     * APR_POLLSET_NOCOPY is mandatory for apr_pollset_poll_into().
+     */
+    conn_pollset = event_pollset;
+#ifdef EVENT_WORKER_POLL
+    {
+        static listener_poll_type doorbell_pt = { PT_QUEUE, NULL };
+        apr_pollset_t *ps = NULL;
+
+        for (i = 0; i < sizeof(good_methods) / sizeof(good_methods[0]); i++) {
+            rv = apr_pollset_create_ex(&ps, pollset_size + 1, pruntime,
+                                       APR_POLLSET_THREADSAFE |
+                                       APR_POLLSET_NOCOPY |
+                                       APR_POLLSET_NODEFAULT,
+                                       good_methods[i]);
+            if (rv == APR_SUCCESS) {
+                break;
+            }
+        }
+        if (rv == APR_SUCCESS) {
+            rv = apr_file_pipe_create_ex(&doorbell_in, &doorbell_out,
+                                         APR_FULL_NONBLOCK, pruntime);
+        }
+        if (rv == APR_SUCCESS) {
+            doorbell_pfd.desc_type = APR_POLL_FILE;
+            doorbell_pfd.reqevents = APR_POLLIN | APR_POLLONESHOT;
+            doorbell_pfd.desc.f = doorbell_in;
+            doorbell_pfd.client_data = &doorbell_pt;
+            rv = apr_pollset_add(ps, &doorbell_pfd);
+        }
+        if (rv == APR_SUCCESS) {
+            conn_pollset = ps;
+            worker_poll = 1;
+        }
+        else {
+            ap_log_error(APLOG_MARK, APLOG_WARNING, rv, ap_server_conf,
+                         APLOGNO() "can't create the workers' pollset, the "
+                         "listener polls the connections");
+        }
+    }
+#endif
+    oneshot_disarms_fd = (strcmp(apr_pollset_method_name(conn_pollset),
                                  "kqueue") != 0);
 
     /* Add listeners to the main pollset */
@@ -4711,8 +5249,16 @@ static void setup_threads_runtime(void)
         lr->accept_func = ap_unixd_accept;
     }
 
-    worker_sockets = apr_pcalloc(pruntime, threads_per_child *
-                                           sizeof(apr_socket_t *));
+    /* Aligned on a cache line (APR allocates on 8 bytes), so that a slot's
+     * data never straddles into the next slot's line (one more slot for it).
+     */
+    {
+        char *slots = apr_pcalloc(pruntime, (threads_per_child + 1) *
+                                            sizeof(struct worker_slot));
+        worker_slots = (struct worker_slot *)APR_ALIGN((apr_uintptr_t)slots,
+                                                       CACHE_LINE_SIZE);
+    }
+    apr_thread_mutex_create(&limbo_mutex, APR_THREAD_MUTEX_DEFAULT, pruntime);
 }
 
 /* XXX under some circumstances not understood, children can get stuck
@@ -5626,11 +6172,18 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
     ap_log_error(APLOG_MARK, APLOG_INFO, 0, ap_server_conf, APLOGNO(10464)
                  "MPM event settings%s: MaxRequestWorkers=%d AsyncRequestWorkerFactor=%.1lf "
                  "ThreadsPerChild=%d ThreadLimit=%d MinSpareThreads=%d MaxSpareThreads=%d "
-                 "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d",
+                 "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d "
+                 "WorkerPoll=%s",
                  auto_settings ? " (auto)" : "", max_workers, async_factor,
                  threads_per_child, thread_limit, min_spare_threads, max_spare_threads,
                  active_daemons_limit, server_limit, ap_daemons_to_start,
-                 num_buckets, num_cpus);
+                 num_buckets, num_cpus,
+#ifdef EVENT_WORKER_POLL
+                 "on"   /* where the pollset method allows (children) */
+#else
+                 "off"
+#endif
+                 );
 
     /* If we're doing a graceful_restart then we're going to see a lot
      * of children exiting immediately when we get into the main loop
