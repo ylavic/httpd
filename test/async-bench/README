@@ -2,8 +2,10 @@ Async proxying and MPM queuing: benchmark harness and checks (prototype)
 
 Build the Go tools (Go >= 1.21, no module needed):
   go build -o backend backend.go     # backend: GET /?d=MS answers 512 bytes after MS ms,
-                                     # "Upgrade: echo" gets a 101 then an echo
-  go build -o loadgen loadgen.go     # load generator (closed loop, or open loop -rate)
+                                     # "Upgrade: echo" gets a 101 then an echo,
+                                     # GET /?s=BYTES streams BYTES, POST reads its body
+  go build -o loadgen loadgen.go     # load generator (closed loop, or open loop -rate;
+                                     # paced uploads -upload, slow reads -rchunk)
   go build -o tunnelgen tunnelgen.go # tunnels (Upgrade: echo) sending a message every -i
 
 Build mod_aptest (its "aptest-queue" handler, controlled service times):
@@ -39,6 +41,15 @@ tunnelbench.py PREFIX WORKDIR [tunnels,...]
   epoll_ctl churn per message). DELAY=-1 for blocking tunnels (one thread
   each, so no more tunnels than ThreadsPerChild). medians.py reads its logs
   too.
+
+bodybench.py PREFIX WORKDIR [delays] [scenarios]
+  Large-body benchmark: blocking (-1) vs async (0) by default, 16 clients,
+  responses of SIZE bytes (4MB) streamed by the backend in CHUNK-byte writes
+  (64KB) and read by clients slower than the backend (down-slow: a CHUNK read
+  every PAUSE, 1ms) or as fast as possible (down-fast), and uploads of SIZE
+  bytes written a CHUNK every PAUSE (up); requests/s, MB/s, latency
+  percentiles, CPU and context switches per MB of the httpd tree, and
+  syscalls per request with STRACE=1. medians.py reads its logs too.
 
 queue.py PREFIX MOD_APTEST_SO WORKDIR [scenario...]
   MPM queuing scenarios (burst, overload-cpu, blocked, async-mix, progress,

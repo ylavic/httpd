@@ -1,5 +1,6 @@
-"""Median of each (delay, backend) cell, or of each tunnel count, over the given
-bench.py/tunnelbench.py logs (round*.log by default).
+"""Median of each (delay, backend) cell, of each tunnel count, or of each (delay,
+scenario) cell, over the given bench.py/tunnelbench.py/bodybench.py logs
+(round*.log by default).
 
 usage: python3 -I medians.py [LOG...]
 """
@@ -8,9 +9,16 @@ import re
 import statistics
 import sys
 
-cells, tunnels = {}, {}
+cells, tunnels, bodies = {}, {}, {}
 for path in sys.argv[1:] or sorted(glob.glob("round*.log")):
     for line in open(path):
+        m = re.match(r"delay (\S+)\s+(\S+)\s*: rps (\d+) errors (\d+) p50 ([\d.]+)ms "
+                     r"p99 ([\d.]+)ms .* mbps ([\d.]+) \| cpu ([\d.]+) ms/MB \| cs ([\d.]+)",
+                     line)
+        if m:
+            bodies.setdefault((m.group(1), m.group(2)), []).append(
+                tuple(float(x) for x in m.groups()[2:]))
+            continue
         m = re.match(r"delay (\S+)\s+backend\s+(\d+)ms: rps (\d+) errors (\d+) p50 ([\d.]+)ms "
                      r"p99 ([\d.]+)ms .* \| cpu ([\d.]+)(?: ms/1k req \| cs ([\d.]+))?", line)
         if m:
@@ -44,3 +52,9 @@ if tunnels:
     for t in sorted(tunnels):
         med = [statistics.median(x[i] for x in tunnels[t]) for i in range(6)]
         print("%8d | %8.0f %6.0f %8.2f %8.2f %9.1f %6.1f" % (t, *med))
+if bodies:
+    print("%-6s %-9s | %6s %6s %8s %8s %7s %7s %6s" % (
+        "delay", "scenario", "req/s", "errs", "p50 ms", "p99 ms", "MB/s", "cpu/MB", "cs/MB"))
+    for key in sorted(bodies, key=lambda k: (k[1], k[0] != "-1", k[0])):
+        med = [statistics.median(x[i] for x in bodies[key]) for i in range(7)]
+        print("%-6s %-9s | %6.0f %6.0f %8.2f %8.2f %7.1f %7.2f %6.1f" % (*key, *med))
