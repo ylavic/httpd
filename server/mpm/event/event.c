@@ -982,6 +982,11 @@ static const apr_time_t admission_interval =
  */
 static volatile apr_time_t admission_above_since;
 
+/* The refusals by the backstop rather than the sojourn (for the stats),
+ * counted by the listener (disable_listensocks())
+ */
+static apr_uint32_t admission_backstops;
+
 /* Called by the workers for each new connection they take: write only on
  * changes, the line is read by all of them. The last new connection taken
  * resets it too (none waiting).
@@ -1211,6 +1216,11 @@ static int disable_listensocks(apr_time_t now)
     volatile process_score *ps;
     int i;
 
+    if (!apr_atomic_read32(&listensocks_off)
+        && !apr_atomic_read32(&dying)
+        && admission_above_target(now) == ADMISSION_BACKSTOP) {
+        admission_backstops++;
+    }
     if (apr_atomic_cas32(&listensocks_off, 1, 0) != 0) {
         return 0;
     }
