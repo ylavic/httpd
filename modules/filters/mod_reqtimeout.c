@@ -69,6 +69,7 @@ typedef struct
 } reqtimeout_con_cfg;
 
 static const char *const reqtimeout_filter_name = "reqtimeout";
+static const char *const reqtimeout_body_filter_name = "reqtimeout_body";
 static int default_handshake_rate_factor;
 static int default_header_rate_factor;
 static int default_body_rate_factor;
@@ -355,6 +356,37 @@ static apr_status_t reqtimeout_eor(ap_filter_t *f, apr_bucket_brigade *bb)
     return ap_pass_brigade(f->next, bb);
 }
 
+/* End the body stage once the whole body is read (its EOS), so that the reads
+ * of the connection which may follow before the response is done (e.g. to
+ * check whether the client is gone, or a pipelined request) don't get the
+ * body's deadline, which applies to reading the body only.
+ */
+static apr_status_t reqtimeout_body_filter(ap_filter_t *f,
+                                           apr_bucket_brigade *bb,
+                                           ap_input_mode_t mode,
+                                           apr_read_type_e block,
+                                           apr_off_t readbytes)
+{
+    reqtimeout_con_cfg *ccfg = f->ctx;
+    apr_bucket *e;
+    apr_status_t rv;
+
+    rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
+    if (rv != APR_SUCCESS || mode == AP_MODE_SPECULATIVE) {
+        return rv;
+    }
+    for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb); e = APR_BUCKET_NEXT(e)) {
+        if (APR_BUCKET_IS_EOS(e)) {
+            ccfg->timeout_at = 0;
+            ccfg->max_timeout_at = 0;
+            ccfg->cur_stage.timeout = 0;
+            ap_remove_input_filter(f);
+            break;
+        }
+    }
+    return rv;
+}
+
 #define INIT_STAGE(cfg, ccfg, stage, s_timeout) do { \
     if (cfg->stage.timeout != UNSET) { \
         ccfg->cur_stage.timeout     = cfg->stage.timeout; \
@@ -446,12 +478,14 @@ static int reqtimeout_before_body(request_rec *r)
     ccfg->type = "body";
     ccfg->timeout_at = 0;
     ccfg->max_timeout_at = 0;
-    if (r->method_number == M_CONNECT) {
-        /* disabled for a CONNECT request */
+    if (r->method_number == M_CONNECT || !ap_request_has_body(r)) {
+        /* disabled for a CONNECT request, and without a body to read */
         ccfg->cur_stage.timeout = 0;
     }
     else {
         INIT_STAGE(cfg, ccfg, body, r->server->timeout);
+        /* ended by the body's EOS (reqtimeout_body_filter()) */
+        ap_add_input_filter(reqtimeout_body_filter_name, ccfg, r, r->connection);
     }
     return OK;
 }
@@ -649,6 +683,13 @@ static void reqtimeout_hooks(apr_pool_t *pool)
      */
     ap_register_output_filter(reqtimeout_filter_name, reqtimeout_eor, NULL,
                               AP_FTYPE_CONNECTION);
+
+    /*
+     * And end the body stage at the body's EOS, so above HTTP_IN (which is
+     * AP_FTYPE_PROTOCOL) to see it.
+     */
+    ap_register_input_filter(reqtimeout_body_filter_name, reqtimeout_body_filter,
+                             NULL, AP_FTYPE_PROTOCOL + 1);
 
     /*
      * mod_reqtimeout needs to be called before ap_process_http_request (which
