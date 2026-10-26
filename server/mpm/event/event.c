@@ -685,9 +685,16 @@ typedef struct
     void *baton;
 } listener_poll_type;
 
-/* The claim state of a wait (user_wait->claim): an armed wait is completed by
- * the first thread to CAS it to WAIT_CLAIMED (claim_user_wait()), whatever
- * completes it (a fired pfd, its timer, its wakeup).
+/* A wait: registered by a module (ap_mpm_register_wait()) for a SUSPENDED
+ * connection, on pfds, a timeout and a notifier, the first to fire completes
+ * it (claim_user_wait()), then a worker runs the module's continuation
+ * (struct user_continuation). Modules only see the registration and the
+ * continuation; the wait's states and the kept pfds are the MPM's.
+ */
+
+/* The claim state of a wait (user_wait->claim): an armed wait is completed
+ * by the first thread to CAS it to WAIT_CLAIMED (claim_user_wait()),
+ * whatever completes it (a fired pfd, its timer, its notifier).
  */
 #define WAIT_IDLE    0u
 #define WAIT_ARMED   1u
@@ -2238,8 +2245,14 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         rc = ap_run_process_connection(c);
         if (cs->pending_wait && cs->pub.state != CONN_STATE_SUSPENDED) {
             /* The handler registered a wait but didn't suspend in the end */
-            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
-                          "ignoring the wait of a connection not suspended");
+            {
+                static log_ratelimit_t rl;
+                if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 1, NULL, c)) {
+                    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
+                                  "ignoring the wait registered by a connection not "
+                                  "suspended");
+                }
+            }
             cs->pending_wait = NULL;
         }
         /*
