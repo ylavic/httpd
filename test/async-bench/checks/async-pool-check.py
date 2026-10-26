@@ -50,7 +50,11 @@ def many(path, n, delay, timeout=30):
 def child_fds():
     kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True,
                           text=True).stdout.split()
-    return sum(len(os.listdir("/proc/%s/fd" % k)) for k in kids)
+    if os.path.isdir("/proc/self/fd"):
+        return sum(len(os.listdir("/proc/%s/fd" % k)) for k in kids)
+    # FreeBSD: procstat -f lists the fds (after a header line)
+    return sum(len(subprocess.run(["procstat", "-f", k], capture_output=True,
+                                  text=True).stdout.splitlines()[1:]) for k in kids)
 
 
 def summary(st):

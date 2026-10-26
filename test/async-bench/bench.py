@@ -11,6 +11,7 @@ LOGLEVEL (warn), CONF_EXTRA (appended to the httpd.conf, e.g.
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,49 @@ STRACE_SECONDS = str(max(1, int(SECONDS) - 1))
 os.makedirs(work, exist_ok=True)
 FRONT, BACK = 18500, 18501
 TICK = os.sysconf("SC_CLK_TCK")
+# Linux, or FreeBSD (no /proc: ps; cpuset, truss and netstat for taskset,
+# strace and ss)
+LINUX = sys.platform.startswith("linux")
+# The CPUs of httpd, the backend and the load generators: CPUS="0-1 2 3" e.g.
+# on a machine (or VM) of 4 CPUs
+HTTPD_CPUS, BACKEND_CPUS, TOOLS_CPUS = os.environ.get("CPUS", "0-3 4,5 6,7").split()
+
+
+def pinned(cpus, args):
+    """args run on the given CPUs (taskset, or cpuset on FreeBSD)"""
+    return (["taskset", "-c", cpus] if LINUX else ["cpuset", "-l", cpus]) + args
+
+
+def ps_seconds(t):
+    """seconds of a ps time ([[dd-]hh:]mm:ss.ss)"""
+    days, _, t = t.rpartition("-")
+    total = float(days or 0) * 86400
+    seconds = 0.0
+    for part in t.split(":"):
+        seconds = seconds * 60 + float(part)
+    return total + seconds
+
+
+def tracer(pid):
+    """the syscalls summary of pid over STRACE_SECONDS, into strace.out"""
+    out = os.path.join(work, "strace.out")
+    if LINUX:
+        args = ["strace", "-c", "-f", "-q", "-o", out, "-p", pid]
+    else:
+        args = ["truss", "-c", "-f", "-o", out, "-p", pid]
+    return subprocess.Popen(["timeout", "-s", "INT", STRACE_SECONDS] + args)
+
+
+def established_to(port):
+    """the number of established TCP connections to port (ss, else netstat,
+    e.g. on FreeBSD)"""
+    if shutil.which("ss"):
+        out = subprocess.run(["ss", "-Htn", "state", "established", "dport", "= :%d" % port],
+                             capture_output=True, text=True).stdout
+        return out.count("\n")
+    out = subprocess.run(["netstat", "-n", "-p", "tcp"], capture_output=True, text=True).stdout
+    return sum(1 for line in out.splitlines()
+               if "ESTABLISHED" in line and line.split()[4].endswith(".%d" % port))
 
 CONF = """
 ServerRoot "{prefix}"
@@ -67,6 +111,10 @@ def tree_cpu(pid):
     """utime+stime (seconds) of pid and its children"""
     pids = [str(pid)] + subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
                                        text=True).stdout.split()
+    if not LINUX:
+        out = subprocess.run(["ps", "-o", "time=", "-p", ",".join(pids)],
+                             capture_output=True, text=True).stdout
+        return sum(ps_seconds(t) for t in out.split())
     total = 0
     for p in pids:
         try:
@@ -83,6 +131,11 @@ def tree_ctxsw(pid):
     children"""
     pids = [str(pid)] + subprocess.run(["pgrep", "-P", str(pid)], capture_output=True,
                                        text=True).stdout.split()
+    if not LINUX:
+        # one -o per column: the header given after a "=" runs to the end
+        out = subprocess.run(["ps", "-H", "-o", "nvcsw=", "-o", "nivcsw=",
+                              "-p", ",".join(pids)], capture_output=True, text=True).stdout
+        return sum(int(x) for x in out.split())
     total = 0
     for p in pids:
         try:
@@ -101,15 +154,20 @@ def tree_ctxsw(pid):
 
 
 def strace_per_req(n):
-    """the main syscalls per request from strace -c's summary (strace.out), over
-    its window (STRACE_SECONDS of the SECONDS measured, n requests in SECONDS)"""
+    """the main syscalls per request from strace -c's (or truss -c's) summary
+    (strace.out), over its window (STRACE_SECONDS of the SECONDS measured, n
+    requests in SECONDS)"""
     n = n * float(STRACE_SECONDS) / int(SECONDS)
     calls = {}
     with open(os.path.join(work, "strace.out")) as f:
         for line in f:
             fields = line.split()
-            if len(fields) >= 5 and fields[0][0].isdigit() and fields[-1] != "total":
-                calls[fields[-1]] = int(fields[3])
+            if LINUX:
+                if len(fields) >= 5 and fields[0][0].isdigit() and fields[-1] != "total":
+                    calls[fields[-1]] = int(fields[3])
+            elif len(fields) == 4 and fields[2].isdigit() and fields[0] != "syscall":
+                # truss: syscall seconds calls errors
+                calls[fields[0]] = int(fields[2])
     total = sum(calls.values())
     top = sorted(calls.items(), key=lambda kv: -kv[1])[:10]
     return "total %.1f, " % (float(total) / n) + ", ".join(
@@ -121,8 +179,8 @@ def start_httpd(delay):
         f.write(CONF.format(prefix=prefix, work=work, front=FRONT, back=BACK, delay=delay,
                             poolmax=POOLMAX, loglevel=LOGLEVEL) + CONF_EXTRA + "\n")
     open(os.path.join(work, "error_log"), "w").close()
-    p = subprocess.Popen(["taskset", "-c", "0-3", os.path.join(prefix, "bin", "httpd"),
-                          "-f", os.path.join(work, "httpd.conf"), "-DFOREGROUND"])
+    p = subprocess.Popen(pinned(HTTPD_CPUS, [os.path.join(prefix, "bin", "httpd"),
+                          "-f", os.path.join(work, "httpd.conf"), "-DFOREGROUND"]))
     for _ in range(100):
         r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                             "http://127.0.0.1:%d/b?d=0" % FRONT], capture_output=True, text=True)
@@ -145,8 +203,8 @@ def stop_httpd(p):
         p.wait(10)
 
 
-backend = subprocess.Popen(["taskset", "-c", "4,5", os.path.join(here, "backend"),
-                            "-addr", "127.0.0.1:%d" % BACK])
+backend = subprocess.Popen(pinned(BACKEND_CPUS, [os.path.join(here, "backend"),
+                                                 "-addr", "127.0.0.1:%d" % BACK]))
 time.sleep(0.5)
 print("clients %d, %ss per run, 8 threads, pool max=%s; cpu = httpd tree CPU ms per 1000"
       " requests, cs = httpd context switches per request" % (CLIENTS, SECONDS, POOLMAX))
@@ -155,18 +213,16 @@ try:
         p = start_httpd(delay)
         try:
             for ms in BACKEND_MS:
-                lg = subprocess.Popen(["taskset", "-c", "6,7", os.path.join(here, "loadgen"),
+                lg = subprocess.Popen(pinned(TOOLS_CPUS, [os.path.join(here, "loadgen"),
                                        "-url", "http://127.0.0.1:%d/b?d=%s" % (FRONT, ms),
-                                       "-c", str(CLIENTS), "-d", SECONDS + "s", "-w", "2s"],
+                                       "-c", str(CLIENTS), "-d", SECONDS + "s", "-w", "2s"]),
                                       stdout=subprocess.PIPE, text=True)
                 time.sleep(2)
                 st = None
                 if STRACE:
                     child = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True,
                                            text=True).stdout.split()[0]
-                    st = subprocess.Popen(["timeout", "-s", "INT", STRACE_SECONDS, "strace", "-c",
-                                           "-f", "-q", "-o", os.path.join(work, "strace.out"),
-                                           "-p", child])
+                    st = tracer(child)
                 c0, s0 = tree_cpu(p.pid), tree_ctxsw(p.pid)
                 out = lg.communicate()[0].strip()
                 c1, s1 = tree_cpu(p.pid), tree_ctxsw(p.pid)

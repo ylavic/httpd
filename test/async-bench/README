@@ -13,7 +13,11 @@ The scripts start their own httpd from an install prefix ($PREFIX, e.g. built
 from this tree) with their own configuration under WORKDIR, on 127.0.0.1
 ports 18431-18435 (checks) and 18500-18510 (bench, queue). They pin httpd on
 CPUs 0-3 and the tools on 4-7 (taskset); for stable numbers use a fixed CPU
-frequency (cpupower frequency-set -g performance, no turbo).
+frequency (cpupower frequency-set -g performance, no turbo). CPUS="HTTPD
+BACKEND TOOLS" changes the CPUs of the benches (e.g. CPUS="0-1 2 3" on 4
+CPUs). The benches using bench.py's helpers and the checks also run on
+FreeBSD (cpuset, ps, truss and netstat for taskset, /proc, strace and ss);
+queue.py is Linux only.
 
 bench.py PREFIX WORKDIR [delays] [backend_ms]
   ProxyAsyncDelay benchmark: blocking (-1) vs async (0, 1ms, 10ms) against
