@@ -5,16 +5,19 @@
 // requests/s, errors, latency percentiles. With -upload, POSTs a body of that
 // size written -wchunk bytes at a time every -wdelay; with -rchunk, reads the
 // response -rchunk bytes at a time every -rdelay (a slow reader); either also
-// reports the body bytes/s (both ways).
+// reports the body bytes/s (both ways). -rcvbuf sets the receive buffer of the
+// connections (fixed, no autotuning), for a reader really slower than httpd.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -61,6 +64,7 @@ func main() {
 	wdelay := flag.Duration("wdelay", 0, "delay between upload chunks")
 	rchunk := flag.Int("rchunk", 0, "read the response this many bytes at a time")
 	rdelay := flag.Duration("rdelay", 0, "delay between response reads")
+	rcvbuf := flag.Int("rcvbuf", 0, "receive buffer of the connections (0: the system's)")
 	flag.Parse()
 	bodies := *upload > 0 || *rchunk > 0
 	var nbytes int64 // body bytes of the measured requests
@@ -71,6 +75,22 @@ func main() {
 	}
 	tr := &http.Transport{MaxIdleConnsPerHost: *conc, MaxConnsPerHost: conns,
 		DisableCompression: true, DisableKeepAlives: !*keepalive}
+	if *rcvbuf > 0 {
+		// Before connecting, for the TCP window to be negotiated with it
+		dialer := &net.Dialer{Timeout: 30 * time.Second,
+			Control: func(network, address string, c syscall.RawConn) error {
+				var serr error
+				err := c.Control(func(fd uintptr) {
+					serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET,
+						syscall.SO_RCVBUF, *rcvbuf)
+				})
+				if err != nil {
+					return err
+				}
+				return serr
+			}}
+		tr.DialContext = dialer.DialContext
+	}
 	client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
 
 	var mu sync.Mutex

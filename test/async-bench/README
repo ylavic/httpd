@@ -47,9 +47,14 @@ bodybench.py PREFIX WORKDIR [delays] [scenarios]
   responses of SIZE bytes (4MB) streamed by the backend in CHUNK-byte writes
   (64KB) and read by clients slower than the backend (down-slow: a CHUNK read
   every PAUSE, 1ms) or as fast as possible (down-fast), and uploads of SIZE
-  bytes written a CHUNK every PAUSE (up); requests/s, MB/s, latency
-  percentiles, CPU and context switches per MB of the httpd tree, and
-  syscalls per request with STRACE=1. medians.py reads its logs too.
+  bytes written a CHUNK every PAUSE (up). On loopback these hardly make a
+  request wait more than once (large socket buffers), so down-crawl and
+  up-crawl read or send CRAWL_SIZE bytes (1MB) a CRAWL_CHUNK (16KB) every
+  CRAWL_PAUSE (20ms), down-crawl through the client's receive buffer and
+  httpd's SendBufferSize set to CRAWL_CHUNK: about 60 waits per request.
+  Requests/s, MB/s, latency percentiles, CPU and context switches per MB of
+  the httpd tree, and syscalls per request with STRACE=1. medians.py reads its
+  logs too.
 
 queue.py PREFIX MOD_APTEST_SO WORKDIR [scenario...]
   MPM queuing scenarios (burst, overload-cpu, blocked, async-mix, progress,
