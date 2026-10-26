@@ -4552,11 +4552,11 @@ static void setup_threads_runtime(void)
     const int good_methods[] = { APR_POLLSET_PORT,
                                  APR_POLLSET_KQUEUE,
                                  APR_POLLSET_EPOLL };
-    const double threads_factor = (async_factor < DEFAULT_ASYNC_FACTOR
-                                   ? DEFAULT_ASYNC_FACTOR
-                                   : async_factor);
-    const apr_size_t pollset_size = ((unsigned int)(threads_per_child * threads_factor) +
-                                     (unsigned int)num_listensocks +
+    /* The size is the events returned by a poll (the connections the good
+     * methods hold are unbounded).
+     */
+    const apr_size_t pollset_size = ((apr_size_t)threads_per_child * 2 +
+                                     (apr_size_t)num_listensocks +
                                      POLLSET_RESERVE_SIZE);
     int pollset_flags;
 
@@ -6598,8 +6598,8 @@ static const command_rec event_cmds[] = {
                   "Maximum number of worker threads per child process for this "
                   "run of Apache - Upper limit for ThreadsPerChild"),
     AP_INIT_TAKE1("AsyncRequestWorkerFactor", set_worker_factor, NULL, RSRC_CONF,
-                  "How many additional connects will be accepted per idle "
-                  "worker thread"),
+                  "How many new connections can wait for a worker, per "
+                  "worker thread, before accepting stops"),
     AP_GRACEFUL_SHUTDOWN_TIMEOUT_COMMAND,
     {NULL}
 };
