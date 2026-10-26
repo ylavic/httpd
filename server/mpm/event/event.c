@@ -367,6 +367,14 @@ struct event_conn_state_t {
     timer_event_t *te;
     /** user pollfds (for suspended connection) */
     struct user_wait *user_wait;
+    /** a wait (ap_mpm_register_wait()) to arm once no thread runs the
+     *  connection anymore */
+    struct user_wait *pending_wait;
+    /** the continuation to run on resume, and its arguments */
+    ap_mpm_continuation_fn_t *resume_fn;
+    void *resume_baton;
+    apr_array_header_t *resume_pfds;
+    ap_mpm_wait_result_e resume_why;
 
     /*
      * when queued to workers
@@ -392,6 +400,10 @@ struct event_conn_state_t {
         suspended       :1,
         /** Did the connection timed out? */
         timed_out       :1,
+        /** Is a continuation (resume_fn) running? */
+        in_continuation :1,
+        /** Did the running continuation ask to resume the conn? */
+        continuation_pending :1,
         /** Has ap_start_lingering_close() been called? */
         linger_started  :1,
         /** Is lingering connection flushed and shutdown? */
@@ -653,6 +665,9 @@ struct user_wait {
     timer_event_t *timer; /* the timer of its timeout if any (also cs->te) */
     struct user_wait *next; /* chaining */
     int chained; /* in the listener's user_chain (next may be NULL there) */
+    apr_interval_time_t timeout; /* the timeout to arm with */
+    ap_mpm_continuation_fn_t *fn; /* the continuation (ap_mpm_register_wait()), if any */
+    void *fn_baton;
 };
 
 typedef struct event_child_bucket {
@@ -1062,6 +1077,9 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
     case AP_MPMQ_CAN_POLL_SUSPENDED:
         *result = 1;
         break;
+    case AP_MPMQ_CAN_REGISTER_WAIT:
+        *result = 1;
+        break;
     default:
         *rv = APR_ENOTIMPL;
         break;
@@ -1195,6 +1213,9 @@ static apr_status_t decrement_connection_count(void *cs_)
     return APR_SUCCESS;
 }
 
+static void arm_pending_wait(event_conn_state_t *cs);
+static void run_user_continuation(event_conn_state_t *cs);
+
 static void enter_suspended(event_conn_state_t *cs)
 {
     AP_DEBUG_ASSERT(!cs->suspended);
@@ -1206,6 +1227,13 @@ static void enter_suspended(event_conn_state_t *cs)
     cs->c->sbh = NULL;
     cs->c->suspended_baton = cs;
     ap_run_suspend_connection(cs->c, cs->r);
+
+    /* A wait registered by the handler (ap_mpm_register_wait()) is armed
+     * now that the MPM has the connection.
+     */
+    if (cs->pending_wait) {
+        arm_pending_wait(cs);
+    }
 }
 
 static void take_suspended(event_conn_state_t *cs)
@@ -1700,6 +1728,13 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                       "resuming connection %" CS_FMT, CS_ARG(cs));
         take_suspended(cs);
+        if (cs->resume_fn) {
+            /* The continuation of an ap_mpm_register_wait(), this worker
+             * busy meanwhile (SERVER_BUSY_WRITE, the handler's status)
+             */
+            ap_update_child_status(cs->sbh, SERVER_BUSY_WRITE, cs->r);
+            run_user_continuation(cs);
+        }
         return;
     }
 
@@ -1724,6 +1759,12 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         processed = 1;
         cs->pub.state = CONN_STATE_PROCESSING;
         rc = ap_run_process_connection(c);
+        if (cs->pending_wait && cs->pub.state != CONN_STATE_SUSPENDED) {
+            /* The handler registered a wait but didn't suspend in the end */
+            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
+                          "ignoring the wait of a connection not suspended");
+            cs->pending_wait = NULL;
+        }
         /*
          * The process_connection hooks should set the appropriate connection
          * state upon return, for event MPM to either:
@@ -1885,6 +1926,15 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
     process_lingering_close(cs);
 }
 
+static struct user_wait *make_user_wait(event_conn_state_t *cs,
+                                              apr_pool_t *p,
+                                              const apr_array_header_t *user_pfds,
+                                              apr_interval_time_t timeout);
+static apr_status_t arm_user_wait(event_conn_state_t *cs,
+                                  struct user_wait *user_wait);
+static void arm_pending_wait(event_conn_state_t *cs);
+static void run_user_continuation(event_conn_state_t *cs);
+
 static apr_status_t user_wait_cleanup(void *data)
 {
     struct user_wait *user_wait = data;
@@ -1924,11 +1974,7 @@ static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
                                          apr_interval_time_t timeout)
 {
     event_conn_state_t *cs = c->suspended_baton;
-    apr_status_t rc, final_rc = APR_SUCCESS;
     struct user_wait *user_wait;
-    apr_array_header_t *pfds;
-    listener_poll_type *pt;
-    int i;
 
     AP_DEBUG_ASSERT(cs != NULL);
     AP_DEBUG_ASSERT(cs->suspended);
@@ -1948,13 +1994,41 @@ static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
                 "event_poll_suspended: no poll FDs");
         return APR_EINVAL;
     }
- 
-    cs->pub.state = CONN_STATE_SUSPENDED;
-    cs->user_wait = user_wait = apr_pcalloc(p, sizeof(*user_wait));
+
+    user_wait = make_user_wait(cs, p, user_pfds, timeout);
+    return arm_user_wait(cs, user_wait);
+}
+
+/* A wait of a SUSPENDED connection, to be armed by arm_user_wait() */
+static struct user_wait *make_user_wait(event_conn_state_t *cs,
+                                              apr_pool_t *p,
+                                              const apr_array_header_t *user_pfds,
+                                              apr_interval_time_t timeout)
+{
+    struct user_wait *user_wait;
+
+    user_wait = apr_pcalloc(p, sizeof(*user_wait));
     apr_thread_mutex_create(&user_wait->mutex, APR_THREAD_MUTEX_DEFAULT, p);
-    user_wait->pfds = pfds = apr_array_copy(p, user_pfds);
+    user_wait->pfds = apr_array_copy(p, user_pfds);
     user_wait->pool = p;
     user_wait->cs = cs;
+    user_wait->timeout = timeout;
+    return user_wait;
+}
+
+/* Put the user pollfds of a wait into the listener pollset, with its timer */
+static apr_status_t arm_user_wait(event_conn_state_t *cs,
+                                  struct user_wait *user_wait)
+{
+    apr_pool_t *p = user_wait->pool;
+    apr_array_header_t *pfds = user_wait->pfds;
+    apr_interval_time_t timeout = user_wait->timeout;
+    apr_status_t rc, final_rc = APR_SUCCESS;
+    listener_poll_type *pt;
+    int i;
+
+    cs->pub.state = CONN_STATE_SUSPENDED;
+    cs->user_wait = user_wait;
 
     apr_pool_pre_cleanup_register(p, user_wait, user_wait_cleanup);
 
@@ -1976,7 +2050,8 @@ static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
      */
     apr_thread_mutex_lock(user_wait->mutex);
     for (i = 0; i < pfds->nelts; i++) {
-        apr_pollfd_t *pfd = (apr_pollfd_t *)pfds->elts + i;
+        apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
+        pfd->rtnevents = 0;
         if (pfd->reqevents) {
             if (pfd->reqevents & APR_POLLIN) {
                 pfd->reqevents |= APR_POLLHUP;
@@ -2002,7 +2077,94 @@ static apr_status_t event_poll_suspended(conn_rec *c, apr_pool_t *p,
     return final_rc;
 }
 
+/* Suspend a request until some pfds are ready (ap_mpm_register_wait()). The
+ * wait is armed once no thread runs the connection anymore, i.e. when the
+ * handler has returned SUSPENDED (enter_suspended()) or when the continuation
+ * of a previous wait has returned (process_socket()).
+ */
+static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
+                                       const apr_array_header_t *pfds,
+                                       apr_interval_time_t timeout,
+                                       ap_mpm_continuation_fn_t *fn, void *baton)
+{
+    event_conn_state_t *cs;
+    struct user_wait *user_wait;
+
+    if (c->master) {
+        return APR_ENOTIMPL; /* secondary connections not handled (yet) */
+    }
+    cs = ap_get_module_config(c->conn_config, &mpm_event_module);
+    if (!cs) {
+        return APR_ENOTIMPL; /* not a connection of this MPM */
+    }
+    if (!fn || !pfds || pfds->nelts <= 0) {
+        return APR_EINVAL;
+    }
+    if (cs->pending_wait || (cs->suspended && !cs->in_continuation)) {
+        /* One wait at a time, and not from another thread */
+        return APR_EBUSY;
+    }
+
+    user_wait = make_user_wait(cs, p, pfds, timeout);
+    user_wait->fn = fn;
+    user_wait->fn_baton = baton;
+    cs->pending_wait = user_wait;
+    return APR_SUCCESS;
+}
+
+/* Arm the pending wait of a connection, or run its continuation with
+ * AP_MPM_WAIT_ERROR if that fails.
+ */
+static void arm_pending_wait(event_conn_state_t *cs)
+{
+    struct user_wait *user_wait = cs->pending_wait;
+    apr_status_t rc;
+
+    cs->pending_wait = NULL;
+    rc = arm_user_wait(cs, user_wait);
+    if (rc == APR_SUCCESS) {
+        return;
+    }
+    {
+        static log_ratelimit_t rl;
+        if (LOG_RATELIMIT(&rl, APLOG_ERR, 1, NULL, cs->c)) {
+            ap_log_cerror(APLOG_MARK, APLOG_ERR, rc, cs->c, APLOGNO()
+                          "suspended connection: can't wait for its pollfds");
+        }
+    }
+    if (cs->te) {
+        cs->te->canceled = 1;
+        cs->te = NULL;
+    }
+    apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
+    cs->user_wait = NULL;
+    cs->resume_fn = user_wait->fn;
+    cs->resume_baton = user_wait->fn_baton;
+    cs->resume_pfds = user_wait->pfds;
+    cs->resume_why = AP_MPM_WAIT_ERROR;
+    run_user_continuation(cs);
+}
+
 /* Put a SUSPENDED connection back into a queue. */
+static void leave_suspended(event_conn_state_t *cs)
+{
+    apr_atomic_dec32(&suspended_count);
+    cs->c->suspended_baton = NULL;
+    cs->c->sbh = cs->sbh;
+    cs->suspended = 0;
+
+    cs->pub.sense = CONN_SENSE_DEFAULT;
+    if (cs->pub.state != CONN_STATE_LINGER) {
+        cs->pub.state = CONN_STATE_WRITE_COMPLETION;
+        if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
+            return; /* queued */
+        }
+        /* fall through lingering close on error */
+        cs->pub.state = CONN_STATE_LINGER;
+    }
+    process_lingering_close(cs);
+}
+
 static apr_status_t event_resume_suspended(conn_rec *c)
 {
     event_conn_state_t *cs = c->suspended_baton;
@@ -2019,22 +2181,54 @@ static apr_status_t event_resume_suspended(conn_rec *c)
                 "event_resume_suspended: thread isn't suspended");
         return APR_EINVAL;
     }
-    apr_atomic_dec32(&suspended_count);
-    cs->c->suspended_baton = NULL;
-    cs->c->sbh = cs->sbh;
-    cs->suspended = 0;
-
-    cs->pub.sense = CONN_SENSE_DEFAULT;
-    if (cs->pub.state != CONN_STATE_LINGER) {
-        cs->pub.state = CONN_STATE_WRITE_COMPLETION;
-        if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
-            return APR_SUCCESS; /* queued */
-        }
-        /* fall through lingering close on error */
-        cs->pub.state = CONN_STATE_LINGER;
+    if (cs->in_continuation) {
+        /* Called from a continuation: resume the connection when the
+         * continuation returns (process_socket()), since the connection must
+         * not be queued while this thread still runs it.
+         */
+        cs->continuation_pending = 1;
+        return APR_SUCCESS;
     }
-    process_lingering_close(cs);
+    leave_suspended(cs);
     return APR_SUCCESS;
+}
+
+/* Run the continuation of a resumed wait (on a worker thread), then arm the
+ * next wait or resume the connection, as the continuation asked.
+ */
+static void run_user_continuation(event_conn_state_t *cs)
+{
+    ap_mpm_continuation_fn_t *fn = cs->resume_fn;
+    void *baton = cs->resume_baton;
+    apr_array_header_t *pfds = cs->resume_pfds;
+    ap_mpm_wait_result_e why = cs->resume_why;
+
+    cs->resume_fn = NULL;
+    cs->resume_baton = NULL;
+    cs->resume_pfds = NULL;
+    cs->continuation_pending = 0;
+
+    cs->in_continuation = 1;
+    fn(cs->c, cs->r, why, pfds, baton);
+    cs->in_continuation = 0;
+
+    if (cs->pending_wait) {
+        cs->continuation_pending = 0;
+        arm_pending_wait(cs);
+    }
+    else if (cs->continuation_pending) {
+        cs->continuation_pending = 0;
+        leave_suspended(cs);
+    }
+    else {
+        /* The continuation neither waits again nor gives the connection
+         * back: close it.
+         */
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, cs->c, APLOGNO()
+                      "suspended connection abandoned by its continuation");
+        cs->pub.state = CONN_STATE_LINGER;
+        leave_suspended(cs);
+    }
 }
 
 /* conns_this_child has gone to zero or below.  See if the admin coded
@@ -2791,6 +2985,17 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                         continue;
                     }
 
+                    /* The continuation to run, if any (ap_mpm_register_wait()),
+                     * which decides what to do with the connection.
+                     */
+                    if (cs->user_wait->fn) {
+                        cs->timed_out = 0;
+                        cs->resume_fn = cs->user_wait->fn;
+                        cs->resume_baton = cs->user_wait->fn_baton;
+                        cs->resume_pfds = cs->user_wait->pfds;
+                        cs->resume_why = AP_MPM_WAIT_TIMEOUT;
+                    }
+
                     /* Remove all user pollfds from the pollset */
                     AP_DEBUG_ASSERT(cs->user_wait->pfds != NULL);
                     apr_pool_cleanup_run(cs->user_wait->pool, cs->user_wait,
@@ -2801,7 +3006,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     cs->user_wait = NULL;
 
                     AP_DEBUG_ASSERT(cs->suspended);
-                    cs->pub.state = CONN_STATE_LINGER;
+                    if (!cs->resume_fn) {
+                        cs->pub.state = CONN_STATE_LINGER;
+                    }
                 }
                 else {
                     cs = NULL;
@@ -3044,6 +3251,20 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     user_wait->next = user_chain;
                     user_chain = user_wait;
                 }
+                if (user_wait->fn) {
+                    /* Tell the continuation which pfds are ready */
+                    apr_array_header_t *pfds = user_wait->pfds;
+                    int i;
+                    for (i = 0; i < pfds->nelts; i++) {
+                        apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
+                        if (pfd->desc_type == out_pfd->desc_type
+                            && (pfd->desc_type == APR_POLL_SOCKET
+                                ? pfd->desc.s == out_pfd->desc.s
+                                : pfd->desc.f == out_pfd->desc.f)) {
+                            pfd->rtnevents |= out_pfd->rtnevents;
+                        }
+                    }
+                }
                 break;
             }
         } /* for processing poll */
@@ -3068,12 +3289,21 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 cs->te = NULL;
             }
 
+            /* The continuation to run, if any (ap_mpm_register_wait()) */
+            if (user_wait->fn) {
+                cs->resume_fn = user_wait->fn;
+                cs->resume_baton = user_wait->fn_baton;
+                cs->resume_pfds = user_wait->pfds;
+                cs->resume_why = AP_MPM_WAIT_READY;
+            }
+
             /* Remove all user pollfds from the pollset */
             apr_pool_cleanup_run(user_wait->pool, user_wait,
                                  user_wait_cleanup);
 #ifdef AP_DEBUG
             memset(user_wait, 0, sizeof(*user_wait));
 #endif
+            cs->user_wait = NULL;
 
             /* Schedule ap_run_resume_connection() */
             push2worker(cs, NULL, now, &above_limit);
@@ -5268,6 +5498,7 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_poll_suspended(event_poll_suspended, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_register_wait(event_register_wait, NULL, NULL, APR_HOOK_MIDDLE);
 
     ap_hook_pre_connection(event_pre_connection, NULL, NULL, APR_HOOK_REALLY_FIRST);
     ap_hook_protocol_switch(event_protocol_switch, NULL, NULL, APR_HOOK_REALLY_FIRST);

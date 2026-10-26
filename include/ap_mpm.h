@@ -185,6 +185,8 @@ AP_DECLARE(apr_status_t) ap_os_create_privileged_process(
 #define AP_MPMQ_CAN_WAITIO           19
 /** MPM implements the poll_suspended hook */
 #define AP_MPMQ_CAN_POLL_SUSPENDED   20
+/** MPM implements the suspend_wait hook */
+#define AP_MPMQ_CAN_REGISTER_WAIT     21
 /** @} */
 
 /**
@@ -210,6 +212,57 @@ AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c);
 AP_DECLARE(apr_status_t) ap_mpm_poll_suspended(conn_rec *c, apr_pool_t *p,
                                                const apr_array_header_t *pfds,
                                                apr_interval_time_t timeout);
+/** Why a suspended request is resumed by the MPM (ap_mpm_register_wait()) */
+typedef enum {
+    AP_MPM_WAIT_READY,    /**< Some of the pfds are ready (their rtnevents set) */
+    AP_MPM_WAIT_TIMEOUT,  /**< The wait timed out */
+    AP_MPM_WAIT_ERROR     /**< The MPM could not wait (e.g. pollset failure) */
+} ap_mpm_wait_result_e;
+
+/**
+ * The continuation of a suspended request, called by the MPM on a worker
+ * thread when the wait registered by ap_mpm_register_wait() completes.
+ * @param c The suspended connection
+ * @param r The suspended request, or NULL
+ * @param why The result of the wait
+ * @param pfds The pfds of the wait, with their rtnevents set for
+ * AP_MPM_WAIT_READY
+ * @param baton The baton given to ap_mpm_register_wait()
+ * @remark The callback either registers a wait again
+ * (ap_mpm_register_wait()), or gives the connection back to the MPM
+ * (ap_mpm_resume_suspended()), and must not touch @a c or @a r after that.
+ */
+typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
+                                        ap_mpm_wait_result_e why,
+                                        const apr_array_header_t *pfds,
+                                        void *baton);
+
+/**
+ * Suspend the processing of a request until some pfds are ready, or a timeout.
+ * @param c The connection
+ * @param p The pool to allocate the wait from; the pfds are removed from the
+ * MPM when this pool is cleared or destroyed
+ * @param pfds The apr_pollfd_t to wait for (their client_data is used by the MPM)
+ * @param timeout The timeout of the wait, or -1 for none
+ * @param fn The continuation called by the MPM when the wait completes
+ * @param baton The baton passed to @a fn
+ * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
+ * AP_MPMQ_CAN_REGISTER_WAIT) or the connection isn't handled by the MPM,
+ * or an error.
+ * @remark It can be called from a handler (which then returns SUSPENDED), or
+ * from the continuation of a previous wait. Either way the MPM arms the
+ * wait once no thread is processing the connection anymore, so @a fn can't
+ * run concurrently with the caller.
+ * @remark The wait completes when any of @a pfds is ready (the first to
+ * fire), not all of them: the continuation tells which from their
+ * rtnevents, and can register a wait again for the others.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
+                                             const apr_array_header_t *pfds,
+                                             apr_interval_time_t timeout,
+                                             ap_mpm_continuation_fn_t *fn,
+                                             void *baton);
+
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(
         apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton);

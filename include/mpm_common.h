@@ -449,6 +449,14 @@ AP_DECLARE_HOOK(apr_status_t, mpm_poll_suspended,
  */
 AP_DECLARE_HOOK(apr_status_t, mpm_resume_suspended, (conn_rec*))
 
+/** Suspend a request until some pfds are ready (see ap_mpm_register_wait())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
+                (conn_rec *c, apr_pool_t *p, const apr_array_header_t *pfds,
+                 apr_interval_time_t timeout, ap_mpm_continuation_fn_t *fn,
+                 void *baton))
+
 /**
  * Get MPM name (e.g., "prefork" or "event")
  * @ingroup hooks

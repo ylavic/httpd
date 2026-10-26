@@ -24,6 +24,7 @@
 module AP_MODULE_DECLARE_DATA proxy_http_module;
 
 static int mpm_can_poll_suspended = 0;
+static int mpm_can_wait = 0;
 
 static int (*ap_proxy_clear_connection_fn)(request_rec *r, apr_table_t *headers) =
         NULL;
@@ -454,6 +455,131 @@ static void proxy_http_suspend_connection(conn_rec *c, request_rec *r)
     ap_assert(req->r == r);
 
     proxy_http_async_poll(req);
+}
+
+static int ap_proxy_http_process_response(proxy_http_req_t *req);
+
+/* The continuation of proxy_http_response_head_wait(), called when the
+ * backend's response is available (or on timeout or error): process it and
+ * finish the request.
+ */
+static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
+                                                  ap_mpm_wait_result_e why,
+                                                  const apr_array_header_t *pfds,
+                                                  void *baton)
+{
+    proxy_http_req_t *req = baton;
+    proxy_conn_rec *backend = req->backend;
+    int status;
+
+    AP_DEBUG_ASSERT(req->r == r);
+    switch (why) {
+    case AP_MPM_WAIT_READY:
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                      "proxy %s: response ready (async)", req->proto);
+        status = ap_proxy_http_process_response(req);
+        break;
+    case AP_MPM_WAIT_TIMEOUT:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: timeout waiting for the response of "
+                      "%s:%d (async)", req->proto,
+                      backend->hostname, backend->port);
+        apr_table_setn(r->notes, "proxy_timedout", "1");
+        status = HTTP_GATEWAY_TIME_OUT;
+        break;
+    default:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: can't wait for the response of %s:%d "
+                      "(async, %i)", req->proto,
+                      backend->hostname, backend->port, (int)why);
+        status = HTTP_BAD_GATEWAY;
+        break;
+    }
+    /* No upgrade (tunnel) on this path, see proxy_http_handler() */
+    AP_DEBUG_ASSERT(status != SUSPENDED);
+
+    /* Release the backend, which proxy_http_handler() didn't since it
+     * returned SUSPENDED, unless ap_proxy_http_process_response() already
+     * did (then req->backend is NULL).
+     */
+    if (req->backend) {
+        proxy_run_detach_backend(r, req->backend);
+        if (status != OK) {
+            req->backend->close = 1;
+        }
+        ap_proxy_release_connection(req->proto, req->backend, r->server);
+        req->backend = NULL;
+    }
+    if (req->async_pool) {
+        apr_pool_destroy(req->async_pool);
+        req->async_pool = NULL;
+    }
+
+    /* Finish the request, as ap_process_async_request() does */
+    if (status != OK && status != DONE) {
+        r->status = HTTP_OK;
+    }
+    ap_die(status, r);
+    ap_process_request_after_handler(r);
+    /* don't dereference req or r from here! */
+
+    /* Give the client connection back to the MPM */
+    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
+        c->cs->state = CONN_STATE_LINGER;
+    }
+    else {
+        c->cs->state = CONN_STATE_WRITE_COMPLETION;
+    }
+    ap_mpm_resume_suspended(c);
+}
+
+/* Wait for the backend's response without holding the thread: synchronously
+ * for ProxyAsyncDelay, then in the MPM (ap_mpm_register_wait()).
+ * Returns OK if the response can be read now, or SUSPENDED if it's waited for
+ * asynchronously (proxy_http_response_head_continuation() is called then).
+ */
+static int proxy_http_response_head_wait(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    proxy_conn_rec *backend = req->backend;
+    apr_array_header_t *pfds;
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+    apr_status_t rv;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = backend->sock;
+    pfd.reqevents = APR_POLLIN;
+    rv = apr_poll(&pfd, 1, &nready, req->dconf->async_delay);
+    if (!APR_STATUS_IS_TIMEUP(rv)) {
+        /* Readable, or an error the (blocking) read will report */
+        return OK;
+    }
+
+    if (req->async_pool) {
+        apr_pool_clear(req->async_pool);
+    }
+    else {
+        apr_pool_create(&req->async_pool, req->p);
+    }
+    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
+    pfd.p = req->async_pool;
+    *(apr_pollfd_t *)apr_array_push(pfds) = pfd;
+    rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
+                             req->idle_timeout, proxy_http_response_head_continuation,
+                             req);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy %s: can't wait for the response asynchronously",
+                      req->proto);
+        return OK; /* the caller waits synchronously */
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: waiting for the response (async)", req->proto);
+    return SUSPENDED;
 }
 
 static int stream_reqbody(proxy_http_req_t *req)
@@ -1142,6 +1268,11 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                     return ap_proxyerror(r, HTTP_SERVICE_UNAVAILABLE,
                                          "Timeout on 100-Continue");
                 }
+                /* A gateway timeout, as when waiting asynchronously
+                 * (proxy_http_response_head_continuation()).
+                 */
+                return ap_proxyerror(r, HTTP_GATEWAY_TIME_OUT,
+                                     "Timeout reading from remote server");
             }
             /*
              * If we are a reverse proxy request shutdown the connection
@@ -1962,7 +2093,7 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
     req->backend = backend;
     req->proto = scheme;
     req->bucket_alloc = c->bucket_alloc;
-    req->can_suspend = (mpm_can_poll_suspended &&
+    req->can_suspend = (mpm_can_wait &&
                         dconf->async_delay_set &&
                         dconf->async_delay >= 0);
     req->rb_method = RB_INIT;
@@ -2145,6 +2276,16 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
         }
 
         /* Step Five: Receive the Response... Fall thru to cleanup */
+        if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
+            /* Don't hold the thread while the backend processes the request
+             * (except for upgrades, whose tunnel path uses the hooks, and for
+             * 100-continue's ping).
+             */
+            status = proxy_http_response_head_wait(req);
+            if (status == SUSPENDED) {
+                return SUSPENDED;
+            }
+        }
         status = ap_proxy_http_process_response(req);
         if (status == SUSPENDED) {
             return SUSPENDED;
@@ -2179,6 +2320,11 @@ static int proxy_http_post_config(apr_pool_t *pconf, apr_pool_t *plog,
 #ifdef AP_MPMQ_CAN_POLL_SUSPENDED
     if (ap_mpm_query(AP_MPMQ_CAN_POLL_SUSPENDED, &mpm_can_poll_suspended)) {
         mpm_can_poll_suspended = 0;
+    }
+#endif
+#ifdef AP_MPMQ_CAN_REGISTER_WAIT
+    if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &mpm_can_wait)) {
+        mpm_can_wait = 0;
     }
 #endif
 
