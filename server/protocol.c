@@ -2354,21 +2354,24 @@ AP_DECLARE(void) ap_set_std_response_headers(request_rec *r)
         apr_table_setn(r->headers_out, "Server", server);
 }
 
-AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers)
+AP_DECLARE(apr_status_t) ap_send_interim_response_ex(request_rec *r,
+                                                     int send_headers,
+                                                     unsigned int flags)
 {
     request_rec *rr;
     apr_bucket *b;
     apr_bucket_brigade *bb;
     const char *reason = NULL;
+    apr_status_t rv;
 
     if (r->proto_num < HTTP_VERSION(1,1)) {
         /* don't send interim response to HTTP/1.0 Client */
-        return;
+        return APR_SUCCESS;
     }
     if (!ap_is_HTTP_INFO(r->status)) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00575)
                       "Status is %d - not sending interim response", r->status);
-        return;
+        return APR_SUCCESS;
     }
     if (r->status == HTTP_CONTINUE) {
         if (!r->expecting_100) {
@@ -2377,7 +2380,7 @@ AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers)
              * in the request headers. For origin servers this is a SHOULD NOT
              * for proxies it is a MUST NOT according to RFC 2616 8.2.3
              */
-            return;
+            return APR_SUCCESS;
         }
 
         /* if we send an interim response, we're no longer in a state of
@@ -2410,10 +2413,26 @@ AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers)
     if (send_headers) {
         apr_table_clear(r->headers_out);
     }
-    b = apr_bucket_flush_create(r->connection->bucket_alloc);
+    if (flags & AP_SEND_INTERIM_NONBLOCK) {
+        b = ap_bucket_wc_create(r->connection->bucket_alloc);
+    }
+    else {
+        b = apr_bucket_flush_create(r->connection->bucket_alloc);
+    }
     APR_BRIGADE_INSERT_TAIL(bb, b);
-    ap_pass_brigade(r->proto_output_filters, bb);
+    rv = ap_pass_brigade(r->proto_output_filters, bb);
     apr_brigade_destroy(bb);
+
+    if (rv == APR_SUCCESS && (flags & AP_SEND_INTERIM_NONBLOCK)
+        && ap_filter_should_yield(r->connection->output_filters)) {
+        rv = APR_EAGAIN;
+    }
+    return rv;
+}
+
+AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers)
+{
+    (void)ap_send_interim_response_ex(r, send_headers, 0);
 }
 
 /*

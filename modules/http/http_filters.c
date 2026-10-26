@@ -336,15 +336,17 @@ apr_status_t ap_http_filter(ap_filter_t *f, apr_bucket_brigade *b,
      * If the read is to be nonblocking though, the caller may not want to
      * handle this just now (e.g. mod_proxy_http), and is prepared to read
      * nothing if the client really waits for 100 continue, so we don't
-     * send it now and wait for later blocking read.
+     * send it now and wait for later blocking read. Unless the caller says
+     * so with AP_EXPECT_100_NONBLOCK, then we send it without blocking.
      *
      * In any case, even if r->expecting remains set at the end of the
      * request handling, ap_set_keepalive() will finally do the right
      * thing (i.e. "Connection: close" the connection).
      */
-    if (block == APR_BLOCK_READ
-            && r->expecting_100 && r->proto_num >= HTTP_VERSION(1,1)
-            && !(ctx->at_eos || r->eos_sent || r->bytes_sent)) {
+    if ((block == APR_BLOCK_READ
+         || (r->expecting_100 & AP_EXPECT_100_NONBLOCK))
+        && r->expecting_100 && r->proto_num >= HTTP_VERSION(1,1)
+        && !(ctx->at_eos || r->eos_sent || r->bytes_sent)) {
         if (!ap_is_HTTP_SUCCESS(r->status)) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                           "ap_http_in_filter: status != OK, not sending 100-continue");
@@ -357,10 +359,18 @@ apr_status_t ap_http_filter(ap_filter_t *f, apr_bucket_brigade *b,
                           "ap_http_in_filter: sending 100-continue");
             r->status = HTTP_CONTINUE;
             r->status_line = NULL;
-            ap_send_interim_response(r, 0);
+            rv = ap_send_interim_response_ex(r, 0,
+                                             (block == APR_BLOCK_READ)
+                                             ? 0 : AP_SEND_INTERIM_NONBLOCK);
             AP_DEBUG_ASSERT(!r->expecting_100);
             r->status_line = saved_status_line;
             r->status = saved_status;
+            if (APR_STATUS_IS_EAGAIN(rv)) {
+                /* Nonblocking: the 100 is pending, nothing to read before
+                 * the client gets it (see AP_EXPECT_100_NONBLOCK).
+                 */
+                return APR_EAGAIN;
+            }
         }
         else {
             /* https://tools.ietf.org/html/rfc7231#section-5.1.1

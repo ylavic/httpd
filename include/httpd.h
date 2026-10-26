@@ -772,6 +772,19 @@ typedef apr_uint64_t ap_request_bnotes_t;
 /** @} // values_request_rec_body */
 
 /**
+ * request_rec.expecting_100 flag, only while it is set (the client waits for
+ * a 100 Continue): HTTP_IN may send the 100 on a nonblocking read too (by
+ * default only on a blocking read, for readers not ready for it yet such as
+ * mod_proxy_http before the backend agrees). Set around the reads that allow
+ * it; sending the 100 resets expecting_100 to 0 (flag included). If (some of)
+ * the 100 can't be written without blocking, the read returns APR_EAGAIN with
+ * the 100 pending in the connection's output filters: the reader must wait
+ * for the connection to be writable (ap_check_output_pending()) before
+ * waiting for the client to send its body.
+ */
+#define AP_EXPECT_100_NONBLOCK   0x2
+
+/**
  * @defgroup values_request_rec_used_path_info Possible values for request_rec.used_path_info
  * @ingroup APACHE_CORE_DAEMON
  * @{
@@ -970,7 +983,8 @@ struct request_rec {
     int read_body;
     /** reading chunked transfer-coding */
     int read_chunked;
-    /** is client waiting for a 100 response? */
+    /** is client waiting for a 100 response? (non-zero if so, possibly
+     *  with AP_EXPECT_100_NONBLOCK) */
     unsigned expecting_100;
     /** The optional kept body of the request. */
     apr_bucket_brigade *kept_body;

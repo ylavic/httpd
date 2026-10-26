@@ -1428,6 +1428,28 @@ AP_DECLARE(void) ap_set_std_response_headers(request_rec *r);
  */
 AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers);
 
+/** ap_send_interim_response_ex() flag: don't block writing the response */
+#define AP_SEND_INTERIM_NONBLOCK (1u << 0)
+
+/**
+ * Send an interim (HTTP 1xx) response, with flags.
+ * @param r The request
+ * @param send_headers Whether to send&clear headers in r->headers_out
+ * @param flags AP_SEND_INTERIM_* flags (0 for ap_send_interim_response())
+ * @return APR_SUCCESS if sent (or nothing to send), APR_EAGAIN with
+ * AP_SEND_INTERIM_NONBLOCK if (some of) the response is pending in the
+ * connection's output filters, or an error.
+ * @remark With AP_SEND_INTERIM_NONBLOCK, the response is passed with a WC
+ * (write completion) bucket instead of a FLUSH: the core writes what it can
+ * without blocking and sets aside the rest. On APR_EAGAIN, the caller must
+ * get it written (ap_check_output_pending() when the connection is writable)
+ * before waiting for the client, which may wait for this response (e.g. a 100
+ * Continue).
+ */
+AP_DECLARE(apr_status_t) ap_send_interim_response_ex(request_rec *r,
+                                                     int send_headers,
+                                                     unsigned int flags);
+
 /**
  * Append a header in HTTP/1.1 format to the brigade.
  * @param b the brigade to append to
