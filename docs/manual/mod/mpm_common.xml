@@ -429,7 +429,7 @@ in *BSDs.</compatibility>
 <name>MaxRequestWorkers</name>
 <description>Maximum number of connections that will be processed
 simultaneously</description>
-<syntax>MaxRequestWorkers <var>number</var></syntax>
+<syntax>MaxRequestWorkers <var>number</var> [auto]</syntax>
 <default>See usage for details</default>
 <contextlist><context>server config</context></contextlist>
 <modulelist><module>event</module><module>worker</module>
@@ -481,6 +481,55 @@ simultaneously</description>
     ThreadsPerChild of 25, decreasing to nearest multiple 75, for a
     maximum of 3 servers.
     </example>
+
+    <p>With <module>event</module> (available in Apache HTTP Server 2.5.1
+    and later), the <code>auto</code> argument derives the other process
+    and thread settings from <directive>MaxRequestWorkers</directive>,
+    adjusting them silently rather than warning:</p>
+    <ul>
+      <li><directive module="mpm_common">ThreadsPerChild</directive>, when
+      not set, is the number of CPUs the server can run on (its CPU
+      affinity where the system tells, e.g. taskset or cpusets, else the
+      online CPUs), doubled as long as the child processes would
+      outnumber the threads per child by more than 32 times (a large
+      <directive>MaxRequestWorkers</directive> on a few CPUs gets more
+      threads per child rather than a lot of processes). CPU quotas
+      (e.g. a container's) are not taken into account: set
+      <directive module="mpm_common">ThreadsPerChild</directive> explicitly
+      in that case.</li>
+      <li><directive>MaxRequestWorkers</directive> is rounded down to a
+      multiple of <directive module="mpm_common">ThreadsPerChild</directive>
+      times the number of listeners buckets (see <directive
+      module="mpm_common">ListenCoresBucketsRatio</directive>).</li>
+      <li><directive module="mpm_common">ThreadLimit</directive> and
+      <directive module="mpm_common">ServerLimit</directive> are raised as
+      needed, with room for the children of a graceful restart (four times
+      the number of processes, unless set higher).</li>
+      <li><directive module="mpm_common">StartServers</directive>,
+      <directive module="mpm_common">MinSpareThreads</directive> and
+      <directive module="mpm_common">MaxSpareThreads</directive> are
+      rounded to whole processes, and default to one process per bucket,
+      the threads of the started processes, and 75% of
+      <directive>MaxRequestWorkers</directive> respectively.</li>
+    </ul>
+    <p>Any of these directives can still be set: the explicit values are
+    used as the base for the others. For instance, with the server
+    restricted to 4 CPUs:</p>
+
+    <example><title>Example</title>
+    <highlight language="config">
+MaxRequestWorkers 400 auto
+ThreadsPerChild 4
+    </highlight>
+    </example>
+
+    <p>gives 4 threads per child, and up to 100 child processes.</p>
+
+    <p>With <module>event</module>, the threads don't bound the number of
+    connections a child handles (see <directive module="event"
+    >AsyncRequestWorkerFactor</directive>), so a few threads per CPU are
+    enough unless the requests block (e.g. with modules handling the
+    requests synchronously).</p>
 
     <p><directive>MaxRequestWorkers</directive> was called
     <directive>MaxClients</directive> before version 2.3.13. The old name is still
