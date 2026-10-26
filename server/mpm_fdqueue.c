@@ -557,7 +557,8 @@ static void push_elem(fd_queue_t *queue, fd_queue_elem_t **pushed_elem,
  * terminated: APR_EOF (terminated) or APR_EINTR (interrupted) only when it's
  * empty, so that nothing queued is lost.
  */
-static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem)
+static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem,
+                             int block)
 {
     apr_status_t rv;
 
@@ -575,6 +576,10 @@ static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem)
         if (queue->interrupted) {
             queue->interrupted--;
             return APR_EINTR;
+        }
+
+        if (!block) {
+            return APR_EAGAIN;
         }
 
         queue->num_waiters++;
@@ -618,8 +623,8 @@ AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
     return rv;
 }
 
-AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
-                                            ap_queue_event_t **pevent)
+static apr_status_t pop_event(fd_queue_t *queue, ap_queue_event_t **pevent,
+                              int block)
 {
     apr_status_t rv;
     fd_queue_elem_t *elem;
@@ -630,7 +635,7 @@ AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
         return rv;
     }
 
-    rv = pop_elem(queue, &elem);
+    rv = pop_elem(queue, &elem, block);
     if (rv == APR_SUCCESS) {
         ap_queue_event_t *event = elem->event;
         ap_assert(event && event != &elem->self_event);
@@ -643,6 +648,18 @@ AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
 
     queue_unlock(queue);
     return rv;
+}
+
+AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
+                                            ap_queue_event_t **pevent)
+{
+    return pop_event(queue, pevent, 1);
+}
+
+AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
+                                               ap_queue_event_t **pevent)
+{
+    return pop_event(queue, pevent, 0);
 }
 
 AP_DECLARE(void) ap_queue_kill_event_locked(fd_queue_t *queue,
@@ -716,7 +733,7 @@ AP_DECLARE(apr_status_t) ap_queue_pop_socket(fd_queue_t *queue, apr_socket_t **p
         return rv;
     }
 
-    rv = pop_elem(queue, &elem);
+    rv = pop_elem(queue, &elem, 1);
     if (rv == APR_SUCCESS) {
         ap_queue_event_t *event = elem->event;
         ap_assert(event && event == &elem->self_event);
@@ -748,7 +765,7 @@ static apr_status_t queue_interrupt(fd_queue_t *queue, int all, int term)
      * would-be popper checks it but right before they block
      *
      * An interrupt is consumed by the next pop finding the queue empty,
-     * whoever does it (a waiting popper or not),
+     * whoever does it (a waiting popper or not, ap_queue_trypop_event() too),
      * and ap_queue_interrupt_one() calls coalesce until then: the callers
      * must not count on a given thread getting it, only on some pop seeing
      * it (or popping what's queued meanwhile).

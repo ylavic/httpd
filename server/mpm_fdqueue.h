@@ -144,6 +144,9 @@ AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
                                              unsigned int flags);
 AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
                                             ap_queue_event_t **pevent);
+/* Like ap_queue_pop_event() but APR_EAGAIN instead of waiting when empty */
+AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
+                                               ap_queue_event_t **pevent);
 AP_DECLARE(apr_status_t) ap_queue_lock(fd_queue_t *queue);
 AP_DECLARE(void) ap_queue_kill_event_locked(fd_queue_t *queue,
                                             ap_queue_event_t *event);
