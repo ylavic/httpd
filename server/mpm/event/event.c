@@ -349,6 +349,17 @@ struct backlog_timer_event {
 #define te_qe(te) (&((struct backlog_timer_event *)(te))->qe)
 #define te_in_backlog(te) (te_qe(te)->cb != NULL)
 
+/* A module's continuation (ap_mpm_register_wait()) and its arguments:
+ * fn and baton as registered (user_wait->continuation), pfds and why once its
+ * wait fired (cs->continuation, see run_user_continuation()).
+ */
+struct user_continuation {
+    ap_mpm_continuation_fn_t *fn;
+    void *baton;
+    apr_array_header_t *pfds;
+    ap_mpm_wait_result_e why;
+};
+
 typedef struct event_conn_state_t event_conn_state_t;
 struct event_conn_state_t {
     /** APR_RING of expiration timeouts */
@@ -390,11 +401,8 @@ struct event_conn_state_t {
      *  fired event's pfd/pt/wait stay valid as long as the connection;
      *  user_wait/pending_wait point to it */
     struct user_wait *wait;
-    /** the continuation to run on resume, and its arguments */
-    ap_mpm_continuation_fn_t *resume_fn;
-    void *resume_baton;
-    apr_array_header_t *resume_pfds;
-    ap_mpm_wait_result_e resume_why;
+    /** the continuation to run (continuation.fn set), once its wait fired */
+    struct user_continuation continuation;
 
     /*
      * when queued to workers
@@ -420,9 +428,9 @@ struct event_conn_state_t {
         suspended       :1,
         /** Did the connection timed out? */
         timed_out       :1,
-        /** Is a continuation (resume_fn) running? */
+        /** Is a continuation (continuation.fn) running? */
         in_continuation :1,
-        /** Did the running continuation ask to resume the conn? */
+        /** Did the running continuation give the conn back? */
         continuation_pending :1,
         /** Has ap_start_lingering_close() been called? */
         linger_started  :1,
@@ -701,8 +709,7 @@ struct user_wait {
     struct user_wait *next; /* chaining */
     int chained; /* in the listener's user_chain (next may be NULL there) */
     apr_interval_time_t timeout; /* the timeout to arm with */
-    ap_mpm_continuation_fn_t *fn; /* the continuation (ap_mpm_register_wait()), if any */
-    void *fn_baton;
+    struct user_continuation continuation; /* fn and baton (ap_mpm_register_wait()), if any */
     struct user_watch_wakeup *notifier; /* the wait's notifier, if any */
     int wait_notified; /* resume with AP_MPM_WAIT_NOTIFIED (listener only) */
 };
@@ -2195,7 +2202,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                       "resuming connection %" CS_FMT, CS_ARG(cs));
         take_suspended(cs);
-        if (cs->resume_fn) {
+        if (cs->continuation.fn) {
             /* The continuation of an ap_mpm_register_wait(), which may give
              * the connection back to this thread, this worker busy meanwhile
              * (SERVER_BUSY_WRITE, the handler's status).
@@ -2408,6 +2415,16 @@ static void arm_pending_wait(event_conn_state_t *cs);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 static int claim_user_wait(struct user_wait *user_wait);
 
+/* The continuation to run since the wait fired (claimed), for why */
+static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
+                                             struct user_wait *user_wait,
+                                             ap_mpm_wait_result_e why)
+{
+    cs->continuation = user_wait->continuation;
+    cs->continuation.pfds = user_wait->pfds;
+    cs->continuation.why = why;
+}
+
 /* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
  * nothing remains to remove from event_pollset: not with kqueue, a filter per
  * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
@@ -2520,8 +2537,7 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
     user_wait->timer = NULL;
     user_wait->next = NULL;
     user_wait->chained = 0;
-    user_wait->fn = NULL;
-    user_wait->fn_baton = NULL;
+    memset(&user_wait->continuation, 0, sizeof(user_wait->continuation));
     user_wait->wait_notified = 0;
     user_wait->notifier = notifier;
     return user_wait;
@@ -2709,8 +2725,8 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
         /* Read by event_notify() once armed (under notifiers_mutex) */
         notifier->state.baton = user_wait;
     }
-    user_wait->fn = fn;
-    user_wait->fn_baton = baton;
+    user_wait->continuation.fn = fn;
+    user_wait->continuation.baton = baton;
     cs->pending_wait = user_wait;
     return APR_SUCCESS;
 }
@@ -2740,10 +2756,7 @@ static void arm_pending_wait(event_conn_state_t *cs)
     }
     apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
     cs->user_wait = NULL;
-    cs->resume_fn = user_wait->fn;
-    cs->resume_baton = user_wait->fn_baton;
-    cs->resume_pfds = user_wait->pfds;
-    cs->resume_why = AP_MPM_WAIT_ERROR;
+    set_user_continuation(cs, user_wait, AP_MPM_WAIT_ERROR);
     (void)run_user_continuation(cs, 0);
 }
 
@@ -2815,18 +2828,13 @@ static apr_status_t event_resume_suspended(conn_rec *c)
  */
 static int run_user_continuation(event_conn_state_t *cs, int in_place)
 {
-    ap_mpm_continuation_fn_t *fn = cs->resume_fn;
-    void *baton = cs->resume_baton;
-    apr_array_header_t *pfds = cs->resume_pfds;
-    ap_mpm_wait_result_e why = cs->resume_why;
+    struct user_continuation continuation = cs->continuation;
 
-    cs->resume_fn = NULL;
-    cs->resume_baton = NULL;
-    cs->resume_pfds = NULL;
+    memset(&cs->continuation, 0, sizeof(cs->continuation));
     cs->continuation_pending = 0;
 
     cs->in_continuation = 1;
-    fn(cs->c, cs->r, why, pfds, baton);
+    continuation.fn(cs->c, cs->r, continuation.why, continuation.pfds, continuation.baton);
     cs->in_continuation = 0;
 
     if (cs->pending_wait) {
@@ -2838,8 +2846,14 @@ static int run_user_continuation(event_conn_state_t *cs, int in_place)
             /* The continuation neither registers a wait again nor gives
              * the connection back: close it.
              */
-            ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, cs->c, APLOGNO()
-                          "suspended connection abandoned by its continuation");
+            {
+                static log_ratelimit_t rl;
+                if (LOG_RATELIMIT(&rl, APLOG_ERR, 1, NULL, cs->c)) {
+                    ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, cs->c, APLOGNO()
+                                  "suspended connection abandoned by its "
+                                  "continuation");
+                }
+            }
             cs->pub.state = CONN_STATE_LINGER;
         }
         cs->continuation_pending = 0;
@@ -3767,12 +3781,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                  * (ap_mpm_register_wait()), which decides what to do
                  * with the connection.
                  */
-                if (user_wait->fn) {
+                if (user_wait->continuation.fn) {
                     cs->timed_out = 0;
-                    cs->resume_fn = user_wait->fn;
-                    cs->resume_baton = user_wait->fn_baton;
-                    cs->resume_pfds = user_wait->pfds;
-                    cs->resume_why = AP_MPM_WAIT_TIMEOUT;
+                    set_user_continuation(cs, user_wait, AP_MPM_WAIT_TIMEOUT);
                 }
 
                 /* Remove all user pollfds from the pollset */
@@ -3781,7 +3792,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 cs->user_wait = NULL;
 
                 AP_DEBUG_ASSERT(cs->suspended);
-                if (!cs->resume_fn) {
+                if (!cs->continuation.fn) {
                     cs->pub.state = CONN_STATE_LINGER;
                 }
                 push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit);
@@ -4091,7 +4102,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 else if (stale_user_wait(pt)) {
                     break;
                 }
-                if (user_wait->fn) {
+                if (user_wait->continuation.fn) {
                     /* Tell the continuation which pfds are ready */
                     apr_array_header_t *pfds = user_wait->pfds;
                     int i;
@@ -4149,13 +4160,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             AP_DEBUG_ASSERT(cs->suspended);
 
             /* The continuation to run, if any (ap_mpm_register_wait()) */
-            if (user_wait->fn) {
-                cs->resume_fn = user_wait->fn;
-                cs->resume_baton = user_wait->fn_baton;
-                cs->resume_pfds = user_wait->pfds;
-                cs->resume_why = user_wait->wait_notified
-                                 ? AP_MPM_WAIT_NOTIFIED
-                                 : AP_MPM_WAIT_READY;
+            if (user_wait->continuation.fn) {
+                set_user_continuation(cs, user_wait, user_wait->wait_notified
+                                                        ? AP_MPM_WAIT_NOTIFIED
+                                                        : AP_MPM_WAIT_READY);
             }
 
             /* Remove all user pollfds from the pollset */
