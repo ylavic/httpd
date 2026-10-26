@@ -276,9 +276,17 @@ static /*atomic*/ apr_uint32_t listener_may_exit = 0;
 #define CACHE_LINE_ALIGNED
 #endif
 
-static /*atomic*/ apr_uint32_t connection_count = 0; /* Number of open connections */
-static /*atomic*/ apr_uint32_t timers_count = 0;     /* Number of queued timers */
-static /*atomic*/ apr_uint32_t suspended_count = 0;  /* Number of suspended connections */
+/* Counters written by any thread at every connection, timer and suspend, in a
+ * cache line of their own: not with the flags and settings above, read by all
+ * the threads.
+ */
+static struct {
+    CACHE_LINE_ALIGNED
+    /*atomic*/ apr_uint32_t connection_count; /* Number of open connections */
+    /*atomic*/ apr_uint32_t timers_count;     /* Number of queued timers */
+    /*atomic*/ apr_uint32_t suspended_count;  /* Number of suspended connections */
+} event_counts;
+
 static /*atomic*/ apr_uint32_t threads_shutdown = 0; /* Number of threads that have shutdown
                                                         early during graceful termination */
 
@@ -1315,15 +1323,15 @@ static int disable_listensocks(apr_time_t now)
                          "waitio:%u write:%u keepalive:%u shutdown:%u "
                          "linger:%u timers:%u suspended:%u",
                          ap_queue_info_idlers_count(worker_queue_info),
-                         apr_atomic_read32(&connection_count),
+                         apr_atomic_read32(&event_counts.connection_count),
                          apr_atomic_read32(backlog_q->total),
                          apr_atomic_read32(waitio_q->total),
                          apr_atomic_read32(write_completion_q->total),
                          apr_atomic_read32(keepalive_q->total),
                          apr_atomic_read32(shutdown_q->total),
                          apr_atomic_read32(linger_q->total),
-                         apr_atomic_read32(&timers_count),
-                         apr_atomic_read32(&suspended_count));
+                         apr_atomic_read32(&event_counts.timers_count),
+                         apr_atomic_read32(&event_counts.suspended_count));
         }
     }
 
@@ -1364,15 +1372,15 @@ static int enable_listensocks(apr_time_t now, const char *by)
                          "linger:%u timers:%u suspended:%u",
                          by, now - listensocks_suspended_at,
                          ap_queue_info_idlers_count(worker_queue_info),
-                         apr_atomic_read32(&connection_count),
+                         apr_atomic_read32(&event_counts.connection_count),
                          apr_atomic_read32(backlog_q->total),
                          apr_atomic_read32(waitio_q->total),
                          apr_atomic_read32(write_completion_q->total),
                          apr_atomic_read32(keepalive_q->total),
                          apr_atomic_read32(shutdown_q->total),
                          apr_atomic_read32(linger_q->total),
-                         apr_atomic_read32(&timers_count),
-                         apr_atomic_read32(&suspended_count));
+                         apr_atomic_read32(&event_counts.timers_count),
+                         apr_atomic_read32(&event_counts.suspended_count));
         }
     }
 
@@ -1738,7 +1746,7 @@ static void connection_count_out(event_conn_state_t *cs)
      * or if the listening sockets were disabled due to limits and can
      * now accept new connections.
      */
-    is_last_connection = !apr_atomic_dec32(&connection_count);
+    is_last_connection = !apr_atomic_dec32(&event_counts.connection_count);
     is_dying = apr_atomic_read32(&dying);
     if (is_last_connection && is_dying) {
         apr_pollset_wakeup(event_pollset);
@@ -1765,7 +1773,7 @@ static apr_status_t decrement_connection_count(void *cs_)
      * suspended), not with the socket
      */
     if (cs->suspended) {
-        apr_atomic_dec32(&suspended_count);
+        apr_atomic_dec32(&event_counts.suspended_count);
     }
     if (!cs->counted_out) {
         connection_count_out(cs);
@@ -1782,7 +1790,7 @@ static void enter_suspended(event_conn_state_t *cs)
     AP_DEBUG_ASSERT(!cs->suspended);
     ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                   "Suspend connection %" CS_FMT, CS_ARG(cs));
-    apr_atomic_inc32(&suspended_count);
+    apr_atomic_inc32(&event_counts.suspended_count);
     cs->suspended = 1;
 
     cs->c->sbh = NULL;
@@ -2295,7 +2303,7 @@ static event_conn_state_t *make_conn_state(apr_pool_t *p, apr_socket_t *csd)
     cs->pub.state = CONN_STATE_PROCESSING;
     cs->pub.sense = CONN_SENSE_DEFAULT;
 
-    apr_atomic_inc32(&connection_count);
+    apr_atomic_inc32(&event_counts.connection_count);
     apr_pool_cleanup_register(p, cs, decrement_connection_count,
                               apr_pool_cleanup_null);
     return cs;
@@ -2981,7 +2989,7 @@ static void arm_pending_wait(event_conn_state_t *cs)
  */
 static void leave_suspended_state(event_conn_state_t *cs)
 {
-    apr_atomic_dec32(&suspended_count);
+    apr_atomic_dec32(&event_counts.suspended_count);
     cs->c->suspended_baton = NULL;
     cs->c->sbh = cs->sbh;
     cs->suspended = 0;
@@ -3230,10 +3238,10 @@ static void timer_event_backlog_cb(void *baton, int pushed)
     ap_assert(te && te_qe(te));
 
     if (pushed) {
-        apr_atomic_inc32(&timers_count);
+        apr_atomic_inc32(&event_counts.timers_count);
     }
     else { /* popped */
-        apr_atomic_dec32(&timers_count);
+        apr_atomic_dec32(&event_counts.timers_count);
 
         /* not in backlog anymore */
         te_qe(te)->cb = NULL;
@@ -3792,8 +3800,8 @@ static void update_stats(process_score *ps, apr_time_t now,
         apr_atomic_set32(&ps->shutdown, apr_atomic_read32(shutdown_q->total));
         apr_atomic_set32(&ps->lingering_close, apr_atomic_read32(linger_q->total));
         apr_atomic_set32(&ps->backlog, apr_atomic_read32(backlog_q->total));
-        apr_atomic_set32(&ps->suspended, apr_atomic_read32(&suspended_count));
-        apr_atomic_set32(&ps->connections, apr_atomic_read32(&connection_count));
+        apr_atomic_set32(&ps->suspended, apr_atomic_read32(&event_counts.suspended_count));
+        apr_atomic_set32(&ps->connections, apr_atomic_read32(&event_counts.connection_count));
     }
 
     if (expired) {
@@ -3802,15 +3810,15 @@ static void update_stats(process_score *ps, apr_time_t now,
                      "waitio:%u write:%u keepalive:%u shutdown:%u linger:%u "
                      "timers:%u suspended:%u (%u/%u workers shutdown)",
                      ap_queue_info_idlers_count(worker_queue_info),
-                     apr_atomic_read32(&connection_count),
+                     apr_atomic_read32(&event_counts.connection_count),
                      apr_atomic_read32(backlog_q->total),
                      apr_atomic_read32(waitio_q->total),
                      apr_atomic_read32(write_completion_q->total),
                      apr_atomic_read32(keepalive_q->total),
                      apr_atomic_read32(shutdown_q->total),
                      apr_atomic_read32(linger_q->total),
-                     apr_atomic_read32(&timers_count),
-                     apr_atomic_read32(&suspended_count),
+                     apr_atomic_read32(&event_counts.timers_count),
+                     apr_atomic_read32(&event_counts.suspended_count),
                      apr_atomic_read32(&threads_shutdown),
                      threads_per_child);
         if (backlog_stats_on) {
@@ -3869,8 +3877,8 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             }
 
             if (terminate_mode == ST_UNGRACEFUL
-                || (apr_atomic_read32(&connection_count) == 0
-                    && apr_atomic_read32(&timers_count) == 0))
+                || (apr_atomic_read32(&event_counts.connection_count) == 0
+                    && apr_atomic_read32(&event_counts.timers_count) == 0))
                 break;
 
             if (once) {
@@ -4033,7 +4041,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          */
         if (timeout < 0 || timeout > STATS_UPDATE_TIMEOUT) {
             if (timeout > 0
-                || apr_atomic_read32(&connection_count)) {
+                || apr_atomic_read32(&event_counts.connection_count)) {
                 timeout = next_stats_time - now;
                 if (timeout <= 0 || timeout > STATS_UPDATE_TIMEOUT) {
                     timeout = STATS_UPDATE_TIMEOUT;
@@ -4112,7 +4120,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      queues_next_expiry ? queues_next_expiry - now : 0,
                      timers_next_expiry ? timers_next_expiry - now : 0,
                      listensocks_disabled() ? "no" : "yes",
-                     apr_atomic_read32(&connection_count),
+                     apr_atomic_read32(&event_counts.connection_count),
                      apr_atomic_read32(&listener_may_exit),
                      apr_atomic_read32(&dying));
 
@@ -4149,7 +4157,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      queues_next_expiry ? queues_next_expiry - now : 0,
                      timers_next_expiry ? timers_next_expiry - now : 0,
                      listensocks_disabled() ? "no" : "yes",
-                     apr_atomic_read32(&connection_count),
+                     apr_atomic_read32(&event_counts.connection_count),
                      apr_atomic_read32(&listener_may_exit),
                      apr_atomic_read32(&dying));
 
@@ -4497,7 +4505,7 @@ static int worker_thread_should_exit_early(int slot)
 {
     const apr_uint32_t max = threads_per_child;
     for (;;) {
-        apr_uint32_t conns = apr_atomic_read32(&connection_count);
+        apr_uint32_t conns = apr_atomic_read32(&event_counts.connection_count);
         apr_uint32_t deads = apr_atomic_read32(&threads_shutdown);
 
         AP_DEBUG_ASSERT(deads < max);
