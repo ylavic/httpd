@@ -183,6 +183,54 @@ static int proxy_connect_canon(request_rec *r, char *url)
     return OK;
 }
 
+/* The backend connection of a tunnel, for its end */
+typedef struct {
+    conn_rec *backconn;
+    int via_proxy; /* through a remote proxy (we sent it the CONNECT) */
+} connect_baton_t;
+
+/*
+ * Step Five: Clean Up
+ *
+ * Close the backend connection once the tunnel is over (with rc), and
+ * return the request's status.
+ */
+static int proxy_connect_end(proxy_tunnel_rec *tunnel, int rc,
+                             connect_baton_t *cb)
+{
+    request_rec *r = tunnel->r;
+    conn_rec *backconn = cb->backconn;
+
+    if (rc == HTTP_GATEWAY_TIME_OUT) {
+        /* ap_proxy_tunnel_run{,_ex}() didn't log this */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10224)
+                      "tunnel timed out");
+    }
+
+    if (backconn->aborted)
+        apr_socket_close(ap_get_conn_socket(backconn));
+    else
+        ap_lingering_close(backconn);
+
+    /* The client connection is the tunnel's too */
+    r->connection->keepalive = AP_CONN_CLOSE;
+
+    /* Don't send an error page if we sent data already */
+    if (ap_is_HTTP_ERROR(rc) && cb->via_proxy && !tunnel->replied) {
+        return rc;
+    }
+    return OK;
+}
+
+/* The end of a tunnel run asynchronously (ap_proxy_tunnel_run_ex()):
+ * finish the request with the status of the tunnel's end
+ * (proxy_connect_end()).
+ */
+static void proxy_connect_done(proxy_tunnel_rec *tunnel, int rc, void *baton)
+{
+    ap_proxy_handler_done(tunnel->r, proxy_connect_end(tunnel, rc, baton));
+}
+
 /* CONNECT handler */
 static int proxy_connect_handler(request_rec *r, proxy_worker *worker,
                                  proxy_server_conf *conf,
@@ -203,6 +251,7 @@ static int proxy_connect_handler(request_rec *r, proxy_worker *worker,
 
     apr_bucket_brigade *bb;
     proxy_tunnel_rec *tunnel;
+    connect_baton_t *cb;
     int failed, rc;
 
     apr_uri_t uri;
@@ -393,31 +442,19 @@ static int proxy_connect_handler(request_rec *r, proxy_worker *worker,
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    rc = ap_proxy_tunnel_run(tunnel);
-    if (ap_is_HTTP_ERROR(rc)) {
-        if (rc == HTTP_GATEWAY_TIME_OUT) {
-            /* ap_proxy_tunnel_run() didn't log this */
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10224)
-                          "tunnel timed out");
-        }
-        /* Don't send an error page if we sent data already */
-        if (proxyport && !tunnel->replied) {
-            return rc;
-        }
-    }
-
-    /*
-     * Step Five: Clean Up
-     *
-     * Close the socket and clean up
+    /* Asynchronously when possible (the MPM waits for either side meanwhile,
+     * proxy_connect_done() finishes), otherwise the whole tunneling happens
+     * now in this thread.
      */
-
-    if (backconn->aborted)
-        apr_socket_close(sock);
-    else
-        ap_lingering_close(backconn);
-
-    return OK;
+    cb = apr_pcalloc(p, sizeof(*cb));
+    cb->backconn = backconn;
+    cb->via_proxy = (proxyport != 0);
+    rc = ap_proxy_tunnel_run_ex(tunnel, tunnel->timeout,
+                                proxy_connect_done, cb);
+    if (rc == SUSPENDED) {
+        return SUSPENDED;
+    }
+    return proxy_connect_end(tunnel, rc, cb);
 }
 
 static void ap_proxy_connect_register_hook(apr_pool_t *p)
