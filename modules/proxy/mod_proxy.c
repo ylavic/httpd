@@ -1896,7 +1896,7 @@ static void *create_proxy_dir_config(apr_pool_t *p, char *dummy)
     new->add_forwarded_headers_set = 0;
     new->forward_100_continue = 1;
     new->forward_100_continue_set = 0;
-    new->async_delay = -1;
+    new->async_delay = 0; /* asynchronous when the MPM can wait */
 
     return (void *) new;
 }

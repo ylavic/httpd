@@ -25,6 +25,22 @@ module AP_MODULE_DECLARE_DATA proxy_http_module;
 
 static int mpm_can_wait = 0;
 
+/* A request is processed by the same steps whether it can be suspended or
+ * not: either way it gets the same results (statuses, timeouts, logs, backend
+ * connection reuse), it just doesn't hold a thread while waiting when it can
+ * be suspended (the waits in the MPM, ap_mpm_register_wait(), and their
+ * continuations).
+ *
+ * Whether the request can be suspended to wait asynchronously: unless
+ * disabled (ProxyAsyncDelay -1) when the MPM can wait, but not for a
+ * subrequest whose caller (e.g. mod_include) goes on once the handler
+ * returns.
+ */
+static int proxy_http_can_suspend(request_rec *r, proxy_dir_conf *dconf)
+{
+    return mpm_can_wait && dconf->async_delay >= 0 && !r->main;
+}
+
 static int (*ap_proxy_clear_connection_fn)(request_rec *r, apr_table_t *headers) =
         NULL;
 
@@ -2576,7 +2592,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
 
         if (proxy_status == HTTP_SWITCHING_PROTOCOLS) {
             apr_status_t rv;
-            int tunnel_async;
 
             /* If we didn't send the full body yet, do it now */
             if (do_100_continue) {
@@ -2601,21 +2616,18 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
             req->proto = upgrade;
             req->upgraded = 1;
 
-            /* Tunnel asynchronously by default (when the MPM can wait, see
+            /* Tunnel asynchronously as any wait (when the MPM can wait, see
              * ap_proxy_tunnel_run_ex()), a tunnel holding a thread for its
-             * whole life otherwise, unless disabled (ProxyAsyncDelay -1, not
-             * unset): with ProxyAsyncIdleTimeout if set, this thread forwards
-             * what's ready, then the MPM waits for the connections, and
-             * proxy_http_tunnel_done() finishes. Otherwise the whole tunneling
-             * happens now in this thread, with the proxy's timeout.
+             * whole life otherwise, unless disabled (ProxyAsyncDelay -1):
+             * with req->idle_timeout (ProxyAsyncIdleTimeout if set), this
+             * thread forwards what's ready, then the MPM waits for the
+             * connections, and proxy_http_tunnel_done() finishes. Otherwise
+             * the whole tunneling happens now in this thread, with the
+             * proxy's timeout.
              */
-            tunnel_async = !(dconf->async_delay_set && dconf->async_delay < 0);
-            if (tunnel_async && dconf->async_idle_timeout_set) {
-                req->idle_timeout = dconf->async_idle_timeout;
-            }
             status = ap_proxy_tunnel_run_ex(req->tunnel, req->idle_timeout,
-                                            tunnel_async ? proxy_http_tunnel_done
-                                                         : NULL,
+                                            req->can_suspend ? proxy_http_tunnel_done
+                                                             : NULL,
                                             req);
             if (status == SUSPENDED) {
                 /* The MPM arms the wait once the handler returns SUSPENDED */
@@ -3194,8 +3206,8 @@ handshake:
         /* Step Five: Receive the Response... Fall thru to cleanup */
         if (req->can_suspend && !req->upgrade) {
             /* Don't hold the thread while the backend processes the request,
-             * or decides on 100-continue (except for upgrades, whose tunnel
-             * path uses the hooks).
+             * or decides on 100-continue (except for upgrades, whose response
+             * is read synchronously before tunneling).
              */
             status = proxy_http_response_head_wait(req);
             if (status == SUSPENDED) {
@@ -3357,8 +3369,7 @@ static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
     if (!pr) {
         const char *te, *cl;
 
-        if (!(mpm_can_wait && dconf->async_delay_set && dconf->async_delay >= 0)
-            || r->main
+        if (!proxy_http_can_suspend(r, dconf)
             || r->expecting_100     /* the client waits for 100 */
             || !ap_request_has_body(r)
             || apr_table_get(r->headers_in, "Upgrade")
@@ -3520,8 +3531,7 @@ static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
     apr_status_t rv;
     int status;
 
-    if (!(mpm_can_wait
-          && dconf->async_delay_set && dconf->async_delay >= 0)) {
+    if (!proxy_http_can_suspend(r, dconf)) {
         return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
     }
 
@@ -3663,9 +3673,7 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
     req->backend = backend;
     req->proto = scheme;
     req->bucket_alloc = c->bucket_alloc;
-    req->can_suspend = (mpm_can_wait &&
-                        dconf->async_delay_set &&
-                        dconf->async_delay >= 0);
+    req->can_suspend = proxy_http_can_suspend(r, dconf);
     req->rb_method = RB_INIT;
 
     rctx->req = req;

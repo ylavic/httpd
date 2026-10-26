@@ -2327,6 +2327,7 @@ header for proxied requests</description>
 <description>Time to poll synchronously before handing a connection to the
 MPM for asynchronous processing</description>
 <syntax>ProxyAsyncDelay <var>time</var>[s]</syntax>
+<default>ProxyAsyncDelay 0</default>
 <contextlist><context>server config</context>
 <context>virtual host</context>
 <context>directory</context>
@@ -2343,8 +2344,8 @@ MPM for asynchronous processing</description>
     responded, the connection is handed off to the MPM's asynchronous
     event loop, freeing the worker thread to serve other requests.</p>
 
-    <p>Setting this directive to <code>0</code> causes the connection
-    to be handed to the event loop immediately. Setting it to
+    <p>With <code>0</code>, the default, the connection is handed to the
+    event loop as soon as it would wait. Setting this directive to
     <code>-1</code> disables asynchronous handling entirely (all proxy
     connections remain synchronous).</p>
 
@@ -2352,21 +2353,22 @@ MPM for asynchronous processing</description>
     Protocols</code> response, e.g. WebSocket, see the
     <code>upgrade</code> parameter of
     <directive module="mod_proxy">ProxyPass</directive>) are handled
-    asynchronously by default, a synchronous tunnel holding a worker
-    thread for its whole life: unless this directive is explicitly set
-    to <code>-1</code>, the worker thread forwards what is available on
-    either side, then the MPM waits for more. Tunnels of HTTP/2 streams
-    remain synchronous.</p>
+    asynchronously too unless this directive is <code>-1</code>, whatever
+    its value: the worker thread forwards what is available on either
+    side, then the MPM waits for more.</p>
 
-    <p>This directive has no effect unless the MPM supports polling
-    (e.g., <module>event</module>).</p>
+    <p>This directive has no effect unless the MPM supports it (e.g.,
+    <module>event</module>), and the proxy connections of HTTP/2 streams
+    and subrequests remain synchronous.</p>
 
     <note><title>When to use this</title>
-    <p>Async proxy handling is most useful for slow backends or
-    long-lived streaming responses, where tying up a worker thread
-    waiting for data would limit concurrency. For fast backends that
-    respond within milliseconds, the synchronous path is more
-    efficient.</p>
+    <p>Async proxy handling frees the worker threads while waiting for
+    slow backends, long-lived streaming responses or tunnels, where tying
+    up a worker thread waiting for data would limit concurrency. For fast
+    backends that respond within a millisecond, the synchronous path
+    (<code>-1</code>) costs a bit less CPU per request, and a delay
+    greater than <code>0</code> helps only for the requests answered
+    within that delay.</p>
     </note>
 </usage>
 
@@ -2400,10 +2402,10 @@ MPM for asynchronous processing</description>
     finally to the server's
     <directive module="core">Timeout</directive>.</p>
 
-    <p>This directive has no effect unless
-    <directive module="mod_proxy">ProxyAsyncDelay</directive> is also
-    set to enable asynchronous handling, or for asynchronous tunnels
-    (where it is the time without data on either side).</p>
+    <p>This directive has no effect when
+    <directive module="mod_proxy">ProxyAsyncDelay</directive> is
+    <code>-1</code> (asynchronous handling disabled). For asynchronous
+    tunnels it is the time without data on either side.</p>
 </usage>
 
 <seealso><directive module="mod_proxy">ProxyAsyncDelay</directive></seealso>
