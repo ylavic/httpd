@@ -526,8 +526,8 @@ ThreadsPerChild 4
     <p>gives 4 threads per child, and up to 100 child processes.</p>
 
     <p>With <module>event</module>, the threads don't bound the number of
-    connections a child handles (see <directive module="event"
-    >AsyncRequestWorkerFactor</directive>), so a few threads per CPU are
+    connections a child handles (see the <a href="event.html#admission"
+    >admission of new connections</a>), so a few threads per CPU are
     enough unless the requests block (e.g. with modules handling the
     requests synchronously).</p>
 

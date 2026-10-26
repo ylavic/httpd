@@ -152,15 +152,15 @@
 #define MAX_THREAD_LIMIT 100000
 #endif
 
-/* The admission's backstop: how many new connections can wait for a worker,
- * per worker thread. From 16 the waiting time decides when to stop accepting,
- * even under a flood of new connections (for requests of about a millisecond
- * or more; below, the backstop does first and only toggles the accepting more
- * often), while what a child holds for them stays cheap: a pool and a socket
- * each (e.g. 400 for 25 threads).
+/* The admission's backstop (AsyncAdmissionBacklogPerThread): how many new
+ * connections can wait for a worker, per worker thread. From 16 the waiting
+ * time decides when to stop accepting, even under a flood of new connections
+ * (for requests of about a millisecond or more; below, the backstop does first
+ * and only toggles the accepting more often), while what a child holds for
+ * them stays cheap: a pool and a socket each (e.g. 400 for 25 threads).
  */
-#ifndef DEFAULT_ASYNC_FACTOR
-#define DEFAULT_ASYNC_FACTOR 16.0
+#ifndef DEFAULT_ADMISSION_BACKLOG
+#define DEFAULT_ADMISSION_BACKLOG 16.0
 #endif
 
 #ifndef MAX_SPARE_THREADS_RATIO
@@ -230,7 +230,7 @@ static int server_limit = 0;                /* ServerLimit */
 static int thread_limit = 0;                /* ThreadLimit */
 static int conns_this_child = 0;            /* MaxConnectionsPerChild, only accessed
                                                in listener thread */
-static double async_factor = DEFAULT_ASYNC_FACTOR; /* AsyncRequestWorkerFactor */
+static double admission_backlog = DEFAULT_ADMISSION_BACKLOG; /* AsyncAdmissionBacklogPerThread */
 
 /* Idle workers poll the connections themselves (worker_poll_next()): needs
  * one-shot pfds and APR to poll a pollset from several threads. Building with
@@ -1093,7 +1093,8 @@ static const unsigned int backlog_class_weights[BACKLOG_CLASSES] = {
  * interval; any wait at or below the target, or no new connection waiting,
  * resets it. The waits are those of the new connections taken by a worker,
  * and that of the oldest one still waiting (so blocked workers count too).
- * The target and interval (ms) can be changed at build time.
+ * The target and interval are AsyncAdmissionTarget and AsyncAdmissionInterval
+ * (ms), whose defaults can be changed at build time.
  */
 #ifndef AP_EVENT_ADMISSION_TARGET
 #define AP_EVENT_ADMISSION_TARGET 5
@@ -1101,9 +1102,9 @@ static const unsigned int backlog_class_weights[BACKLOG_CLASSES] = {
 #ifndef AP_EVENT_ADMISSION_INTERVAL
 #define AP_EVENT_ADMISSION_INTERVAL 100
 #endif
-static const apr_time_t admission_target =
+static apr_time_t admission_target =
     apr_time_from_msec(AP_EVENT_ADMISSION_TARGET);
-static const apr_time_t admission_interval =
+static apr_time_t admission_interval =
     apr_time_from_msec(AP_EVENT_ADMISSION_INTERVAL);
 
 /* Since when the new connections' waits are above the target, 0 when below:
@@ -6974,11 +6975,14 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
     }
 
     ap_log_error(APLOG_MARK, APLOG_INFO, 0, ap_server_conf, APLOGNO(10464)
-                 "MPM event settings%s: MaxRequestWorkers=%d AsyncRequestWorkerFactor=%.1lf "
+                 "MPM event settings%s: MaxRequestWorkers=%d AsyncAdmissionBacklogPerThread=%.1lf "
+                 "AsyncAdmissionTarget=%" APR_TIME_T_FMT "ms AsyncAdmissionInterval=%"
+                 APR_TIME_T_FMT "ms "
                  "ThreadsPerChild=%d ThreadLimit=%d MinSpareThreads=%d MaxSpareThreads=%d "
                  "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d "
                  "WorkerPoll=%s",
-                 auto_settings ? " (auto)" : "", max_workers, async_factor,
+                 auto_settings ? " (auto)" : "", max_workers, admission_backlog,
+                 apr_time_as_msec(admission_target), apr_time_as_msec(admission_interval),
                  threads_per_child, thread_limit, min_spare_threads, max_spare_threads,
                  active_daemons_limit, server_limit, ap_daemons_to_start,
                  num_buckets, num_cpus,
@@ -7365,7 +7369,7 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         max_spare_threads = max_workers;
     }
 
-    workers_backlog_limit = threads_per_child * async_factor;
+    workers_backlog_limit = threads_per_child * admission_backlog;
 
     /* For the PODs of the next restart (see above) */
     retained->gen_daemons_limit = active_daemons_limit;
@@ -7485,7 +7489,9 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
         }
     }
 #endif
-    async_factor = DEFAULT_ASYNC_FACTOR;
+    admission_backlog = DEFAULT_ADMISSION_BACKLOG;
+    admission_target = apr_time_from_msec(AP_EVENT_ADMISSION_TARGET);
+    admission_interval = apr_time_from_msec(AP_EVENT_ADMISSION_INTERVAL);
 
     return OK;
 }
@@ -7926,16 +7932,56 @@ static const char *set_thread_limit(cmd_parms * cmd, void *dummy,
 static const char *set_worker_factor(cmd_parms * cmd, void *dummy,
                                      const char *arg)
 {
+    static int warnonce = 0;
+    const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
+    if (err != NULL) {
+        return err;
+    }
+
+    /* Its meaning (a limit of the connections per process) is gone, a value
+     * tuned for it would mean something else for the admission.
+     */
+    if (++warnonce == 1) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING|APLOG_STARTUP, 0, NULL, APLOGNO()
+                     "AsyncRequestWorkerFactor has no effect since 2.5.1, "
+                     "see AsyncAdmissionBacklogPerThread %s:%d",
+                     cmd->directive->filename, cmd->directive->line_num);
+    }
+    return NULL;
+}
+
+static const char *set_admission_backlog(cmd_parms *cmd, void *dummy,
+                                         const char *arg)
+{
     char *endptr;
     const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
     if (err != NULL) {
         return err;
     }
 
-    async_factor = strtod(arg, &endptr);
-    if (*endptr || async_factor < 1.0) {
-        return "AsyncRequestWorkerFactor must be a rational number greater or equal to 1";
+    admission_backlog = strtod(arg, &endptr);
+    if (*endptr || admission_backlog < 1.0) {
+        return "AsyncAdmissionBacklogPerThread must be a rational number greater or equal to 1";
     }
+    return NULL;
+}
+
+static const char *set_admission_time(cmd_parms *cmd, void *dummy,
+                                      const char *arg)
+{
+    apr_interval_time_t *t = cmd->info;
+    apr_interval_time_t val;
+    const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
+    if (err != NULL) {
+        return err;
+    }
+
+    if (ap_timeout_parameter_parse(arg, &val, "ms") != APR_SUCCESS
+        || val <= 0) {
+        return apr_pstrcat(cmd->pool, cmd->cmd->name,
+                           " must be a positive time (ms by default)", NULL);
+    }
+    *t = val;
     return NULL;
 }
 
@@ -7960,8 +8006,19 @@ static const command_rec event_cmds[] = {
                   "Maximum number of worker threads per child process for this "
                   "run of Apache - Upper limit for ThreadsPerChild"),
     AP_INIT_TAKE1("AsyncRequestWorkerFactor", set_worker_factor, NULL, RSRC_CONF,
+                  "No effect since 2.5.1, see AsyncAdmissionBacklogPerThread"),
+    AP_INIT_TAKE1("AsyncAdmissionBacklogPerThread", set_admission_backlog, NULL,
+                  RSRC_CONF,
                   "How many new connections can wait for a worker, per "
                   "worker thread, before accepting stops"),
+    AP_INIT_TAKE1("AsyncAdmissionTarget", set_admission_time, &admission_target,
+                  RSRC_CONF,
+                  "How long new connections can wait for a worker (ms by "
+                  "default) before the admission counts them as late"),
+    AP_INIT_TAKE1("AsyncAdmissionInterval", set_admission_time, &admission_interval,
+                  RSRC_CONF,
+                  "How long the new connections must be late (ms by default) "
+                  "before accepting stops"),
     AP_GRACEFUL_SHUTDOWN_TIMEOUT_COMMAND,
     {NULL}
 };

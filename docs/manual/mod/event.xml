@@ -58,8 +58,9 @@ child processes. Each child process creates a fixed number of server
 threads as specified in the <directive module="mpm_common">ThreadsPerChild</directive> directive, as well
 as a listener thread which listens for connections and passes them to a worker thread for processing when they arrive.</p>
 
-<p>Run-time configuration directives are identical to those provided by <module>worker</module>, with the only addition
-of the <directive>AsyncRequestWorkerFactor</directive>.</p>
+<p>Run-time configuration directives are identical to those provided by <module>worker</module>, with the addition
+of the <a href="#admission">admission</a> directives (<directive>AsyncAdmissionTarget</directive>,
+<directive>AsyncAdmissionInterval</directive> and <directive>AsyncAdmissionBacklogPerThread</directive>).</p>
 
 </section>
 
@@ -83,8 +84,91 @@ of the <directive>AsyncRequestWorkerFactor</directive>.</p>
        no longer requires the <code>mpm-accept</code> <directive module="core">Mutex</directive>
        configured to avoid the thundering herd problem.</p>
 
-    <p>The total amount of connections that a single process/threads block can handle is regulated
-        by the <directive>AsyncRequestWorkerFactor</directive> directive.</p>
+    <p>A process stops accepting new connections when they wait too long
+        for a worker thread, see <a href="#admission">Admission of new
+        connections</a>.</p>
+
+    <p>By default the idle worker threads poll the connections themselves,
+        and run what they get without a hand-off from the listener thread.
+        Defining <code>AP_EVENT_NO_WORKER_POLL</code> at build time restores
+        the listener thread polling the connections for the workers.</p>
+
+    <section id="admission"><title>Admission of new connections</title>
+        <p>A process accepts new connections as long as they don't wait too
+        long for a worker thread, whatever the reason (busy or blocked
+        workers), and stops accepting when they do, until they're served in
+        time again. Meanwhile the other processes take the new connections,
+        or they wait in the kernel's listen backlog (see <directive
+        module="mpm_common">ListenBacklog</directive>). Three directives
+        control it:</p>
+        <ul>
+            <li><directive>AsyncAdmissionTarget</directive> (5 milliseconds
+            by default): how long a new connection can wait for a worker
+            thread without being late;</li>
+            <li><directive>AsyncAdmissionInterval</directive> (100
+            milliseconds by default): how long the new connections must stay
+            late before the process stops accepting;</li>
+            <li><directive>AsyncAdmissionBacklogPerThread</directive> (16 by
+            default): how many new connections can wait for a worker, per
+            worker thread, whatever their waits.</li>
+        </ul>
+
+        <note><title>How they interact, and the defaults</title>
+        <p>The process stops accepting when the oldest new connection has
+        been waiting more than <directive>AsyncAdmissionTarget</directive>
+        for <directive>AsyncAdmissionInterval</directive> in a row (a burst
+        of late connections shorter than that doesn't count), or when more
+        than <directive module="mpm_common">ThreadsPerChild</directive> times
+        <directive>AsyncAdmissionBacklogPerThread</directive> new connections
+        are waiting (the backstop). It accepts again once the new connections
+        wait less than half the target and fewer than half the backstop are
+        waiting, so that it doesn't toggle at the pace of the workers.</p>
+
+        <p>The waiting time normally decides: the backstop acts first only
+        for very short requests (well under a millisecond), when many new
+        connections can wait without any of them waiting long; it then only
+        makes the process stop and resume accepting more often. A lower
+        target or interval stops accepting sooner, with fewer connections
+        waiting in the process and more left to the others or to the kernel;
+        higher ones let more wait, with longer latencies under overload.</p>
+
+        <p>The defaults fit most cases: a 5 milliseconds target is above the
+        service time of most requests and far below what clients notice, the
+        100 milliseconds interval ignores the bursts a process absorbs on its
+        own, and 16 waiting connections per thread (400 for 25 threads) let
+        the waits decide down to requests of about a millisecond, while what
+        a process holds for them stays cheap (a pool and a socket each). The
+        defaults of the target and interval can be changed at build time by
+        defining <code>AP_EVENT_ADMISSION_TARGET</code> and
+        <code>AP_EVENT_ADMISSION_INTERVAL</code> (in milliseconds).</p>
+        </note>
+
+        <p>The connections that don't need a worker while they wait (idle
+        keep-alive connections, write completion, lingering close, requests
+        suspended by asynchronous modules) are not limited by the admission,
+        nor by <directive module="mpm_common">MaxRequestWorkers</directive>:
+        they only cost some memory (a pool and a socket each) and a file
+        descriptor. Their number is bounded by the descriptors limit of the
+        child processes (e.g. <code>ulimit -n</code> in the server's
+        environment). A process reaching its
+        limit stops accepting until some of its connections close, while the
+        other processes keep accepting. Idle connections are closed by
+        <directive module="core">KeepAliveTimeout</directive>,
+        <directive module="core">Timeout</directive> and
+        <module>mod_reqtimeout</module>, which are the settings to adjust
+        against many idle or slow clients.</p>
+
+        <note><title>Changes in 2.5.1</title>
+        <p>The admission replaces the per-process connection limit of the
+        previous versions, set by <directive>AsyncRequestWorkerFactor</directive>
+        (default 2): <directive module="mpm_common">ThreadsPerChild</directive>
+        + (<directive>AsyncRequestWorkerFactor</directive> * <var>number of
+        idle workers</var>) connections of all states. This directive has no
+        effect anymore (a warning is logged at startup), and the keep-alive
+        connections are no longer closed early when all the workers are
+        busy.</p>
+        </note>
+    </section>
 
     <section id="async-connections"><title>Async connections</title>
         <p>Async connections would need a fixed dedicated worker thread with the previous MPMs but not with event.
@@ -322,117 +406,91 @@ of the <directive>AsyncRequestWorkerFactor</directive>.</p>
 </directivesynopsis>
 
 <directivesynopsis>
-<name>AsyncRequestWorkerFactor</name>
-<description>Limit concurrent connections per process</description>
-<syntax>AsyncRequestWorkerFactor <var>factor</var></syntax>
-<default>2</default>
-<contextlist><context>server config</context> </contextlist>
-<compatibility>Available in version 2.3.13 and later</compatibility>
+<name>AsyncAdmissionBacklogPerThread</name>
+<description>How many new connections can wait for a worker thread, per
+thread</description>
+<syntax>AsyncAdmissionBacklogPerThread <var>number</var></syntax>
+<default>AsyncAdmissionBacklogPerThread 16</default>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
 
 <usage>
-    <p>The event MPM handles some connections in an asynchronous way, where
-    request worker threads are only allocated for short periods of time as
-    needed, and other connections with one request worker thread reserved per
-    connection. This can lead to situations where all workers are tied up and
-    no worker thread is available to handle new work on established async
-    connections.</p>
+    <p>The backstop of the <a href="#admission">admission of new
+    connections</a>: a process stops accepting when more than
+    <directive module="mpm_common">ThreadsPerChild</directive> times
+    <var>number</var> new connections are waiting for a worker thread,
+    whatever their waits, and accepts again below half of it.</p>
 
-    <p>To mitigate this problem, the event MPM does two things:</p>
-    <ul>
-        <li>It limits the number of connections accepted per process, depending on the
-            number of idle request workers;</li>
-        <li>If all workers are busy, it will
-            close connections in keep-alive state even if the keep-alive timeout has
-            not expired. This allows the respective clients to reconnect to a
-            different process which may still have worker threads available.</li>
-    </ul>
-
-    <p>This directive can be used to fine-tune the per-process connection
-    limit. A <strong>process</strong> will only accept new connections if the current number of
-    connections (not counting connections in the "closing" state) is lower
-    than:</p>
-
-    <p class="indent"><strong>
-        <directive module="mpm_common">ThreadsPerChild</directive> +
-        (<directive>AsyncRequestWorkerFactor</directive> *
-        <var>number of idle workers</var>)
-    </strong></p>
-
-    <p>An estimation of the maximum concurrent connections across all the processes given
-        an average value of idle worker threads can be calculated with:
-    </p>
-
-
-    <p class="indent"><strong>
-        (<directive module="mpm_common">ThreadsPerChild</directive> +
-        (<directive>AsyncRequestWorkerFactor</directive> *
-        <var>number of idle workers</var>)) *
-        <directive module="mpm_common">ServerLimit</directive>
-    </strong></p>
-
-    <note><title>Example</title>
-    <highlight language="config">
-
-ThreadsPerChild = 10
-ServerLimit = 4
-AsyncRequestWorkerFactor = 2
-MaxRequestWorkers = 40
-
-idle_workers = 4 (average for all the processes to keep it simple)
-
-max_connections = (ThreadsPerChild + (AsyncRequestWorkerFactor * idle_workers)) * ServerLimit
-                = (10 + (2 * 4)) * 4 = 72
-
-    </highlight>
-    </note>
-
-    <p>When all the worker threads are idle, then absolute maximum numbers of concurrent
-        connections can be calculated in a simpler way:</p>
-
-    <p class="indent"><strong>
-        (<directive>AsyncRequestWorkerFactor</directive> + 1) *
-        <directive module="mpm_common">MaxRequestWorkers</directive>
-    </strong></p>
-
-
-    <note><title>Example</title>
-    <highlight language="config">
-
-ThreadsPerChild = 10
-ServerLimit = 4
-MaxRequestWorkers = 40
-AsyncRequestWorkerFactor = 2
-
-    </highlight>
-
-    <p>If all the processes have all threads idle then: </p>
-
-    <highlight language="config">idle_workers = 10</highlight>
-
-    <p>We can calculate the absolute maximum numbers of concurrent connections in two ways:</p>
-
-    <highlight language="config">
-
-max_connections = (ThreadsPerChild + (AsyncRequestWorkerFactor * idle_workers)) * ServerLimit
-                = (10 + (2 * 10)) * 4 = 120
-
-max_connections = (AsyncRequestWorkerFactor + 1) * MaxRequestWorkers
-                = (2 + 1) * 40 = 120
-
-    </highlight>
-    </note>
-
-    <p>Tuning <directive>AsyncRequestWorkerFactor</directive> requires knowledge about the traffic handled by httpd in each specific use case, so changing the default value requires extensive testing and data gathering from <module>mod_status</module>.</p>
-
-    <p><directive module="mpm_common">MaxRequestWorkers</directive> was called
-    <directive>MaxClients</directive> prior to version 2.3.13. The above value
-    shows that the old name did not accurately describe its meaning for the event MPM.</p>
-
-    <p><directive>AsyncRequestWorkerFactor</directive> can take non-integer
-    arguments, e.g "1.5".</p>
-
+    <p>It can take non-integer arguments, e.g "1.5", and can't be lower
+    than 1.</p>
 </usage>
+</directivesynopsis>
 
+<directivesynopsis>
+<name>AsyncAdmissionInterval</name>
+<description>How long new connections must stay late before accepting
+stops</description>
+<syntax>AsyncAdmissionInterval <var>time</var>[ms]</syntax>
+<default>AsyncAdmissionInterval 100ms</default>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
+
+<usage>
+    <p>A process stops accepting new connections when the oldest one has been
+    waiting for a worker thread more than <directive
+    >AsyncAdmissionTarget</directive> for this <var>time</var> in a row, see
+    the <a href="#admission">admission of new connections</a>.</p>
+
+    <p>The <var>time</var> is in milliseconds unless suffixed with a unit
+    (us, ms, s, mi, h), and must be positive.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>AsyncAdmissionTarget</name>
+<description>How long a new connection can wait for a worker thread without
+being late</description>
+<syntax>AsyncAdmissionTarget <var>time</var>[ms]</syntax>
+<default>AsyncAdmissionTarget 5ms</default>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
+
+<usage>
+    <p>New connections waiting for a worker thread longer than this
+    <var>time</var> are late: a process stops accepting when they stay late
+    for <directive>AsyncAdmissionInterval</directive>, and accepts again once
+    they wait less than half of it, see the <a href="#admission">admission of
+    new connections</a>.</p>
+
+    <p>The <var>time</var> is in milliseconds unless suffixed with a unit
+    (us, ms, s, mi, h), and must be positive.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>AsyncRequestWorkerFactor</name>
+<description>No effect since 2.5.1 (formerly a limit of the connections per
+process)</description>
+<syntax>AsyncRequestWorkerFactor <var>factor</var></syntax>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in version 2.3.13 and later, no effect since
+2.5.1</compatibility>
+
+<usage>
+    <p>Before 2.5.1, a process only accepted new connections while it had
+    fewer than <directive module="mpm_common">ThreadsPerChild</directive> +
+    (<directive>AsyncRequestWorkerFactor</directive> * <var>number of idle
+    workers</var>) connections, all states included (default 2). The
+    <a href="#admission">admission of new connections</a> replaces this limit,
+    see <directive>AsyncAdmissionTarget</directive>,
+    <directive>AsyncAdmissionInterval</directive> and
+    <directive>AsyncAdmissionBacklogPerThread</directive>.</p>
+
+    <p>The directive is still accepted, ignored with a warning at startup: a
+    value tuned for the previous meaning should not be carried over to
+    <directive>AsyncAdmissionBacklogPerThread</directive> as is, the
+    defaults being suitable for most cases.</p>
+</usage>
 </directivesynopsis>
 
 </modulesynopsis>
