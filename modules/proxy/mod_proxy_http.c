@@ -317,10 +317,17 @@ typedef struct {
     apr_bucket_brigade *response_bb, *response_pass_bb;
     apr_read_type_e response_mode;
 
+    /* The request's sending state (stream_reqbody()) */
+    apr_off_t bytes_streamed;
+
     unsigned int can_suspend            :1,
                  body_async             :1,
                  direction              :2, /* ap_proxy_direction_e */
                  backend_broke          :1,
+                 send_async             :1,
+                 send_wait_backend      :1,
+                 request_timed_out         :1, /* the wait for the client did */
+                 request_eos               :1,
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
@@ -605,6 +612,134 @@ static int proxy_http_response_head_wait(proxy_http_req_t *req)
     return SUSPENDED;
 }
 
+/* How long to wait for the client to send more of the body: the time left in
+ * the connection's current stage if limited (mod_reqtimeout's
+ * RequestReadTimeout, as of the last read, which extends it with minrate),
+ * otherwise the server's Timeout (ap_get_connection_timeout()).
+ */
+static apr_interval_time_t proxy_http_request_read_timeout(request_rec *r)
+{
+    return ap_get_connection_timeout(r->connection, r->server);
+}
+
+static void proxy_http_request_forward_continuation(conn_rec *c, request_rec *r,
+                                                    ap_mpm_wait_result_e why,
+                                                    const apr_array_header_t *pfds,
+                                                    void *baton);
+
+/* While sending the request, wait in the MPM (ap_mpm_register_wait()) for the
+ * backend to take the pending output if wait_backend, otherwise for the
+ * client to send more of the body. Returns SUSPENDED, or OK if we can't wait
+ * asynchronously (the caller then blocks).
+ */
+static int proxy_http_request_forward_wait(proxy_http_req_t *req, int wait_backend)
+{
+    request_rec *r = req->r;
+    conn_rec *c = r->connection;
+    apr_array_header_t *pfds;
+    apr_pollfd_t *pfd;
+    apr_status_t rv;
+
+    if (req->async_pool) {
+        apr_pool_clear(req->async_pool);
+    }
+    else {
+        apr_pool_create(&req->async_pool, req->p);
+    }
+    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
+    pfd = apr_array_push(pfds);
+    memset(pfd, 0, sizeof(*pfd));
+    pfd->p = req->async_pool;
+    pfd->desc_type = APR_POLL_SOCKET;
+    if (wait_backend) {
+        pfd->desc.s = req->backend->sock;
+        pfd->reqevents = APR_POLLOUT;
+    }
+    else {
+        pfd->desc.s = ap_get_conn_socket(c);
+        pfd->reqevents = APR_POLLIN;
+    }
+    /* Wait for the client with the time left to read
+     * (proxy_http_request_read_timeout()), and for the backend with the
+     * proxy's timeout (ProxyAsyncIdleTimeout, or else the backend's).
+     */
+    rv = ap_mpm_register_wait(c, req->async_pool, pfds,
+                             (wait_backend
+                              ? req->idle_timeout
+                              : proxy_http_request_read_timeout(r)),
+                             proxy_http_request_forward_continuation, req);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy %s: can't wait for the %s asynchronously",
+                      req->proto, wait_backend ? "backend" : "client");
+        return OK;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: request: waiting for the %s (async)",
+                  req->proto, wait_backend ? "backend" : "client");
+    req->send_wait_backend = !!wait_backend;
+    return SUSPENDED;
+}
+
+/* Read some of the request body without blocking (for async sending).
+ * Returns OK with the data in req->input_brigade, SUSPENDED if waiting in the
+ * MPM for the backend to take what's pending or for the client to send more,
+ * or an HTTP error.
+ */
+static int proxy_http_request_read_body(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    conn_rec *c = r->connection;
+    apr_bucket_brigade *bb = req->input_brigade;
+    apr_status_t status;
+    int rv;
+
+    status = ap_get_brigade(r->input_filters, bb, AP_MODE_READBYTES,
+                            APR_NONBLOCK_READ, HUGE_STRING_LEN);
+    if (APR_STATUS_IS_EAGAIN(status)
+            || (status == APR_SUCCESS && APR_BRIGADE_EMPTY(bb))) {
+        if (req->request_timed_out) {
+            /* The wait for the client timed out and there is still nothing
+             * to read (the server's Timeout, a deadline of mod_reqtimeout's
+             * would have failed the read): a 408.
+             */
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO()
+                          "proxy %s: timeout reading the request body from "
+                          "the client (async)", req->proto);
+            return HTTP_REQUEST_TIME_OUT;
+        }
+
+        /* Nothing from the client yet: let the filters release what they
+         * hold towards the backend without blocking (WC), then wait for the
+         * backend to take what's pending if any, otherwise for the client.
+         */
+        apr_brigade_cleanup(bb);
+        APR_BRIGADE_INSERT_TAIL(bb, ap_bucket_wc_create(bb->bucket_alloc));
+        rv = ap_proxy_pass_brigade(req->bucket_alloc, r, req->backend,
+                                   req->origin, bb, 0);
+        if (rv != OK) {
+            return rv;
+        }
+        if (proxy_http_request_forward_wait(req,
+                    ap_check_output_pending(req->origin) == AGAIN)
+                == SUSPENDED) {
+            return SUSPENDED;
+        }
+        req->send_async = 0; /* can't wait: block */
+        return ap_proxy_read_input(r, req->backend, bb, HUGE_STRING_LEN);
+    }
+    if (status != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                      "read request body failed to %pI (%s)"
+                      " from %s (%s)", req->backend->addr,
+                      req->backend->hostname ? req->backend->hostname : "",
+                      c->client_ip, c->remote_host ? c->remote_host : "");
+        return ap_map_http_request_error(status, HTTP_BAD_REQUEST);
+    }
+    req->request_timed_out = 0; /* data came in the meantime */
+    return OK;
+}
+
 static int stream_reqbody(proxy_http_req_t *req)
 {
     request_rec *r = req->r;
@@ -617,14 +752,23 @@ static int stream_reqbody(proxy_http_req_t *req)
     apr_bucket_brigade *header_brigade = req->header_brigade;
     apr_bucket_brigade *input_brigade = req->input_brigade;
     rb_methods rb_method = req->rb_method;
-    apr_off_t bytes, bytes_streamed = 0;
+    apr_off_t bytes, bytes_streamed = req->bytes_streamed;
     apr_bucket *e;
 
     do {
         if (APR_BRIGADE_EMPTY(input_brigade)
                 && APR_BRIGADE_EMPTY(header_brigade)) {
-            rv = ap_proxy_read_input(r, p_conn, input_brigade,
-                                     HUGE_STRING_LEN);
+            if (req->send_async) {
+                rv = proxy_http_request_read_body(req);
+                if (rv == SUSPENDED) {
+                    req->bytes_streamed = bytes_streamed;
+                    return SUSPENDED;
+                }
+            }
+            else {
+                rv = ap_proxy_read_input(r, p_conn, input_brigade,
+                                         HUGE_STRING_LEN);
+            }
             if (rv != OK) {
                 return rv;
             }
@@ -704,15 +848,146 @@ static int stream_reqbody(proxy_http_req_t *req)
          */
         APR_BRIGADE_PREPEND(input_brigade, header_brigade);
 
-        /* Flush here on EOS because we won't ap_proxy_read_input() again. */
-        rv = ap_proxy_pass_brigade(bucket_alloc, r, p_conn, origin,
-                                   input_brigade, seen_eos);
-        if (rv != OK) {
-            return rv;
+        if (req->send_async) {
+            /* Don't block on the backend (WC). Wait for it in the MPM when
+             * too much is pending (backpressure: nothing more is read from
+             * the client meanwhile), and at EOS until it has taken
+             * everything (the response is waited for afterward).
+             */
+            APR_BRIGADE_INSERT_TAIL(input_brigade,
+                                    ap_bucket_wc_create(bucket_alloc));
+            rv = ap_proxy_pass_brigade(bucket_alloc, r, p_conn, origin,
+                                       input_brigade, 0);
+            if (rv != OK) {
+                return rv;
+            }
+            if (seen_eos
+                    ? ap_check_output_pending(origin) == AGAIN
+                    : ap_filter_should_yield(origin->output_filters)) {
+                req->request_eos = seen_eos;
+                req->bytes_streamed = bytes_streamed;
+                if (proxy_http_request_forward_wait(req, 1) == SUSPENDED) {
+                    return SUSPENDED;
+                }
+                /* can't wait: block */
+                req->send_async = 0;
+                rv = ap_proxy_pass_brigade(bucket_alloc, r, p_conn, origin,
+                                           input_brigade, 1);
+                if (rv != OK) {
+                    return rv;
+                }
+            }
+        }
+        else {
+            /* Flush here on EOS because we won't ap_proxy_read_input() again. */
+            rv = ap_proxy_pass_brigade(bucket_alloc, r, p_conn, origin,
+                                       input_brigade, seen_eos);
+            if (rv != OK) {
+                return rv;
+            }
         }
     } while (!seen_eos);
 
+    req->request_eos = 1;
+    req->bytes_streamed = bytes_streamed;
     return OK;
+}
+
+/* Once the request is sent (asynchronously), wait for the response and
+ * process it (proxy_http_handler()'s Step Five). Returns SUSPENDED if
+ * waiting in the MPM, otherwise the status to finish the request with.
+ */
+static int proxy_http_request_sent(proxy_http_req_t *req)
+{
+    int status;
+
+    if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
+        status = proxy_http_response_head_wait(req);
+        if (status == SUSPENDED) {
+            return SUSPENDED;
+        }
+    }
+    return ap_proxy_http_process_response(req);
+}
+
+/* The continuation of proxy_http_request_forward_wait(), called when the
+ * backend can take more of the pending output or the client sent more of the
+ * body (or on timeout or error): continue sending the request, then wait for
+ * the response.
+ */
+static void proxy_http_request_forward_continuation(conn_rec *c, request_rec *r,
+                                                    ap_mpm_wait_result_e why,
+                                                    const apr_array_header_t *pfds,
+                                                    void *baton)
+{
+    proxy_http_req_t *req = baton;
+    int status;
+
+    AP_DEBUG_ASSERT(req->r == r);
+    if (why == AP_MPM_WAIT_TIMEOUT && !req->send_wait_backend) {
+        /* Read the body once more: the read fails on mod_reqtimeout's
+         * deadline, or proxy_http_request_read_body() answers the timeout if
+         * there's still nothing to read (a 408 either way), unless the client
+         * sent some in the meantime.
+         */
+        req->request_timed_out = 1;
+    }
+    else if (why != AP_MPM_WAIT_READY) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: %s waiting for the %s while sending the "
+                      "request (async, %i)", req->proto,
+                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
+                      req->send_wait_backend ? "backend" : "client", (int)why);
+        if (req->send_wait_backend) {
+            apr_table_setn(r->notes, "proxy_timedout", "1");
+            status = HTTP_GATEWAY_TIME_OUT;
+        }
+        else {
+            status = HTTP_REQUEST_TIME_OUT;
+        }
+        proxy_http_async_finish(req, status);
+        return;
+    }
+
+    if (req->send_wait_backend) {
+        /* Write what's pending to the backend */
+        int rc = ap_check_output_pending(req->origin);
+        if (rc == AGAIN) {
+            if (proxy_http_request_forward_wait(req, 1) == SUSPENDED) {
+                return;
+            }
+            /* can't wait: block */
+            req->send_async = 0;
+            apr_brigade_cleanup(req->input_brigade);
+            rc = ap_proxy_pass_brigade(req->bucket_alloc, r, req->backend,
+                                       req->origin, req->input_brigade, 1);
+        }
+        if (rc != OK) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "proxy %s: pass request to %pI (%s) failed "
+                          "(async)", req->proto, req->backend->addr,
+                          req->backend->hostname);
+            proxy_http_async_finish(req, HTTP_BAD_GATEWAY);
+            return;
+        }
+    }
+
+    if (!req->request_eos) {
+        status = stream_reqbody(req);
+        if (status == SUSPENDED) {
+            return; /* continued later */
+        }
+        if (status != OK) {
+            proxy_http_async_finish(req, status);
+            return;
+        }
+    }
+
+    status = proxy_http_request_sent(req);
+    if (status == SUSPENDED) {
+        return; /* waiting for the response (or while streaming its body) */
+    }
+    proxy_http_async_finish(req, status);
 }
 
 static void terminate_headers(proxy_http_req_t *req)
@@ -924,6 +1199,10 @@ static int ap_proxy_http_request(proxy_http_req_t *req)
         break;
     }
 
+    if (rv == SUSPENDED) {
+        /* Continues in proxy_http_request_forward_continuation() */
+        return SUSPENDED;
+    }
     if (rv != OK) {
         conn_rec *c = r->connection;
         /* apr_status_t value has been logged in lower level method */
@@ -2484,7 +2763,17 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
          * On the off-chance that we forced a 100-Continue as a
          * kinda HTTP ping test, allow for retries
          */
+        /* Don't hold the thread while the client or the backend is slow
+         * (as for the response, see Step Five below).
+         */
+        req->send_async = (req->can_suspend
+                           && !req->do_100_continue && !req->upgrade);
+        req->request_eos = 0;
+        req->bytes_streamed = 0;
         status = ap_proxy_http_request(req);
+        if (status == SUSPENDED) {
+            return SUSPENDED;
+        }
         if (status != OK) {
             proxy_run_detach_backend(r, backend);
             if (req->do_100_continue && status == HTTP_SERVICE_UNAVAILABLE) {
