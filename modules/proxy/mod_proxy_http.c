@@ -352,6 +352,7 @@ typedef struct {
                  request_eos               :1,
                  head_in_headers        :1,
                  head_interim           :1,
+                 head_continue          :1,
                  head_stray             :1,
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
@@ -630,11 +631,21 @@ static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
         break;
     case AP_MPM_WAIT_TIMEOUT:
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
-                      "proxy %s: timeout waiting for the response of "
+                      "proxy %s: timeout waiting for the %sresponse of "
                       "%s:%d (async)", req->proto,
+                      req->do_100_continue ? "100-continue " : "",
                       backend->hostname, backend->port);
         apr_table_setn(r->notes, "proxy_timedout", "1");
-        status = HTTP_GATEWAY_TIME_OUT;
+        if (req->do_100_continue) {
+            /* 503, for the balancer to try another member (the body is
+             * not sent yet).
+             */
+            status = ap_proxyerror(r, HTTP_SERVICE_UNAVAILABLE,
+                                   "Timeout on 100-Continue");
+        }
+        else {
+            status = HTTP_GATEWAY_TIME_OUT;
+        }
         break;
     default:
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
@@ -646,7 +657,9 @@ static void proxy_http_response_head_continuation(conn_rec *c, request_rec *r,
     }
     if (status == SUSPENDED) {
         /* Streaming the response body is waiting,
-         * proxy_http_response_body_continuation() continues. Upgrades
+         * proxy_http_response_body_continuation() continues, or sending the
+         * body after a 100 Continue (then waiting for the final response),
+         * proxy_http_request_forward_continuation() continues. Upgrades
          * (tunnels) don't take this path, see proxy_http_handler().
          */
         return;
@@ -690,9 +703,15 @@ static int proxy_http_response_suspend(proxy_http_req_t *req)
     pfd->desc_type = APR_POLL_SOCKET;
     pfd->desc.s = req->backend->sock;
     pfd->reqevents = APR_POLLIN;
+    /* Waiting for the 100 Continue (or a final response) to send the body,
+     * the worker's ping= applies if set.
+     */
     rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
-                             req->idle_timeout, proxy_http_response_head_continuation,
-                             req);
+                             (req->do_100_continue
+                              && req->worker->s->ping_timeout_set)
+                             ? req->worker->s->ping_timeout
+                             : req->idle_timeout,
+                             proxy_http_response_head_continuation, req);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
                       "proxy %s: can't wait for the response asynchronously",
@@ -804,13 +823,20 @@ static int proxy_http_response_preread(proxy_http_req_t *req)
                 return OK;
             }
             req->head_interim = (status >= 100 && status < 200);
+            req->head_continue = (status == 100);
             req->head_in_headers = 1;
         }
         else if (hl->len == 0) {
-            /* End of a head: another one follows an interim response */
+            /* End of a head: another one follows an interim response, but
+             * after a 100 Continue for our Expect only once the body is sent
+             * (then pre-read again).
+             */
             if (req->head_interim) {
                 req->head_in_headers = 0;
                 req->head_stray = 0;
+                if (req->head_continue && req->do_100_continue) {
+                    return OK;
+                }
                 continue;
             }
             return OK;
@@ -1097,7 +1123,7 @@ static int proxy_http_request_sent(proxy_http_req_t *req)
 {
     int status;
 
-    if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
+    if (req->can_suspend && !req->upgrade) {
         status = proxy_http_response_head_wait(req);
         if (status == SUSPENDED) {
             return SUSPENDED;
@@ -1656,7 +1682,9 @@ static int send_continue_body(proxy_http_req_t *req)
 {
     int status;
 
-    /* Send the request body (fully). */
+    /* Send the request body (fully, or SUSPENDED if req->send_async, then
+     * proxy_http_request_forward_continuation() continues).
+     */
     switch(req->rb_method) {
     case RB_SPOOL_CL:
     case RB_STREAM_CL:
@@ -1668,7 +1696,7 @@ static int send_continue_body(proxy_http_req_t *req)
         status = HTTP_INTERNAL_SERVER_ERROR;
         break;
     }
-    if (status != OK) {
+    if (status != OK && status != SUSPENDED) {
         conn_rec *c = req->r->connection;
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, req->r,
                 APLOGNO(10154) "pass request body failed "
@@ -2517,6 +2545,30 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                      */
                     r->status = original_status;
                     r->status_line = original_status_line;
+
+                    if (req->send_async) {
+                        /* Send the body without blocking, then wait for the
+                         * final response as after any async send
+                         * (proxy_http_request_sent(), directly or from
+                         * proxy_http_request_forward_continuation()), which
+                         * processes it from the start: this call is done with
+                         * the 100 Continue.
+                         */
+                        req->do_100_continue = 0;
+                        status = send_continue_body(req);
+                        if (status != OK) {
+                            return status; /* SUSPENDED included */
+                        }
+                        return proxy_http_request_sent(req);
+                    }
+                }
+                else {
+                    /* A final response with the backend keeping the
+                     * connection (and the client not waiting for a 100):
+                     * send the body before processing it (blocking, this rare
+                     * case would need processing the response to suspend).
+                     */
+                    req->send_async = 0;
                 }
                 status = send_continue_body(req);
                 if (status != OK) {
@@ -2550,6 +2602,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
             /* If we didn't send the full body yet, do it now */
             if (do_100_continue) {
                 r->expecting_100 = 0;
+                req->send_async = 0; /* (upgrades aren't async anyway) */
                 status = send_continue_body(req);
                 if (status != OK) {
                     return status;
@@ -3186,8 +3239,11 @@ handshake:
         /* Don't hold the thread while the client or the backend is slow
          * (as for the response, see Step Five below).
          */
-        req->send_async = (req->can_suspend
-                           && !req->do_100_continue && !req->upgrade);
+        /* With 100-continue only the header is sent here (blocking, as small
+         * as it is on a fresh or idle connection), the body once the backend
+         * says so (ap_proxy_http_process_response()).
+         */
+        req->send_async = (req->can_suspend && !req->upgrade);
         req->request_eos = 0;
         req->bytes_streamed = 0;
         status = ap_proxy_http_request(req);
@@ -3208,10 +3264,10 @@ handshake:
         }
 
         /* Step Five: Receive the Response... Fall thru to cleanup */
-        if (req->can_suspend && !req->do_100_continue && !req->upgrade) {
-            /* Don't hold the thread while the backend processes the request
-             * (except for upgrades, whose tunnel path uses the hooks, and for
-             * 100-continue's ping).
+        if (req->can_suspend && !req->upgrade) {
+            /* Don't hold the thread while the backend processes the request,
+             * or decides on 100-continue (except for upgrades, whose tunnel
+             * path uses the hooks).
              */
             status = proxy_http_response_head_wait(req);
             if (status == SUSPENDED) {
