@@ -1084,7 +1084,7 @@ static int proxy_http_request_sent(proxy_http_req_t *req)
 {
     int status;
 
-    if (req->can_suspend && !req->upgrade) {
+    if (req->can_suspend) {
         status = proxy_http_response_head_wait(req);
         if (status == SUSPENDED) {
             return SUSPENDED;
@@ -2356,6 +2356,18 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                                                  NULL));
             }
             backend->close = 1;
+
+            /* RFC 9110 7.8: a server receiving both Upgrade and Expect:
+             * 100-continue MUST send the 100 before the 101. Switching
+             * with the body still held for that 100 would need to send
+             * it before tunneling (and the backend to read it as such),
+             * so refuse (before forwarding the 101 to the client).
+             */
+            if (do_100_continue && ap_request_has_body(r)) {
+                return ap_proxyerror(r, HTTP_BAD_GATEWAY,
+                                     "Switching Protocols before "
+                                     "100 Continue");
+            }
         }
 
         /* strip connection listed hop-by-hop headers from response */
@@ -2458,6 +2470,8 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                     || (!strcasecmp(policy, "RFC")
                         && (proxy_status != HTTP_CONTINUE
                             || (r->expecting_100 = 1)))) {
+                apr_status_t rv;
+
                 switch (proxy_status) {
                 case HTTP_SWITCHING_PROTOCOLS:
                     AP_DEBUG_ASSERT(upgrade != NULL);
@@ -2466,14 +2480,29 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                                    apr_pstrdup(p, upgrade));
                     break;
                 }
-                /* Async (not for upgrades): what can't be written now is
-                 * written before waiting for the client (see
-                 * proxy_http_request_read_body()), or with the final response.
+                /* Async: what can't be written now is written before waiting
+                 * for the client (see proxy_http_request_read_body()), or with
+                 * the final response, or for a 101 by the tunnel before it
+                 * forwards anything (it starts with the client's pending
+                 * output, see ap_proxy_tunnel_create()).
                  */
-                (void)ap_send_interim_response_ex(r, 1,
-                                                  req->send_async
-                                                  ? AP_SEND_INTERIM_NONBLOCK
-                                                  : 0);
+                rv = ap_send_interim_response_ex(r, 1,
+                                                 req->send_async
+                                                 ? AP_SEND_INTERIM_NONBLOCK
+                                                 : 0);
+                /* A client gone is noticed by the final response's write,
+                 * but there's none after a 101: don't tunnel for nobody
+                 * (the backend connection is upgraded already, close it).
+                 */
+                if (proxy_status == HTTP_SWITCHING_PROTOCOLS
+                    && rv != APR_SUCCESS && !APR_STATUS_IS_EAGAIN(rv)) {
+                    ap_log_rerror(APLOG_MARK, APLOG_INFO, rv, r, APLOGNO()
+                                  "proxy: client gone while sending the 101 "
+                                  "for %s", upgrade);
+                    r->connection->keepalive = AP_CONN_CLOSE;
+                    backend->close = 1;
+                    return DONE;
+                }
             }
             /* FIXME: refine this to be able to specify per-response-status
              * policies and maybe also add option to bail out with 502
@@ -2593,14 +2622,12 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
         if (proxy_status == HTTP_SWITCHING_PROTOCOLS) {
             apr_status_t rv;
 
-            /* If we didn't send the full body yet, do it now */
+            /* Still expecting the 100 Continue here means no body (a 101
+             * before the 100 with a body is refused above): nothing more to
+             * send before tunneling, the request's head was sent already.
+             */
             if (do_100_continue) {
                 r->expecting_100 = 0;
-                req->send_async = 0; /* (upgrades aren't async anyway) */
-                status = send_continue_body(req);
-                if (status != OK) {
-                    return status;
-                }
             }
 
             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10239)
@@ -2740,8 +2767,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
             /* Stream asynchronously, as when waiting for the response head
              * (see proxy_http_handler()).
              */
-            req->body_async = (req->can_suspend
-                               && !req->do_100_continue && !req->upgrade);
+            req->body_async = (req->can_suspend && !req->do_100_continue);
             status = proxy_http_response_body(req);
             if (status == SUSPENDED) {
                 /* Continues in proxy_http_response_body_continuation() */
@@ -3183,7 +3209,7 @@ handshake:
          * as it is on a fresh or idle connection), the body once the backend
          * says so (ap_proxy_http_process_response()).
          */
-        req->send_async = (req->can_suspend && !req->upgrade);
+        req->send_async = req->can_suspend;
         req->request_eos = 0;
         req->bytes_streamed = 0;
         status = ap_proxy_http_request(req);
@@ -3204,10 +3230,9 @@ handshake:
         }
 
         /* Step Five: Receive the Response... Fall thru to cleanup */
-        if (req->can_suspend && !req->upgrade) {
+        if (req->can_suspend) {
             /* Don't hold the thread while the backend processes the request,
-             * or decides on 100-continue (except for upgrades, whose response
-             * is read synchronously before tunneling).
+             * decides on 100-continue, or on an upgrade (the 101 then).
              */
             status = proxy_http_response_head_wait(req);
             if (status == SUSPENDED) {
