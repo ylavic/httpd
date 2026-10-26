@@ -108,6 +108,7 @@ typedef struct {
     ap_filter_t        *pInputFilter;
     ap_filter_t        *pOutputFilter;
     SSLConnRec         *config;
+    int                 connecting; /* outgoing handshake in progress */
 } ssl_filter_ctx_t;
 
 /* How a BIO flush writes what's pending, see bio_filter_out_flush() */
@@ -266,7 +267,10 @@ static int bio_filter_out_write(BIO *bio, const char *in, int inl)
 #else
      need_flush = SSL_in_connect_init(outctx->filter_ctx->pssl);
 #endif
-    if (need_flush) {
+    /* Not in a nonblocking handshake (with the backend), which the BIO
+     * flushes end without blocking (bio_filter_out_flush()).
+     */
+    if (need_flush && outctx->flush_mode != BIO_FLUSH_RETRY) {
         e = apr_bucket_flush_create(outctx->bb->bucket_alloc);
         APR_BRIGADE_INSERT_TAIL(outctx->bb, e);
     }
@@ -1342,9 +1346,8 @@ static apr_status_t ssl_io_filter_handshake(ssl_filter_ctx_t *filter_ctx)
             ap_log_cerror(APLOG_MARK, APLOG_TRACE1, 0, c, 
                           "setting alpn protos from '%s', protolen=%d", 
                           alpn_note, (int)(s - protos));
-            if (protos != s && SSL_set_alpn_protos(filter_ctx->pssl, 
-                                                   (unsigned char *)protos, 
-                                                   s - protos)) {
+            if (!filter_ctx->connecting && protos != s
+                && SSL_set_alpn_protos(filter_ctx->pssl, (unsigned char *)protos, s - protos)) {
                 ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, c, APLOGNO(03310)
                               "error setting alpn protos from '%s'", alpn_note);
                 ssl_log_ssl_error(SSLLOG_MARK, APLOG_WARNING, server);
@@ -1360,7 +1363,7 @@ static apr_status_t ssl_io_filter_handshake(ssl_filter_ctx_t *filter_ctx)
          * pass them on, but RFC 6066 is quite clear on this: "Literal
          * IPv4 and IPv6 addresses are not permitted".)
          */
-        if (hostname_note &&
+        if (!filter_ctx->connecting && hostname_note &&
 #ifndef OPENSSL_NO_SSL3
             dc->proxy->protocol != SSL_PROTOCOL_SSLV3 &&
 #endif
@@ -1380,6 +1383,24 @@ static apr_status_t ssl_io_filter_handshake(ssl_filter_ctx_t *filter_ctx)
 #endif /* defined HAVE_TLSEXT */
 
         if ((n = SSL_connect(filter_ctx->pssl)) <= 0) {
+            ssl_err = SSL_get_error(filter_ctx->pssl, n);
+            if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                /* With nonblocking reads (e.g. AP_MODE_INIT with
+                 * APR_NONBLOCK_READ), report EAGAIN: the caller calls us
+                 * again once the backend is ready, and the handshake
+                 * continues from where it stopped.
+                 */
+                bio_filter_out_ctx_t *outctx =
+                    (bio_filter_out_ctx_t *)BIO_get_data(filter_ctx->pbioWrite);
+                ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, c,
+                              "Want %s during nonblocking connect",
+                              ssl_err == SSL_ERROR_WANT_READ ? "read"
+                                                             : "write");
+                filter_ctx->connecting = 1;
+                outctx->rc = APR_EAGAIN;
+                return APR_EAGAIN;
+            }
+            filter_ctx->connecting = 0;
             ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, c, APLOGNO(02003)
                           "SSL Proxy connect failed");
             ssl_log_ssl_error(SSLLOG_MARK, APLOG_INFO, server);
@@ -1389,6 +1410,7 @@ static apr_status_t ssl_io_filter_handshake(ssl_filter_ctx_t *filter_ctx)
             return MODSSL_ERROR_BAD_GATEWAY;
         }
 
+        filter_ctx->connecting = 0;
         cert = SSL_get_peer_certificate(filter_ctx->pssl);
 
         if (dc->proxy->ssl_check_peer_expire != FALSE) {
@@ -2442,6 +2464,7 @@ apr_status_t ssl_io_filter_init(conn_rec *c, request_rec *r, SSL *ssl)
     filter_ctx = apr_palloc(c->pool, sizeof(ssl_filter_ctx_t));
 
     filter_ctx->config          = myConnConfig(c);
+    filter_ctx->connecting      = 0;
 
     ap_add_output_filter(ssl_io_coalesce, NULL, r, c);
 

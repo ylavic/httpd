@@ -340,6 +340,7 @@ typedef struct {
     ap_proxy_connect_state connect;
 
     unsigned int connecting             :1,
+                 handshaking            :1,
                  toclose                :1,
                  can_suspend            :1,
                  body_async             :1,
@@ -2790,6 +2791,22 @@ static void proxy_http_finish_request(request_rec *r, int status)
 
 static int proxy_http_process(proxy_http_req_t *req);
 
+/* Finish a request whose continuation ran before Step Five, cleaning up as
+ * proxy_http_handler() does.
+ */
+static void proxy_http_continuation_finish(proxy_http_req_t *req, int status)
+{
+    if (req->backend) {
+        if (status != OK) {
+            req->backend->close = 1;
+        }
+        ap_proxy_release_connection(req->proto, req->backend,
+                                    req->r->server);
+        req->backend = NULL;
+    }
+    proxy_http_async_finish(req, status);
+}
+
 /* The continuation of proxy_http_connect(), called when the connect in
  * progress completes (or on timeout or error): go on with the steps from
  * there.
@@ -2831,15 +2848,7 @@ static void proxy_http_connect_continuation(conn_rec *c, request_rec *r,
     }
 
 finish:
-    /* Clean up as proxy_http_handler() does */
-    if (req->backend) {
-        if (status != OK) {
-            req->backend->close = 1;
-        }
-        ap_proxy_release_connection(req->proto, req->backend, r->server);
-        req->backend = NULL;
-    }
-    proxy_http_async_finish(req, status);
+    proxy_http_continuation_finish(req, status);
 }
 
 /* Connect to the backend, without blocking when waiting asynchronously is
@@ -2948,10 +2957,149 @@ static int proxy_http_connect(proxy_http_req_t *req)
     return SUSPENDED;
 }
 
+static void proxy_http_handshake_continuation(conn_rec *c, request_rec *r,
+                                              ap_mpm_wait_result_e why,
+                                              const apr_array_header_t *pfds,
+                                              void *baton);
+
+/* Perform the TLS handshake with the backend before sending the request.
+ * Without this, the handshake would happen (blocking) in the first write of
+ * the request. Here it's driven by nonblocking reads (mod_ssl's AP_MODE_INIT
+ * with APR_NONBLOCK_READ): when it would block, we poll for up to
+ * ProxyAsyncDelay and then wait in the MPM, which calls
+ * proxy_http_handshake_continuation() once the backend is ready. Nothing is
+ * done for a reused connection, whose handshake is complete already. Returns
+ * OK, SUSPENDED, or an HTTP error. On error, the backend connection is marked
+ * to be closed and nothing is written to it.
+ */
+static int proxy_http_handshake(proxy_http_req_t *req)
+{
+    request_rec *r = req->r;
+    conn_rec *origin = req->origin;
+    proxy_conn_rec *backend = req->backend;
+    apr_bucket_brigade *bb;
+    apr_array_header_t *pfds;
+    apr_pollfd_t *pfd;
+    apr_int16_t events;
+    apr_status_t rv;
+
+    req->handshaking = 0;
+    bb = apr_brigade_create(req->p, origin->bucket_alloc);
+    for (;;) {
+        rv = ap_get_brigade(origin->input_filters, bb, AP_MODE_INIT,
+                            APR_NONBLOCK_READ, 0);
+        apr_brigade_cleanup(bb);
+        if (!APR_STATUS_IS_EAGAIN(rv)) {
+            break;
+        }
+        /* Wait for the backend to be writable if the handshake left output
+         * pending, otherwise for it to be readable.
+         */
+        events = (ap_check_output_pending(origin) == AGAIN) ? APR_POLLOUT
+                                                             : APR_POLLIN;
+        if (!proxy_http_ready_within_delay(req, backend->sock, events)) {
+            break;
+        }
+    }
+    apr_brigade_destroy(bb);
+    if (rv == APR_SUCCESS) {
+        return OK;
+    }
+    if (!APR_STATUS_IS_EAGAIN(rv)) {
+        const char *ssl_note;
+
+        /* Fail the same way as when the handshake fails in the first write.
+         * mod_ssl has shut the TLS layer down, so anything written to this
+         * connection now would go out unencrypted: it must be closed.
+         */
+        backend->close = 1;
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "proxy %s: TLS handshake with %pI (%s) failed",
+                      req->proto, backend->addr, backend->hostname);
+        if (origin->aborted
+            && (ssl_note = apr_table_get(origin->notes, "SSL_connect_rv")) != NULL
+            && strcmp(ssl_note, "err") == 0) {
+            return ap_proxyerror(r, HTTP_INTERNAL_SERVER_ERROR,
+                                 "Error during SSL Handshake with"
+                                 " remote server");
+        }
+        return HTTP_BAD_GATEWAY;
+    }
+
+    if (req->async_pool) {
+        apr_pool_clear(req->async_pool);
+    }
+    else {
+        apr_pool_create(&req->async_pool, req->p);
+    }
+    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
+    pfd = apr_array_push(pfds);
+    memset(pfd, 0, sizeof(*pfd));
+    pfd->p = req->async_pool;
+    pfd->desc_type = APR_POLL_SOCKET;
+    pfd->desc.s = backend->sock;
+    pfd->reqevents = events;
+    rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
+                             req->idle_timeout, proxy_http_handshake_continuation,
+                             req);
+    if (rv != APR_SUCCESS) {
+        /* We can't wait asynchronously, so the first write of the request
+         * will finish the handshake (blocking).
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy %s: can't wait for the TLS handshake "
+                      "asynchronously", req->proto);
+        return OK;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy %s: TLS handshake with %s:%d: waiting to %s (async)",
+                  req->proto, backend->hostname, backend->port,
+                  events == APR_POLLOUT ? "write" : "read");
+    return SUSPENDED;
+}
+
+/* The continuation of proxy_http_handshake(), called by the MPM when the
+ * backend is ready, or on timeout or error: continue the handshake, then the
+ * remaining steps.
+ */
+static void proxy_http_handshake_continuation(conn_rec *c, request_rec *r,
+                                              ap_mpm_wait_result_e why,
+                                              const apr_array_header_t *pfds,
+                                              void *baton)
+{
+    proxy_http_req_t *req = baton;
+    int status;
+
+    AP_DEBUG_ASSERT(req->r == r);
+    if (why != AP_MPM_WAIT_READY) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy %s: %s during the TLS handshake with %s:%d "
+                      "(async, %i)", req->proto,
+                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
+                      req->backend->hostname, req->backend->port, (int)why);
+        req->backend->close = 1;
+        /* A failed handshake (as ap_proxy_pass_brigade() reports it) */
+        status = ap_proxyerror(r, HTTP_INTERNAL_SERVER_ERROR,
+                               "Error during SSL Handshake with"
+                               " remote server");
+        proxy_http_continuation_finish(req, status);
+        return;
+    }
+
+    req->handshaking = 1;
+    status = proxy_http_process(req);
+    if (status == SUSPENDED) {
+        return;
+    }
+    proxy_http_continuation_finish(req, status);
+}
+
 /* Run Steps Two to Five of proxy_http_handler(): from Step Two (again for a
- * 100-continue retry), or from the connect in progress when resumed
- * (req->connecting, proxy_http_connect_continuation()).
- * Returns the status of the request, or SUSPENDED.
+ * 100-continue retry), from the connect in progress when continued
+ * (req->connecting, proxy_http_connect_continuation()), or from the TLS
+ * handshake in progress (req->handshaking,
+ * proxy_http_handshake_continuation()). Returns the status of the request, or
+ * SUSPENDED.
  */
 static int proxy_http_process(proxy_http_req_t *req)
 {
@@ -2961,6 +3109,9 @@ static int proxy_http_process(proxy_http_req_t *req)
     int status = OK;
 
     while (req->retry < 2) {
+        if (req->handshaking) {
+            goto handshake; /* Steps Two and Three are done already */
+        }
         if (req->retry && !req->connecting) {
             char *newurl = req->url;
 
@@ -3003,6 +3154,20 @@ static int proxy_http_process(proxy_http_req_t *req)
         if (req->toclose) {
             backend->close = 1;
             req->origin->keepalive = AP_CONN_CLOSE;
+        }
+
+handshake:
+        /* Do the TLS handshake now, so that the first write below doesn't
+         * block on it.
+         */
+        if (backend->is_ssl && req->can_suspend) {
+            status = proxy_http_handshake(req);
+            if (status == SUSPENDED) {
+                return SUSPENDED;
+            }
+            if (status != OK) {
+                break;
+            }
         }
 
         /* Step Four: Send the Request
