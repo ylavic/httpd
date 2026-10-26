@@ -13,7 +13,9 @@ default)
 import calendar
 import os
 import re
+import resource
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -69,6 +71,10 @@ SCENARIOS = {
     "async-mix": dict(groups=[("bg", "suspend=100", "c", 200, True), PROBES]),
     "progress": dict(groups=[("inprogress", "suspend=20", "c", 32, True),
                              ("flood", FLOOD, "c", 64, False)]),
+    # Idle keepalive connections (one request each, then nothing), held while
+    # the probes run: below httpd's descriptors limit, and beyond it (EMFILE).
+    "idle": dict(idle=1500, nofile=4096, groups=[PROBES]),
+    "idle-emfile": dict(idle=3000, nofile=2048, groups=[PROBES]),
     # One child at start, the second spawned once the first one's threads are
     # all blocked (MinSpareThreads): the probes should go to the second one.
     "two-children": dict(children=2, start=1, minspare=4,
@@ -90,7 +96,7 @@ def tree_cpu(pid):
     return total / TICK
 
 
-def start_httpd(children, threads, extra, start=None, minspare=1):
+def start_httpd(children, threads, extra, start=None, minspare=1, nofile=None):
     os.makedirs(work, exist_ok=True)
     with open(os.path.join(work, "httpd.conf"), "w") as f:
         f.write(CONF.format(prefix=prefix, port=PORT, work=work, aptest=aptest,
@@ -98,8 +104,12 @@ def start_httpd(children, threads, extra, start=None, minspare=1):
                             start=start or children, minspare=minspare,
                             workers=children * threads, extra=extra))
     open(os.path.join(work, "error_log"), "w").close()
+    def limit_nofile():
+        if nofile:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
     p = subprocess.Popen(["taskset", "-c", HTTPD_CPUS, os.path.join(prefix, "bin", "httpd"),
-                          "-f", os.path.join(work, "httpd.conf"), "-DFOREGROUND"])
+                          "-f", os.path.join(work, "httpd.conf"), "-DFOREGROUND"],
+                         preexec_fn=limit_nofile)
     for _ in range(100):
         r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                             "http://127.0.0.1:%d/q" % PORT], capture_output=True, text=True)
@@ -160,6 +170,44 @@ def run_bursts(label, query, amount, results, t_end):
                           note="per-burst worst p50/p99")
 
 
+def hold_idle(count):
+    """Open count keepalive connections, a request on each (its response left
+    unread), then nothing: idle connections for httpd, or waiting in its
+    listen backlog if it can't accept them"""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < count + 256:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, count + 256), hard))
+    req = b"GET /q?cpu=0 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    socks = []
+    for _ in range(count):
+        s = socket.socket()
+        s.settimeout(5)
+        s.connect(("127.0.0.1", PORT))
+        s.sendall(req)
+        socks.append(s)
+    return socks
+
+
+def answered(socks):
+    """How many of the idle connections got their response, and how many
+    httpd closed since"""
+    n = closed = 0
+    for s in socks:
+        s.setblocking(False)
+        got = False
+        try:
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    closed += 1
+                    break
+                got = True
+        except OSError:
+            pass
+        n += got
+    return n, closed
+
+
 LINE = re.compile(r"^\[([^\]]+)\].*backlog sojourn:(.*); accept off (\d+) times, (\d+)ms"
                   r"(?:, backstop (\d+))?")
 CLASS = re.compile(r"(\w+):n=(\d+),avg=(\d+)us,p50<(\d+)us,p99<(\d+)us,max=(\d+)us")
@@ -198,8 +246,12 @@ def run(name, sc):
     threads = sc.get("threads", THREADS)
     extra = sc.get("extra", "") + "\n" + CONF_EXTRA
     p = start_httpd(children, threads, extra, sc.get("start"),
-                    sc.get("minspare", 1))
+                    sc.get("minspare", 1), sc.get("nofile"))
+    idle = []
     try:
+        if sc.get("idle"):
+            idle = hold_idle(sc["idle"])
+            time.sleep(1)
         results, threads_ = {}, []
         procs = []
         t_start = time.monotonic()
@@ -224,14 +276,23 @@ def run(name, sc):
             th.join()
         time.sleep(1.2)  # the last stats line
         classes, toggles, off_ms, backstops, lines = server_stats(w0, w1 + 1)
+        idle_answered, idle_closed = answered(idle)
     finally:
         stop_httpd(p)
+        for s in idle:
+            s.close()
 
     cpu = (c1 - c0) / (w1 - w0) / 4 * 100
     print("== %s (%d child%s x %d threads): httpd CPU %.0f%% of 4 cores, "
           "accept off %d times (backstop %d), %dms (in %d stats lines)"
           % (name, children, "ren" if children > 1 else "", threads, cpu, toggles,
              backstops, off_ms, lines))
+    if idle:
+        with open(os.path.join(work, "error_log")) as f:
+            emfile = sum(1 for line in f if "Too many open files" in line)
+        print("   idle       %d held, %d answered, %d closed by httpd (nofile %s), "
+              "%d \"Too many open files\" logged"
+              % (len(idle), idle_answered, idle_closed, sc.get("nofile"), emfile))
     for label, r in results.items():
         if r:
             print("   %-10s %6.0f req/s  p50 %8.2fms  p99 %8.2fms  max %8.2fms  errors %d %s"
