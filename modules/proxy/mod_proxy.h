@@ -1567,7 +1567,8 @@ typedef struct {
 } proxy_tunnel_rec;
 
 /**
- * Create a tunnel, to be activated by ap_proxy_tunnel_run().
+ * Create a tunnel, to be activated by ap_proxy_tunnel_run() (or driven by
+ * ap_proxy_tunnel_step()).
  * @param tunnel   tunnel created
  * @param r        client request
  * @param c_o      connection to origin
@@ -1586,6 +1587,22 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **tunnel,
  *                or another HTTP_ error otherwise.
  */
 PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel);
+
+/**
+ * Forward what can be forwarded from either side of the tunnel to the other
+ * without blocking nor polling, for tunneling driven by the caller's polling
+ * (e.g. the MPM's, ap_mpm_register_wait()): the tunnel's pfds (tunnel->pfds)
+ * then have the events to wait for in their reqevents.
+ * @param tunnel  tunnel to step
+ * @param ready   the tunnel's pfds as polled, with their rtnevents set, or
+ *                NULL to try what each side waits for (e.g. the first step)
+ * @return        SUSPENDED to wait for the pfds' reqevents, OK if completion
+ *                is full, or an HTTP_ error otherwise.
+ * @remark Input already held by the connections' input filters is forwarded
+ *         before returning SUSPENDED (no polling would report it).
+ */
+PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
+                                        const apr_array_header_t *ready);
 
 /*
  * Number of incoming bytes on the tunnel connection.
