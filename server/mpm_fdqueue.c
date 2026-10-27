@@ -612,6 +612,13 @@ AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
         if (!(flags & AP_QUEUE_PUSH_NO_SIGNAL)) {
             apr_thread_cond_signal(queue->not_empty);
         }
+        /* The waiters woken up but not running yet are still counted (they
+         * decrement once the lock is theirs again), each popping one event
+         */
+        if ((flags & AP_QUEUE_PUSH_CHECK_WAITERS)
+            && queue->nelts > queue->num_waiters) {
+            rv = APR_INCOMPLETE;
+        }
         break;
 
     default:

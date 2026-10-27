@@ -138,6 +138,11 @@ AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
 /* mpm_event API (queue of any event) */
 /* Don't wake up a waiting popper (the pusher pops the event itself) */
 #define AP_QUEUE_PUSH_NO_SIGNAL (1u << 0)
+/* APR_INCOMPLETE rather than APR_SUCCESS when the event is queued but more
+ * events are queued than waiters wait for one (or were woken up and will pop
+ * one): one is left for the caller to get popped otherwise
+ */
+#define AP_QUEUE_PUSH_CHECK_WAITERS (1u << 1)
 /* Push an event, with AP_QUEUE_PUSH_* flags */
 AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
                                              ap_queue_event_t *event,

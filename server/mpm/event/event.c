@@ -231,6 +231,11 @@ static int thread_limit = 0;                /* ThreadLimit */
 static int conns_this_child = 0;            /* MaxConnectionsPerChild, only accessed
                                                in listener thread */
 static double admission_backlog = DEFAULT_ADMISSION_BACKLOG; /* AsyncAdmissionBacklogPerThread */
+#ifndef AP_EVENT_WORKER_POLLERS
+#define AP_EVENT_WORKER_POLLERS 0           /* auto */
+#endif
+static int worker_pollers = AP_EVENT_WORKER_POLLERS; /* AsyncWorkerPollers,
+                                                       0 for auto */
 
 /* Idle workers poll the connections themselves (worker_poll_next()): needs
  * one-shot pfds and APR to poll a pollset from several threads. Building with
@@ -388,8 +393,10 @@ static apr_pollset_t *event_pollset;
 static apr_pollset_t *conn_pollset;
 #ifdef EVENT_WORKER_POLL
 static void ring_doorbell(void);
+static APR_INLINE int workers_parked(void);
 #else
 #define ring_doorbell() ((void)0)
+#define workers_parked() 0
 #endif
 #define POLLSET_RESERVE_SIZE 10000
 
@@ -1283,10 +1290,13 @@ static void accept_off_record(apr_time_t duration)
 
 /* The workers polling conn_pollset (worker_poll_one()): their polls, the
  * connections and waits they claimed, and the events they dropped (expired,
- * completed or claimed otherwise meanwhile, or stale). Counted only with the
- * backlog stats (backlog_stats_on).
+ * completed or claimed otherwise meanwhile, or stale), and the polls missed
+ * for lack of a slot and the worker_poll_baton's queuings
+ * (AsyncWorkerPollers). Counted only with the backlog stats
+ * (backlog_stats_on).
  */
 static /*atomic*/ apr_uint32_t drain_polls, drain_csd, drain_user, drain_dropped;
+static /*atomic*/ apr_uint32_t poll_misses, poll_promotions;
 
 #define DRAIN_STAT_INC(counter) do { \
     if (backlog_stats_on) { \
@@ -1337,7 +1347,8 @@ static void backlog_stats_report(apr_time_t now)
                  "backlog sojourn:%s; dropped %u; accept off %u times, %"
                  APR_TIME_T_FMT "ms, backstop %u,"
                  " resumed woken %u recheck %u other %u;"
-                 " drain polls=%u csd=%u user=%u dropped=%u; accept offs ended %u: p50<%uus,max=%uus",
+                 " drain polls=%u csd=%u user=%u dropped=%u"
+                 " misses=%u promotions=%u; accept offs ended %u: p50<%uus,max=%uus",
                  len ? buf : " none", backlog_dropped,
                  toggles, apr_time_as_msec(off),
                  apr_atomic_xchg32(&admission_backstops, 0),
@@ -1346,6 +1357,8 @@ static void backlog_stats_report(apr_time_t now)
                  apr_atomic_xchg32(&drain_csd, 0),
                  apr_atomic_xchg32(&drain_user, 0),
                  apr_atomic_xchg32(&drain_dropped, 0),
+                 apr_atomic_xchg32(&poll_misses, 0),
+                 apr_atomic_xchg32(&poll_promotions, 0),
                  accept_off_ended,
                  (accept_off_ended
                   ? backlog_hist_bound(accept_off_hist, accept_off_ended, 50)
@@ -1896,6 +1909,47 @@ static struct {
     CACHE_LINE_ALIGNED
     /*atomic*/ apr_uint32_t rung;
 } doorbell_state;
+
+/* worker_poll: at most worker_poll_slots_max workers poll conn_pollset at once
+ * (AsyncWorkerPollers, by default num_cpus: those this process can run on),
+ * since every poll returning takes the pollset's lock in the kernel, contended
+ * by the other pollers. A worker that would block without a slot parks on the
+ * worker_queue instead (woken up by what's queued), and a poller leaving
+ * conn_pollset with nobody blocked there anymore while workers are parked
+ * queues the worker_poll_baton for one of them to come and poll.
+ */
+static apr_uint32_t worker_poll_slots_max;
+
+/* Written by the polling and parking workers at each poll and park, read
+ * by them and the listener: in a cache line of its own (false sharing).
+ */
+static struct {
+    CACHE_LINE_ALIGNED
+    /*atomic*/ apr_uint32_t slots;   /* workers polling conn_pollset */
+    /*atomic*/ apr_uint32_t blocked; /* those blocking there */
+    /*atomic*/ apr_uint32_t parked;  /* workers parked on the worker_queue */
+    /*atomic*/ apr_uint32_t baton;   /* worker_poll_baton queued */
+} worker_poll_stats;
+
+/* Queued for a parked worker to come and poll (worker_poll_promote()). A
+ * single static baton is safe: it's queued at most once at a time
+ * (worker_poll_stats.baton, set from 0 to 1 by worker_poll_promote()'s CAS),
+ * so it has one owner at a time; its fields are set here, or written by the
+ * queue under its lock (elem, queued_at), and the popper only compares the
+ * pointer and releases it (worker_poll_stats.baton = 0). Not const, the
+ * queue writes it.
+ */
+static ap_queue_event_t worker_poll_baton = {
+    AP_QUEUE_EVENT_BATON, { NULL }, NULL, NULL, NULL, 0, BACKLOG_TIMER
+};
+
+/* Whether workers are parked on the worker_queue, counted until they return
+ * from it (with an event or not).
+ */
+static APR_INLINE int workers_parked(void)
+{
+    return apr_atomic_read32(&worker_poll_stats.parked) != 0;
+}
 
 /* worker_poll: a worker notifying a wait (ap_mpm_notify(), e.g. releasing a
  * backend connection to a pool waiter) completes it itself rather than
@@ -3946,11 +4000,22 @@ static int push2worker(event_conn_state_t *cs, timer_event_t *te,
     qe->qclass = (te) ? BACKLOG_TIMER : qclass;
     qe->queued_at = now; /* the listener's, when the event was polled */
 
-    rc = ap_queue_push_event(worker_queue, qe, 0);
+    /* A worker queuing for itself pops it next (worker_wake_queued), don't
+     * wake up a parked one for nothing. Otherwise a parked worker is woken up
+     * by the queue's signal, and the doorbell rings for a worker blocked
+     * polling (worker_poll) when no parked one is left for the event: the
+     * queue counts those woken up but not running yet, as workers_parked()
+     * does until they return from the queue, but not the ones having popped
+     * their event already.
+     */
+    rc = ap_queue_push_event(worker_queue, qe,
+                             (by_worker) ? AP_QUEUE_PUSH_NO_SIGNAL
+                                         : AP_QUEUE_PUSH_CHECK_WAITERS);
+    if (rc == APR_INCOMPLETE) {
+        ring_doorbell();
+        rc = APR_SUCCESS;
+    }
     if (rc == APR_SUCCESS) {
-        if (!by_worker) {
-            ring_doorbell(); /* a worker blocked polling (worker_poll) */
-        }
         return 1;
     }
     else {
@@ -5420,6 +5485,79 @@ static event_conn_state_t *worker_poll_one(int slot,
     return cs;
 }
 
+/* A poller leaving conn_pollset with nobody blocked there anymore while
+ * workers are parked: queue the worker_poll_baton for one of them to come and
+ * poll (once, until popped). Both the pollers here and the parking workers
+ * update their counter before reading the other's, with atomic
+ * read-modify-writes, so either a parking worker sees a free slot or the
+ * pollers see it parked. Hence apr_atomic_add32(x, 0) for these reads:
+ * apr_atomic_read32() isn't ordered after a previous update everywhere (e.g.
+ * the mutex based or ppc implementations, a plain load there).
+ */
+static void worker_poll_promote(void)
+{
+    if (!apr_atomic_add32(&worker_poll_stats.blocked, 0)
+        && apr_atomic_add32(&worker_poll_stats.parked, 0)
+        && !apr_atomic_cas32(&worker_poll_stats.baton, 1, 0)) {
+        if (ap_queue_push_event(worker_queue, &worker_poll_baton, 0) != APR_SUCCESS) {
+            apr_atomic_set32(&worker_poll_stats.baton, 0);
+            return;
+        }
+        DRAIN_STAT_INC(poll_promotions);
+    }
+}
+
+/* worker_poll_one() with a poll slot (AsyncWorkerPollers), *polled zero if
+ * there's none.
+ */
+static event_conn_state_t *worker_poll_slot(int slot,
+                                            apr_interval_time_t timeout,
+                                            int *doorbell, int *polled)
+{
+    event_conn_state_t *cs;
+
+    if (apr_atomic_inc32(&worker_poll_stats.slots) >= worker_poll_slots_max) {
+        apr_atomic_dec32(&worker_poll_stats.slots);
+        DRAIN_STAT_INC(poll_misses);
+        *polled = 0;
+        return NULL;
+    }
+    *polled = 1;
+
+    if (timeout) {
+        apr_atomic_inc32(&worker_poll_stats.blocked);
+    }
+    cs = worker_poll_one(slot, timeout, doorbell);
+    if (timeout) {
+        apr_atomic_dec32(&worker_poll_stats.blocked);
+    }
+    apr_atomic_dec32(&worker_poll_stats.slots);
+
+    /* Leaving to run a connection (otherwise this worker polls again) */
+    if (cs) {
+        worker_poll_promote();
+    }
+    return cs;
+}
+
+/* Wait on the worker_queue for an event (or the worker_poll_baton) rather than
+ * in conn_pollset, no poll slot being available. APR_EAGAIN if one is now.
+ */
+static apr_status_t worker_park(ap_queue_event_t **pqe)
+{
+    apr_status_t rv;
+
+    apr_atomic_inc32(&worker_poll_stats.parked);
+    if (apr_atomic_add32(&worker_poll_stats.slots, 0) < worker_poll_slots_max) {
+        /* A slot freed meanwhile, the pollers may not have seen us */
+        apr_atomic_dec32(&worker_poll_stats.parked);
+        return APR_EAGAIN;
+    }
+    rv = ap_queue_pop_event(worker_queue, pqe);
+    apr_atomic_dec32(&worker_poll_stats.parked);
+    return rv;
+}
+
 static int worker_queue_empty(void)
 {
     int i;
@@ -5518,20 +5656,27 @@ static apr_status_t worker_poll_next(int slot,
                                      event_conn_state_t **pcs)
 {
     apr_time_t now = event_time_now();
+    int answered = 0;
 
     worker_poll_round_charge(round, now);
     for (;;) {
         event_conn_state_t *cs;
-        int doorbell = 0, pop_first = 0;
+        int doorbell = 0, pop_first, polled;
         apr_status_t rv;
 
+        /* Woken up by the doorbell: something is queued for this worker,
+         * which the doorbell rang once for, so pop it before polling (an
+         * event polled instead would leave it queued with nobody woken up
+         * for it, until the next ring)
+         */
+        pop_first = answered;
 #ifdef EVENT_WORKER_NOTIFY
         /* Its own continuation queued without ringing (event_notify()) */
-        pop_first = worker_wake_queued;
+        pop_first |= worker_wake_queued;
         worker_wake_queued = 0;
 #endif
         if (!pop_first && round->polled <= round->queued) {
-            cs = worker_poll_one(slot, 0, &doorbell);
+            cs = worker_poll_slot(slot, 0, &doorbell, &polled);
             if (cs) {
                 round->since = now;
                 round->from_poll = 1;
@@ -5540,10 +5685,16 @@ static apr_status_t worker_poll_next(int slot,
             }
             if (doorbell) {
                 answer_doorbell(); /* something queued */
+                answered = 1;
             }
         }
 
         rv = ap_queue_trypop_event(worker_queue, pqe);
+        if (rv == APR_SUCCESS && *pqe == &worker_poll_baton) {
+            apr_atomic_set32(&worker_poll_stats.baton, 0);
+            continue; /* this worker polls anyway, after what's rung for */
+        }
+        answered = 0;
         if (rv == APR_SUCCESS) {
             round->since = now;
             round->from_poll = 0;
@@ -5566,8 +5717,27 @@ static apr_status_t worker_poll_next(int slot,
             return APR_EINTR;
         }
 
-        /* Nothing either way, wait for something */
-        cs = worker_poll_one(slot, WORKER_POLL_TIMEOUT, &doorbell);
+        /* Nothing either way, wait for something: in conn_pollset with a
+         * slot, else parked on the worker_queue
+         */
+        cs = worker_poll_slot(slot, WORKER_POLL_TIMEOUT, &doorbell, &polled);
+        if (!polled) {
+            rv = worker_park(pqe);
+            now = event_time_now();
+            if (rv == APR_SUCCESS && *pqe == &worker_poll_baton) {
+                apr_atomic_set32(&worker_poll_stats.baton, 0);
+                continue; /* promoted, come and poll */
+            }
+            if (rv == APR_SUCCESS) {
+                round->since = now;
+                round->from_poll = 0;
+                return APR_SUCCESS;
+            }
+            if (APR_STATUS_IS_EAGAIN(rv)) {
+                continue; /* a slot freed meanwhile */
+            }
+            return rv;
+        }
         now = event_time_now();
         if (cs) {
             round->since = now;
@@ -5579,6 +5749,7 @@ static apr_status_t worker_poll_next(int slot,
             return APR_TIMEUP;
         }
         answer_doorbell();
+        answered = 1;
     }
 }
 #endif /* EVENT_WORKER_POLL */
@@ -5776,9 +5947,16 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
 #ifdef EVENT_WORKER_NOTIFY
     worker_thread_polls = 0;
     if (worker_wake_queued) {
-        /* Exiting before popping it, another worker will */
+        /* Exiting before popping it, another worker will: a polling one
+         * (the doorbell) or a parked one, woken up by the interrupt and
+         * popping what's queued first (the interrupt itself goes to whichever
+         * pop finds the queue empty later, see ap_queue_interrupt_one())
+         */
         worker_wake_queued = 0;
         ring_doorbell();
+        if (workers_parked()) {
+            ap_queue_interrupt_one(worker_queue);
+        }
     }
 #endif
 
@@ -5985,6 +6163,14 @@ static void setup_threads_runtime(void)
         if (rv == APR_SUCCESS) {
             conn_pollset = ps;
             worker_poll = 1;
+            worker_poll_slots_max = (worker_pollers > 0) ? worker_pollers
+                                                         : num_cpus;
+            if (worker_poll_slots_max > (apr_uint32_t)threads_per_child) {
+                worker_poll_slots_max = threads_per_child;
+            }
+            ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                         "workers polling at most %u at once%s",
+                         worker_poll_slots_max, (worker_pollers > 0) ? "" : " (auto)");
 #if defined(APR_POLLET) && defined(EVENT_WORKER_NOTIFY)
             /* Edge-triggered kept pfds where APR supports them */
             kept_pfds_et = (strcmp(apr_pollset_method_name(ps), "epoll") == 0
@@ -7492,6 +7678,7 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
     admission_backlog = DEFAULT_ADMISSION_BACKLOG;
     admission_target = apr_time_from_msec(AP_EVENT_ADMISSION_TARGET);
     admission_interval = apr_time_from_msec(AP_EVENT_ADMISSION_INTERVAL);
+    worker_pollers = AP_EVENT_WORKER_POLLERS;
 
     return OK;
 }
@@ -7966,6 +8153,28 @@ static const char *set_admission_backlog(cmd_parms *cmd, void *dummy,
     return NULL;
 }
 
+static const char *set_worker_pollers(cmd_parms *cmd, void *dummy,
+                                      const char *arg)
+{
+    const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
+    if (err != NULL) {
+        return err;
+    }
+
+    if (strcasecmp(arg, "auto") == 0) {
+        worker_pollers = 0;
+    }
+    else {
+        char *endptr;
+        long n = strtol(arg, &endptr, 10);
+        if (*endptr || n < 1 || n > INT_MAX) {
+            return "AsyncWorkerPollers must be a positive number or auto";
+        }
+        worker_pollers = (int)n;
+    }
+    return NULL;
+}
+
 static const char *set_admission_time(cmd_parms *cmd, void *dummy,
                                       const char *arg)
 {
@@ -8019,6 +8228,9 @@ static const command_rec event_cmds[] = {
                   RSRC_CONF,
                   "How long the new connections must be late (ms by default) "
                   "before accepting stops"),
+    AP_INIT_TAKE1("AsyncWorkerPollers", set_worker_pollers, NULL, RSRC_CONF,
+                  "How many idle workers can poll the connections at once, "
+                  "or auto (the CPUs available)"),
     AP_GRACEFUL_SHUTDOWN_TIMEOUT_COMMAND,
     {NULL}
 };

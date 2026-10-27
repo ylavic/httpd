@@ -60,7 +60,8 @@ as a listener thread which listens for connections and passes them to a worker t
 
 <p>Run-time configuration directives are identical to those provided by <module>worker</module>, with the addition
 of the <a href="#admission">admission</a> directives (<directive>AsyncAdmissionTarget</directive>,
-<directive>AsyncAdmissionInterval</directive> and <directive>AsyncAdmissionBacklogPerThread</directive>).</p>
+<directive>AsyncAdmissionInterval</directive> and <directive>AsyncAdmissionBacklogPerThread</directive>)
+and <directive>AsyncWorkerPollers</directive>.</p>
 
 </section>
 
@@ -90,8 +91,11 @@ of the <a href="#admission">admission</a> directives (<directive>AsyncAdmissionT
 
     <p>By default the idle worker threads poll the connections themselves,
         and run what they get without a hand-off from the listener thread.
-        Defining <code>AP_EVENT_NO_WORKER_POLL</code> at build time restores
-        the listener thread polling the connections for the workers.</p>
+        At most <directive>AsyncWorkerPollers</directive> of them poll at
+        once (by default as many as the CPUs the process can run on), the
+        others wait for the work queued by the listener thread. Defining
+        <code>AP_EVENT_NO_WORKER_POLL</code> at build time restores the
+        listener thread polling the connections for the workers.</p>
 
     <section id="admission"><title>Admission of new connections</title>
         <p>A process accepts new connections as long as they don't wait too
@@ -490,6 +494,39 @@ process)</description>
     value tuned for the previous meaning should not be carried over to
     <directive>AsyncAdmissionBacklogPerThread</directive> as is, the
     defaults being suitable for most cases.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>AsyncWorkerPollers</name>
+<description>How many idle worker threads can poll the connections at
+once</description>
+<syntax>AsyncWorkerPollers <var>number</var>|auto</syntax>
+<default>AsyncWorkerPollers auto</default>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
+
+<usage>
+    <p>The idle worker threads poll the connections themselves (see <a
+    href="#how-it-works">How it Works</a>), but every poll returning
+    contends with the others in the kernel, at a cost growing with the
+    number of threads polling at once. A process lets at most
+    <var>number</var> of them poll at once; the other idle threads wait for
+    the work queued by the listener thread, and one comes to poll when none
+    is left polling. It never exceeds <directive module="mpm_common"
+    >ThreadsPerChild</directive>.</p>
+
+    <p>With <code>auto</code> (the default), <var>number</var> is the number
+    of CPUs the process can run on: its CPU affinity where the system tells
+    it (e.g. started with <code>taskset</code>, or in a container or cgroup
+    with a cpuset), else the CPUs online. A CPU quota (e.g. a container's CPU
+    limit) is not visible this way: set <var>number</var> to the CPUs of the
+    quota then.</p>
+
+    <p>The default <code>auto</code> can be replaced at build time by
+    defining <code>AP_EVENT_WORKER_POLLERS</code> to a number. It has no
+    effect when the listener thread polls the connections
+    (<code>AP_EVENT_NO_WORKER_POLL</code>).</p>
 </usage>
 </directivesynopsis>
 
