@@ -1620,6 +1620,7 @@ static timer_event_t * event_get_timer_event(apr_time_t t,
 {
     timer_event_t *te;
     apr_time_t now = (t < 0) ? 0 : apr_time_now();
+    int wakeup = 0;
 
     /* oh yeah, and make locking smarter/fine grained. */
 
@@ -1652,13 +1653,17 @@ static timer_event_t * event_get_timer_event(apr_time_t t,
         next_expiry = timers_next_expiry;
         if (!next_expiry || next_expiry > te->when + EVENT_FUDGE_FACTOR) {
             timers_next_expiry = te->when;
-            /* Unblock the poll()ing listener for it to update its timeout. */
-            if (listener_is_wakeable) {
-                apr_pollset_wakeup(event_pollset);
-            }
+            wakeup = listener_is_wakeable;
         }
     }
     apr_thread_mutex_unlock(g_timer_skiplist_mtx);
+
+    /* Unblock the poll()ing listener for it to update its timeout, out of the
+     * mutex (a syscall).
+     */
+    if (wakeup) {
+        apr_pollset_wakeup(event_pollset);
+    }
 
     return te;
 }
