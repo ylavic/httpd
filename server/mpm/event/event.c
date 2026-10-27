@@ -604,7 +604,7 @@ static volatile apr_time_t queues_next_expiry; /* next expiry time accross all q
  * For TO_QUEUE_APPEND and TO_QUEUE_REMOVE, timeout_mutex must be held.
  * TO_QUEUE_APPEND returns whether the listener has to be woken up to update
  * its poll()ing timeout, for the caller to do it once the mutex released
- * (wakeup_listener_timeout()).
+ * (wakeup_listener()).
  */
 static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
 {
@@ -644,14 +644,6 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
         return 1;
     }
     return 0;
-}
-
-/* Wake up the poll()ing listener for it to update its timeout */
-static APR_INLINE void wakeup_listener_timeout(void)
-{
-    if (event_pollset) {
-        apr_pollset_wakeup(event_pollset);
-    }
 }
 
 static void TO_QUEUE_REMOVE(struct timeout_queue *q, event_conn_state_t *cs)
@@ -1533,6 +1525,16 @@ static void close_worker_sockets(void)
     }
 }
 
+/* Wake up the listener if it's poll()ing, for it to see what changed (its
+ * timeout, the listening sockets to poll again, a notified wait, exiting...)
+ */
+static APR_INLINE void wakeup_listener(void)
+{
+    if (event_pollset) {
+        apr_pollset_wakeup(event_pollset);
+    }
+}
+
 /* Wake up the listener for it to accept again, by who (ACCEPT_WAKE_*, noted
  * for the backlog stats), the caller having found that it may
  * (should_enable_listensocks()).
@@ -1549,7 +1551,7 @@ static APR_INLINE void wakeup_listener_by(unsigned int who)
             wakes = old;
         }
     }
-    apr_pollset_wakeup(event_pollset);
+    wakeup_listener();
 }
 
 static void shutdown_listener(void)
@@ -1561,9 +1563,7 @@ static void shutdown_listener(void)
     apr_atomic_set32(&listener_may_exit, 1);
 
     /* Unblock the listener if it's poll()ing */
-    if (event_pollset) {
-        apr_pollset_wakeup(event_pollset);
-    }
+    wakeup_listener();
 
     /* unblock the listener if it's waiting for a worker */
     if (worker_queue_info) {
@@ -1815,7 +1815,7 @@ static void connection_count_out(event_conn_state_t *cs)
     is_last_connection = !apr_atomic_dec32(&event_counts.connection_count);
     is_dying = apr_atomic_read32(&dying);
     if (is_last_connection && is_dying) {
-        apr_pollset_wakeup(event_pollset);
+        wakeup_listener();
     }
     else if (should_enable_listensocks(0)) {
         wakeup_listener_by(ACCEPT_WAKE_CLOSE);
@@ -2269,7 +2269,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
     if (q) {
         apr_thread_mutex_unlock(timeout_mutex);
         if (wakeup) {
-            wakeup_listener_timeout();
+            wakeup_listener();
         }
     }
     return 1;
@@ -3371,7 +3371,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         }
         apr_thread_mutex_unlock(notifiers_mutex);
         if (wake) {
-            apr_pollset_wakeup(event_pollset);
+            wakeup_listener();
         }
     }
     apr_thread_mutex_unlock(user_wait->mutex);
@@ -3500,7 +3500,7 @@ static int event_notify(ap_mpm_notifier_t *notifier)
 #endif
 
     if (wake) {
-        apr_pollset_wakeup(event_pollset);
+        wakeup_listener();
     }
     return OK;
 }
@@ -3851,7 +3851,7 @@ static void conn_state_backlog_cb(void *baton, int pushed)
             q = backlog_linger_q;
         }
         if (TO_QUEUE_APPEND(q, cs)) {
-            wakeup_listener_timeout();
+            wakeup_listener();
         }
     }
     else { /* popped */
@@ -4003,7 +4003,7 @@ static apr_thread_mutex_t *g_timer_skiplist_mtx;
 
 /* Insert a timer in the skiplist (g_timer_skiplist_mtx held), returning
  * whether the listener has to be woken up to update its poll()ing timeout,
- * out of the mutex.
+ * out of the mutex (wakeup_listener()).
  */
 static int timer_insert_locked(timer_event_t *te)
 {
@@ -4018,7 +4018,7 @@ static int timer_insert_locked(timer_event_t *te)
     next_expiry = timers_next_expiry;
     if (!next_expiry || next_expiry > te->when + TIMERS_FUDGE_TIMEOUT) {
         timers_next_expiry = te->when;
-        return (event_pollset != NULL);
+        return 1;
     }
     return 0;
 }
@@ -4038,7 +4038,7 @@ static void insert_timer_event(timer_event_t *te)
 
     /* Out of the mutex (a syscall) */
     if (wakeup) {
-        apr_pollset_wakeup(event_pollset);
+        wakeup_listener();
     }
 }
 
@@ -4084,7 +4084,7 @@ static timer_event_t *get_timer_event(apr_time_t timeout,
      * of the mutex (a syscall).
      */
     if (wakeup) {
-        apr_pollset_wakeup(event_pollset);
+        wakeup_listener();
     }
 
     return te;
