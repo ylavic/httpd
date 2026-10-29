@@ -166,8 +166,25 @@
 #ifndef MAX_SPARE_THREADS_RATIO
 #define MAX_SPARE_THREADS_RATIO 0.75 /* of MaxRequestWorkers */
 #endif
-#ifndef MAX_DAEMONS_THREADS_RATIO
-#define MAX_DAEMONS_THREADS_RATIO 32
+
+/* MaxRequestWorkers auto: the threads per child (one on a single CPU), and the
+ * client connections a child can hold from its descriptors limit: what's left
+ * after AUTO_FDS_RESERVE (logs, modules' files...) and the listeners, at
+ * AUTO_FDS_PER_CLIENT descriptors per client (a proxied client holds its
+ * backend connection too).
+ */
+#ifndef AUTO_THREADS_PER_CHILD
+#define AUTO_THREADS_PER_CHILD 2
+#endif
+#ifndef AUTO_FDS_RESERVE
+#define AUTO_FDS_RESERVE 64
+#endif
+#ifndef AUTO_FDS_PER_CLIENT
+#define AUTO_FDS_PER_CLIENT 2
+#endif
+/* An unlimited (or huge) descriptors limit counts as this many */
+#ifndef AUTO_FDS_MAX
+#define AUTO_FDS_MAX (1 << 24)
 #endif
 
 #ifndef SCOREBOARD_DAEMONS_FACTOR
@@ -249,8 +266,19 @@ static int worker_pollers = AP_EVENT_WORKER_POLLERS; /* AsyncWorkerPollers,
 #endif
 static int worker_poll; /* set before the threads start, then constant */
 
-static int auto_settings = 0;               /* Auto settings based on max_workers
-                                               and num_cpus */
+static int auto_settings = 0;               /* MaxRequestWorkers auto: settings
+                                               derived from max_client_conns and
+                                               num_cpus */
+static int max_client_conns = 0;            /* The client connections to hold
+                                               (auto), derived if 0 */
+static int clients_per_child = 0;           /* The client connections a
+                                               child's descriptors can hold
+                                               (auto) */
+/* The settings set explicitly, that auto doesn't derive */
+#define AUTO_SET_SERVER_LIMIT   (1u << 0)
+#define AUTO_SET_THREAD_LIMIT   (1u << 1)
+static unsigned int auto_set_flags = 0;
+
 static int num_cpus = 0;                    /* Number of CPUs usable (the
                                                affinity where known, else
                                                the online ones) */
@@ -406,6 +434,32 @@ static APR_INLINE int workers_parked(void);
 #define workers_parked() 0
 #endif
 #define POLLSET_RESERVE_SIZE 10000
+
+/* The pollset methods event uses: they hold any number of descriptors and
+ * support APR_POLLSET_THREADSAFE (event is built only where one exists).
+ */
+static const apr_pollset_method_e good_methods[] = { APR_POLLSET_PORT,
+                                                     APR_POLLSET_KQUEUE,
+                                                     APR_POLLSET_EPOLL };
+#define NUM_GOOD_METHODS (sizeof(good_methods) / sizeof(good_methods[0]))
+
+/* Create a pollset with the first good method that works (flags should
+ * include APR_POLLSET_NODEFAULT), the last error if none does.
+ */
+static apr_status_t pollset_create_good(apr_pollset_t **ps, apr_uint32_t size,
+                                        apr_pool_t *p, apr_uint32_t flags)
+{
+    apr_status_t rv = APR_ENOTIMPL;
+    int i;
+
+    for (i = 0; i < NUM_GOOD_METHODS; i++) {
+        rv = apr_pollset_create_ex(ps, size, p, flags, good_methods[i]);
+        if (rv == APR_SUCCESS) {
+            break;
+        }
+    }
+    return rv;
+}
 
 struct backlog_timer_event {
     timer_event_t te;
@@ -6520,12 +6574,6 @@ static void setup_threads_runtime(void)
     ap_listen_rec *lr;
     apr_pool_t *pskip = NULL;
     int max_recycled_pools = -1, i;
-    /* The pollset methods event uses: they hold any number of descriptors and
-     * support APR_POLLSET_THREADSAFE (event is built only where one exists).
-     */
-    const int good_methods[] = { APR_POLLSET_PORT,
-                                 APR_POLLSET_KQUEUE,
-                                 APR_POLLSET_EPOLL };
     /* The size is the events returned by a poll (the connections the good
      * methods hold are unbounded).
      */
@@ -6630,13 +6678,8 @@ static void setup_threads_runtime(void)
      */
     pollset_flags = APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY |
                     APR_POLLSET_WAKEABLE | APR_POLLSET_NODEFAULT;
-    for (i = 0; i < sizeof(good_methods) / sizeof(good_methods[0]); i++) {
-        rv = apr_pollset_create_ex(&event_pollset, pollset_size + 1, pruntime,
-                                   pollset_flags, good_methods[i]);
-        if (rv == APR_SUCCESS) {
-            break;
-        }
-    }
+    rv = pollset_create_good(&event_pollset, pollset_size + 1, pruntime,
+                             pollset_flags);
     if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO(03103)
                      "apr_pollset_create with Thread Safety failed.");
@@ -6654,16 +6697,10 @@ static void setup_threads_runtime(void)
         static listener_poll_type doorbell_pt = { PT_QUEUE, NULL };
         apr_pollset_t *ps = NULL;
 
-        for (i = 0; i < sizeof(good_methods) / sizeof(good_methods[0]); i++) {
-            rv = apr_pollset_create_ex(&ps, pollset_size + 1, pruntime,
-                                       APR_POLLSET_THREADSAFE |
-                                       APR_POLLSET_NOCOPY |
-                                       APR_POLLSET_NODEFAULT,
-                                       good_methods[i]);
-            if (rv == APR_SUCCESS) {
-                break;
-            }
-        }
+        rv = pollset_create_good(&ps, pollset_size + 1, pruntime,
+                                 APR_POLLSET_THREADSAFE |
+                                 APR_POLLSET_NOCOPY |
+                                 APR_POLLSET_NODEFAULT);
         if (rv == APR_SUCCESS) {
             rv = apr_file_pipe_create_ex(&doorbell_in, &doorbell_out,
                                          APR_FULL_NONBLOCK, pruntime);
@@ -7691,12 +7728,12 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
                  APR_TIME_T_FMT "ms "
                  "ThreadsPerChild=%d ThreadLimit=%d MinSpareThreads=%d MaxSpareThreads=%d "
                  "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d "
-                 "WorkerPoll=%s",
+                 "Clients=%d/%d WorkerPoll=%s",
                  auto_settings ? " (auto)" : "", max_workers, admission_backlog,
                  apr_time_as_msec(admission_target), apr_time_as_msec(admission_interval),
                  threads_per_child, thread_limit, min_spare_threads, max_spare_threads,
                  active_daemons_limit, server_limit, ap_daemons_to_start,
-                 num_buckets, num_cpus,
+                 num_buckets, num_cpus, max_client_conns, clients_per_child,
 #ifdef EVENT_WORKER_POLL
                  "on"   /* where the pollset method allows (children) */
 #else
@@ -7941,6 +7978,135 @@ static int event_listen_buckets(server_rec *s, int prev)
     return n;
 }
 
+/* MaxRequestWorkers auto: derive the settings not set explicitly from the
+ * client connections to hold (max_client_conns, or what the descriptors limit
+ * allows) and the CPUs: ThreadsPerChild (AUTO_THREADS_PER_CHILD), the
+ * children needed to hold the clients with the connections a child can hold
+ * (clients_per_child), at least enough for their threads to cover the CPUs,
+ * MaxRequestWorkers (all their threads) and StartServers (all of them).
+ * Called with the listeners set up (num_listensocks), before the buckets are
+ * fit to the children.
+ */
+static void auto_settings_derive(server_rec *s, int startup)
+{
+    const int level_flags = (startup) ? APLOG_STARTUP : 0;
+    server_rec *ls = (startup) ? NULL : s;
+    int ratio = ap_get_listen_buckets_ratio();
+    int tpc, children, min_children, cpu_buckets = 1;
+    apr_int64_t fds = AUTO_FDS_MAX, hard = AUTO_FDS_MAX, reserve, per_child, n;
+    int clients_set = (max_client_conns > 0);
+
+    tpc = threads_per_child;
+    if (tpc <= 0) {
+        tpc = (num_cpus > 1) ? AUTO_THREADS_PER_CHILD : 1;
+    }
+    else if (tpc > MAX_THREAD_LIMIT) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING | level_flags, 0, ls, APLOGNO()
+                     "ThreadsPerChild of %d exceeds the compile-time limit "
+                     "of %d threads, decreasing to match", tpc,
+                     MAX_THREAD_LIMIT);
+        tpc = MAX_THREAD_LIMIT;
+    }
+    if (tpc > thread_limit) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING | level_flags, 0, ls, APLOGNO()
+                     "ThreadsPerChild of %d exceeds ThreadLimit of %d, "
+                     "decreasing to match", tpc, thread_limit);
+        tpc = thread_limit;
+    }
+
+    /* The buckets the CPUs would have (ListenCoresBucketsRatio) */
+    if (!one_process && ratio > 0 && ap_have_so_reuseport) {
+        cpu_buckets = num_cpus / ratio;
+        if (cpu_buckets < 1) {
+            cpu_buckets = 1;
+        }
+    }
+
+#if APR_HAVE_STRUCT_RLIMIT && defined(RLIMIT_NOFILE)
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < AUTO_FDS_MAX) {
+                fds = (apr_int64_t)rl.rlim_cur;
+            }
+            if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < AUTO_FDS_MAX) {
+                hard = (apr_int64_t)rl.rlim_max;
+            }
+        }
+    }
+#endif
+    reserve = AUTO_FDS_RESERVE + (apr_int64_t)num_listensocks;
+    per_child = (fds - reserve) / AUTO_FDS_PER_CLIENT;
+    if (per_child < 1) {
+        per_child = 1;
+    }
+
+    /* The fewest children: enough for their threads to cover the CPUs */
+    min_children = (num_cpus + tpc - 1) / tpc;
+
+    if (clients_set) {
+        n = max_client_conns;
+    }
+    else {
+        /* What the descriptors limit allows anyway: the fewest children (or
+         * a child per bucket if more) at their capacity.
+         */
+        n = per_child * ((min_children > cpu_buckets) ? min_children
+                                                      : cpu_buckets);
+        if (n > INT_MAX / 2) {
+            n = INT_MAX / 2;
+        }
+        if (hard >= fds * 2) {
+            ap_log_error(APLOG_MARK, APLOG_NOTICE | level_flags, 0, ls, APLOGNO()
+                         "MaxRequestWorkers auto: %" APR_INT64_T_FMT " client "
+                         "connections at most, from the soft descriptors limit "
+                         "(%" APR_INT64_T_FMT "), the hard limit allows %s%"
+                         APR_INT64_T_FMT ": raise the soft limit (e.g. "
+                         "ulimit -n) to hold more", n, fds,
+                         (hard == AUTO_FDS_MAX) ? "at least " : "", hard);
+        }
+    }
+
+    children = (int)((n + per_child - 1) / per_child);
+    if (children < min_children) {
+        children = min_children;
+    }
+    /* A multiple of the buckets when more, so that event_listen_buckets()
+     * can use all of them
+     */
+    if (children > cpu_buckets) {
+        children = ((children + cpu_buckets - 1) / cpu_buckets) * cpu_buckets;
+    }
+    if (children > server_limit && (auto_set_flags & AUTO_SET_SERVER_LIMIT)) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING | level_flags, 0, ls, APLOGNO()
+                     "MaxRequestWorkers auto: %" APR_INT64_T_FMT " client "
+                     "connections would need %d children of up to %"
+                     APR_INT64_T_FMT " connections, above ServerLimit %d: "
+                     "up to %" APR_INT64_T_FMT " connections only",
+                     n, children, per_child, server_limit,
+                     per_child * server_limit);
+        children = server_limit;
+    }
+    else if (children > MAX_SERVER_LIMIT) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING | level_flags, 0, ls, APLOGNO()
+                     "MaxRequestWorkers auto: %" APR_INT64_T_FMT " client "
+                     "connections would need %d children of up to %"
+                     APR_INT64_T_FMT " connections, above the compile-time "
+                     "limit of %d: up to %" APR_INT64_T_FMT " connections only",
+                     n, children, per_child, MAX_SERVER_LIMIT,
+                     per_child * MAX_SERVER_LIMIT);
+        children = MAX_SERVER_LIMIT;
+    }
+
+    threads_per_child = tpc;
+    max_workers = children * tpc;
+    if (ap_daemons_to_start <= 0 || ap_daemons_to_start > children) {
+        ap_daemons_to_start = children;
+    }
+    max_client_conns = (int)n;
+    clients_per_child = (int)per_child;
+}
+
 /* This really should be a post_config hook, but the error log is already
  * redirected by that point, so we need to do this in the open_logs phase.
  * We compute num_buckets here too, thus the definitive AP_MPMQ_* settings
@@ -8027,6 +8193,10 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
     if (!retained->mpm->was_graceful) {
         num_buckets = 0;
         retained->mpm->num_buckets = 0; /* old gen's until event_run() */
+    }
+
+    if (auto_settings) {
+        auto_settings_derive(s, startup);
     }
 
     if (retained->first_thread_limit) {
@@ -8229,6 +8399,8 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
     server_limit = thread_limit = -1;
     ap_daemons_to_start = -1;
     auto_settings = 0;
+    max_client_conns = 0;
+    clients_per_child = 0;
 
 #ifndef _SC_NPROCESSORS_ONLN
     num_cpus = 1;
@@ -8327,6 +8499,14 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
         startup = 1;
     }
 
+    auto_set_flags = 0;
+    if (server_limit >= 0) {
+        auto_set_flags |= AUTO_SET_SERVER_LIMIT;
+    }
+    if (thread_limit >= 0) {
+        auto_set_flags |= AUTO_SET_THREAD_LIMIT;
+    }
+
     if (server_limit < 0) {
         server_limit = DEFAULT_SERVER_LIMIT;
     }
@@ -8409,30 +8589,11 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
         thread_limit = retained->first_thread_limit;
     }
 
-    /* Auto settings depend on max_workers and num_buckets, the latter being
-     * known in event_open_logs() only. So defer to there (with no warnings
-     * since it's somewhat auto..).
+    /* The auto settings depend on the listeners (the descriptors they take),
+     * set up in event_open_logs() only, so they're derived there
+     * (auto_settings_derive()).
      */
     if (auto_settings) {
-        if (max_workers <= 0) {
-            /* This used to warn before auto settings, just take the
-             * default value still but silently.
-             */
-            max_workers = DEFAULT_SERVER_LIMIT * DEFAULT_THREADS_PER_CHILD;
-        }
-        if (threads_per_child <= 0) {
-            /* Default threads_per_child is the number of CPUs  */
-            threads_per_child = num_cpus;
-
-            /* With a lot of workers and not so much CPUs to handle them,
-             * spawn more threads to get a reasonable active_daemons_limit
-             * i.e. processes / threads ratio.
-             */
-            while (max_workers / threads_per_child >
-                   threads_per_child * MAX_DAEMONS_THREADS_RATIO) {
-                threads_per_child *= 2;
-            }
-        }
         return OK; /* => event_open_logs() */
     }
 
@@ -8654,7 +8815,7 @@ static const char *set_max_spare_threads(cmd_parms * cmd, void *dummy,
 }
 
 static const char *set_max_workers(cmd_parms * cmd, void *dummy,
-                                   const char *arg, const char *arg2)
+                                   const char *arg)
 {
     const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
     if (err != NULL) {
@@ -8666,9 +8827,14 @@ static const char *set_max_workers(cmd_parms * cmd, void *dummy,
                      "instead.");
     }
 
-    max_workers = atoi(arg);
-    auto_settings = (arg2 && !strcasecmp(arg2, "auto"));
-
+    if (strcasecmp(arg, "auto") == 0) {
+        auto_settings = 1;
+        max_workers = -1;
+    }
+    else {
+        auto_settings = 0;
+        max_workers = atoi(arg);
+    }
     return NULL;
 }
 
@@ -8795,10 +8961,11 @@ static const command_rec event_cmds[] = {
                   "Minimum number of idle threads, to handle request spikes"),
     AP_INIT_TAKE1("MaxSpareThreads", set_max_spare_threads, NULL, RSRC_CONF,
                   "Maximum number of idle threads"),
-    AP_INIT_TAKE12("MaxClients", set_max_workers, NULL, RSRC_CONF,
-                   "Deprecated name of MaxRequestWorkers"),
-    AP_INIT_TAKE12("MaxRequestWorkers", set_max_workers, NULL, RSRC_CONF,
-                   "Maximum number of threads alive at the same time"),
+    AP_INIT_TAKE1("MaxClients", set_max_workers, NULL, RSRC_CONF,
+                  "Deprecated name of MaxRequestWorkers"),
+    AP_INIT_TAKE1("MaxRequestWorkers", set_max_workers, NULL, RSRC_CONF,
+                  "Maximum number of threads alive at the same time, or auto "
+                  "(derived from the clients and the CPUs)"),
     AP_INIT_TAKE1("ThreadsPerChild", set_threads_per_child, NULL, RSRC_CONF,
                   "Number of threads each child creates"),
     AP_INIT_TAKE1("ThreadLimit", set_thread_limit, NULL, RSRC_CONF,
