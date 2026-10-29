@@ -7742,8 +7742,9 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
     }
 
     /* On first startup create gen_pool to satisfy the lifetime of the
-     * parent's PODs and listeners; on restart stop the children from the
-     * previous generation and clear gen_pool for the next one.
+     * parent's PODs (the listeners live in the process pool, reused across
+     * generations); on restart stop the children from the previous
+     * generation and clear gen_pool for the next one.
      */
     if (!retained->gen_pool) {
         apr_pool_create(&retained->gen_pool, ap_pglobal);
