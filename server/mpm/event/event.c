@@ -274,6 +274,9 @@ static int max_client_conns = 0;            /* The client connections to hold
 static int clients_per_child = 0;           /* The client connections a
                                                child's descriptors can hold
                                                (auto) */
+static apr_uint32_t clients_share = 0;      /* The client connections a
+                                               child accepts at most (auto),
+                                               0 for no limit */
 /* The settings set explicitly, that auto doesn't derive */
 #define AUTO_SET_SERVER_LIMIT   (1u << 0)
 #define AUTO_SET_THREAD_LIMIT   (1u << 1)
@@ -1501,6 +1504,8 @@ static void backlog_stats_report(apr_time_t now)
     accept_off_ended = accept_off_max = 0;
 }
 
+static APR_INLINE int connections_full(void);
+
 /* Stop accepting for a reason (ACCEPT_OFF_*), returns whether accepting
  * stopped (not if it was stopped already, for another reason)
  */
@@ -1515,6 +1520,7 @@ static int disable_listensocks(apr_time_t now, unsigned int reason)
     }
     if ((reason & ACCEPT_OFF_LIMIT)
         && !apr_atomic_read32(&dying)
+        && !connections_full()
         && admission_above_target(now) == ADMISSION_BACKSTOP) {
         admission_backstops++;
     }
@@ -1707,12 +1713,44 @@ static int fair_share_above(int stopped)
     return conns > ((stopped) ? avg : avg + fair_share_slack);
 }
 
+/* The connections a child holds at most: its share of MaxClientConnections
+ * (auto), 0 for no limit.
+ */
+static apr_uint32_t connections_limit;
+
+/* Hysteresis of the connections limit: once not accepting for it, accept
+ * again only below the limit minus 1/LIMIT_HYSTERESIS of it (90%), so that
+ * the closes at the limit don't toggle the listening sockets each time.
+ * Below 10 connections that's the limit itself (no hysteresis), harmless
+ * at that size.
+ */
+#define LIMIT_HYSTERESIS 10
+
+/* Not more connections than connections_limit, if any, see LIMIT_HYSTERESIS */
+static APR_INLINE int connections_full(void)
+{
+    apr_uint32_t conns;
+
+    if (!connections_limit) {
+        return 0;
+    }
+    conns = apr_atomic_read32(&event_counts.connection_count);
+    if (listensocks_disabled_for(ACCEPT_OFF_LIMIT)) {
+        return conns >= connections_limit - connections_limit / LIMIT_HYSTERESIS;
+    }
+    return conns >= connections_limit;
+}
+
 /* Whether to stop accepting for the limits, or not to accept again yet once
  * stopped, for any thread (read-only). now: the caller's current time if at
  * hand, otherwise 0 (fetched if needed)
  */
 static APR_INLINE int connections_above_limit(apr_time_t now)
 {
+    if (connections_full()) {
+        return 1;
+    }
+
     /* Stop accepting when the new connections have been waiting too long
      * for a worker, whatever the reason (busy or blocked workers).
      */
@@ -4210,16 +4248,17 @@ static int push2worker(event_conn_state_t *cs, timer_event_t *te,
     ap_assert((cs != NULL) ^ (te != NULL));
 
     busy = (ap_queue_info_idlers_dec(worker_queue_info) < 0);
-    if (busy && !by_worker) {
-        /* Might need to kindle the fire by not accepting new connections until
-         * the situation settles down. The listener and new idling workers will
-         * test for should_enable_listensocks() to recover (when suitable).
-         */
-        if (connections_above_limit(now)) {
-            disable_listensocks(now, ACCEPT_OFF_LIMIT);
-            if (above_limit) {
-                *above_limit = 1;
-            }
+    /* Might need to kindle the fire by not accepting new connections until
+     * the situation settles down. The listener and new idling workers will
+     * test for should_enable_listensocks() to recover (when suitable). The
+     * waits build up only when the workers are busy, but the connections can
+     * reach their limit anyway (connections_full(), e.g. with idle keepalive
+     * connections).
+     */
+    if (!by_worker && (busy ? connections_above_limit(now) : connections_full())) {
+        disable_listensocks(now, ACCEPT_OFF_LIMIT);
+        if (above_limit) {
+            *above_limit = 1;
         }
     }
 
@@ -6685,6 +6724,12 @@ static void setup_threads_runtime(void)
                      "apr_pollset_create with Thread Safety failed.");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
+    connections_limit = clients_share;
+    if (connections_limit) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                     "up to %u connections in this child",
+                     (unsigned int)connections_limit);
+    }
 
     /* The connections' pollset, the workers' own with its doorbell
      * (worker_poll), or the main one if they can't poll (not built in). The
@@ -7728,12 +7773,13 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
                  APR_TIME_T_FMT "ms "
                  "ThreadsPerChild=%d ThreadLimit=%d MinSpareThreads=%d MaxSpareThreads=%d "
                  "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d "
-                 "Clients=%d/%d WorkerPoll=%s",
+                 "MaxClientConnections=%d (%d/%u per child) WorkerPoll=%s",
                  auto_settings ? " (auto)" : "", max_workers, admission_backlog,
                  apr_time_as_msec(admission_target), apr_time_as_msec(admission_interval),
                  threads_per_child, thread_limit, min_spare_threads, max_spare_threads,
                  active_daemons_limit, server_limit, ap_daemons_to_start,
                  num_buckets, num_cpus, max_client_conns, clients_per_child,
+                 (unsigned int)clients_share,
 #ifdef EVENT_WORKER_POLL
                  "on"   /* where the pollset method allows (children) */
 #else
@@ -8239,6 +8285,17 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         active_daemons_limit = retained->first_server_sb_limit;
     }
 
+    /* A child's share of MaxClientConnections, with a 10% slack since the
+     * kernel spreads the new connections only roughly evenly (when a child
+     * stops accepting, the others take them).
+     */
+    clients_share = 0;
+    if (auto_settings && max_client_conns > 0) {
+        clients_share = ((apr_uint32_t)max_client_conns + active_daemons_limit - 1)
+                        / active_daemons_limit;
+        clients_share += (clients_share + 9) / 10;
+    }
+
     /* The buckets divide the children, so MaxRequestWorkers is not changed */
     num_buckets = event_listen_buckets(s, num_buckets);
     if ((rv = ap_duplicate_listeners(retained->gen_pool, ap_server_conf,
@@ -8597,6 +8654,19 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
         return OK; /* => event_open_logs() */
     }
 
+    if (max_client_conns > 0) {
+        if (startup) {
+            ap_log_error(APLOG_MARK, APLOG_WARNING | APLOG_STARTUP, 0, NULL, APLOGNO()
+                         "WARNING: MaxClientConnections has no effect without "
+                         "MaxRequestWorkers auto, ignored.");
+        } else {
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO()
+                         "MaxClientConnections has no effect without "
+                         "MaxRequestWorkers auto, ignored");
+        }
+        max_client_conns = 0;
+    }
+
     /* No auto settings; use the default for anything not set (or set to
      * some negative value), warn about nonsense values and adjust otherwise.
      */
@@ -8838,6 +8908,24 @@ static const char *set_max_workers(cmd_parms * cmd, void *dummy,
     return NULL;
 }
 
+static const char *set_max_client_conns(cmd_parms *cmd, void *dummy,
+                                        const char *arg)
+{
+    char *endptr;
+    long n;
+    const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
+    if (err != NULL) {
+        return err;
+    }
+
+    n = strtol(arg, &endptr, 10);
+    if (*endptr || n < 1 || n > INT_MAX / 2) {
+        return "MaxClientConnections must be a positive number";
+    }
+    max_client_conns = (int)n;
+    return NULL;
+}
+
 static const char *set_threads_per_child(cmd_parms * cmd, void *dummy,
                                          const char *arg)
 {
@@ -8966,6 +9054,9 @@ static const command_rec event_cmds[] = {
     AP_INIT_TAKE1("MaxRequestWorkers", set_max_workers, NULL, RSRC_CONF,
                   "Maximum number of threads alive at the same time, or auto "
                   "(derived from the clients and the CPUs)"),
+    AP_INIT_TAKE1("MaxClientConnections", set_max_client_conns, NULL, RSRC_CONF,
+                  "Maximum number of simultaneous client connections, with "
+                  "MaxRequestWorkers auto"),
     AP_INIT_TAKE1("ThreadsPerChild", set_threads_per_child, NULL, RSRC_CONF,
                   "Number of threads each child creates"),
     AP_INIT_TAKE1("ThreadLimit", set_thread_limit, NULL, RSRC_CONF,
