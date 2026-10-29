@@ -1344,6 +1344,11 @@ static void accept_off_record(apr_time_t duration)
 static /*atomic*/ apr_uint32_t drain_polls, drain_csd, drain_user, drain_dropped;
 static /*atomic*/ apr_uint32_t poll_misses, poll_promotions;
 
+/* The waits' timeouts armed in a timeout queue, or in the timers' skiplist
+ * (not declared, see wait_tq_arm()), with the backlog stats too
+ */
+static /*atomic*/ apr_uint32_t wait_tq_arms, wait_tq_fallbacks;
+
 #define DRAIN_STAT_INC(counter) do { \
     if (backlog_stats_on) { \
         apr_atomic_inc32(&(counter)); \
@@ -1394,7 +1399,8 @@ static void backlog_stats_report(apr_time_t now)
                  APR_TIME_T_FMT "ms, backstop %u,"
                  " resumed woken %u recheck %u other %u;"
                  " drain polls=%u csd=%u user=%u dropped=%u"
-                 " misses=%u promotions=%u; accept offs ended %u: p50<%uus,max=%uus",
+                 " misses=%u promotions=%u; wait timeouts queued=%u"
+                 " skiplist=%u; accept offs ended %u: p50<%uus,max=%uus",
                  len ? buf : " none", backlog_dropped,
                  toggles, apr_time_as_msec(off),
                  apr_atomic_xchg32(&admission_backstops, 0),
@@ -1405,6 +1411,8 @@ static void backlog_stats_report(apr_time_t now)
                  apr_atomic_xchg32(&drain_dropped, 0),
                  apr_atomic_xchg32(&poll_misses, 0),
                  apr_atomic_xchg32(&poll_promotions, 0),
+                 apr_atomic_xchg32(&wait_tq_arms, 0),
+                 apr_atomic_xchg32(&wait_tq_fallbacks, 0),
                  accept_off_ended,
                  (accept_off_ended
                   ? backlog_hist_bound(accept_off_hist, accept_off_ended, 50)
@@ -4396,6 +4404,7 @@ static int wait_tq_arm(struct user_wait *user_wait,
     int wakeup;
 
     if (!q) {
+        DRAIN_STAT_INC(wait_tq_fallbacks);
         if (APLOGdebug(ap_server_conf)) {
             int log_it;
             apr_thread_mutex_lock(wait_queues.mutex);
@@ -4411,6 +4420,7 @@ static int wait_tq_arm(struct user_wait *user_wait,
         return 0;
     }
 
+    DRAIN_STAT_INC(wait_tq_arms);
     AP_DEBUG_ASSERT(!user_wait->tq && !user_wait->to.q);
     user_wait->tq = q;
     apr_thread_mutex_lock(wait_queues.mutex);
