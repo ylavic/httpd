@@ -16,6 +16,7 @@
 
 #include "mod_proxy.h"
 #include "mod_core.h"
+#include "ap_mpm.h"
 #include "apr_optional.h"
 #include "apr_strings.h"
 #include "scoreboard.h"
@@ -3212,6 +3213,133 @@ PROXY_DECLARE(const char *) ap_proxy_ssl_val(apr_pool_t *p, server_rec *s,
     return ap_ssl_var_lookup(p, s, c, r, var);
 }
 
+/* The timeouts of the waits in the MPM (ap_mpm_register_wait()), collected
+ * for ap_mpm_register_timeouts(): the connect's, less ProxyAsyncDelay after
+ * the first poll (proxy_http_connect()), separately.
+ */
+typedef struct {
+    apr_array_header_t *timeouts;
+    apr_array_header_t *connects;
+    apr_array_header_t *delays;
+} proxy_wait_timeouts;
+
+static void proxy_wait_timeout_add(apr_array_header_t *a,
+                                   apr_interval_time_t t)
+{
+    if (t >= 0) {
+        APR_ARRAY_PUSH(a, apr_interval_time_t) = t;
+    }
+}
+
+static void proxy_wait_timeouts_dir(proxy_wait_timeouts *wt,
+                                    ap_conf_vector_t *section)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(section, &proxy_module);
+
+    if (!dconf) {
+        return;
+    }
+    if (dconf->async_idle_timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, dconf->async_idle_timeout);
+    }
+    if (dconf->async_delay > 0) {
+        proxy_wait_timeout_add(wt->delays, dconf->async_delay);
+    }
+}
+
+static void proxy_wait_timeouts_dirs(proxy_wait_timeouts *wt,
+                                     apr_array_header_t *sections)
+{
+    ap_conf_vector_t **elts = (ap_conf_vector_t **)sections->elts;
+    int i;
+
+    for (i = 0; i < sections->nelts; i++) {
+        proxy_wait_timeouts_dir(wt, elts[i]);
+    }
+}
+
+static void proxy_wait_timeouts_worker(proxy_wait_timeouts *wt,
+                                       proxy_worker *worker)
+{
+    if (worker->s->timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->timeout);
+        proxy_wait_timeout_add(wt->connects, worker->s->timeout);
+    }
+    if (worker->s->conn_timeout_set) {
+        proxy_wait_timeout_add(wt->connects, worker->s->conn_timeout);
+    }
+    if (worker->s->ping_timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->ping_timeout);
+    }
+    if (worker->s->acquire_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->acquire);
+    }
+}
+
+/* Declare the timeouts of the waits to the MPM (a hint): the vhosts' Timeout,
+ * ProxyTimeout, the workers' timeout, connectiontimeout, ping and acquire, and
+ * ProxyAsyncIdleTimeout, i.e. the fixed ones (not what's left of the request
+ * read timeouts of mod_reqtimeout); the connect timeouts with and without
+ * each ProxyAsyncDelay.
+ */
+static void proxy_declare_wait_timeouts(apr_pool_t *p, server_rec *main_s)
+{
+    proxy_wait_timeouts wt;
+    apr_interval_time_t *c, *d;
+    server_rec *s;
+    int i, j;
+
+    wt.timeouts = apr_array_make(p, 16, sizeof(apr_interval_time_t));
+    wt.connects = apr_array_make(p, 8, sizeof(apr_interval_time_t));
+    wt.delays = apr_array_make(p, 4, sizeof(apr_interval_time_t));
+
+    for (s = main_s; s; s = s->next) {
+        proxy_server_conf *sconf = ap_get_module_config(s->module_config,
+                                                        &proxy_module);
+        core_server_config *core = ap_get_core_module_config(s->module_config);
+        proxy_balancer *balancer;
+        proxy_worker *worker;
+
+        proxy_wait_timeout_add(wt.timeouts, s->timeout);
+        proxy_wait_timeout_add(wt.connects, s->timeout);
+        if (sconf->timeout_set) {
+            proxy_wait_timeout_add(wt.timeouts, sconf->timeout);
+            proxy_wait_timeout_add(wt.connects, sconf->timeout);
+        }
+
+        worker = (proxy_worker *)sconf->workers->elts;
+        for (i = 0; i < sconf->workers->nelts; i++) {
+            proxy_wait_timeouts_worker(&wt, &worker[i]);
+        }
+        balancer = (proxy_balancer *)sconf->balancers->elts;
+        for (i = 0; i < sconf->balancers->nelts; i++) {
+            proxy_worker **workers = (proxy_worker **)
+                                     balancer[i].workers->elts;
+            for (j = 0; j < balancer[i].workers->nelts; j++) {
+                proxy_wait_timeouts_worker(&wt, workers[j]);
+            }
+        }
+
+        proxy_wait_timeouts_dir(&wt, s->lookup_defaults);
+        proxy_wait_timeouts_dirs(&wt, sconf->sec_proxy);
+        proxy_wait_timeouts_dirs(&wt, core->sec_dir);
+        proxy_wait_timeouts_dirs(&wt, core->sec_url);
+    }
+
+    c = (apr_interval_time_t *)wt.connects->elts;
+    d = (apr_interval_time_t *)wt.delays->elts;
+    for (i = 0; i < wt.connects->nelts; i++) {
+        proxy_wait_timeout_add(wt.timeouts, c[i]);
+        for (j = 0; j < wt.delays->nelts; j++) {
+            if (c[i] > d[j]) {
+                proxy_wait_timeout_add(wt.timeouts, c[i] - d[j]);
+            }
+        }
+    }
+
+    (void)ap_mpm_register_timeouts(wt.timeouts);
+}
+
 static int proxy_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                              apr_pool_t *ptemp, server_rec *main_s)
 {
@@ -3229,6 +3357,8 @@ static int proxy_post_config(apr_pool_t *pconf, apr_pool_t *plog,
     proxy_ssl_engine = APR_RETRIEVE_OPTIONAL_FN(ssl_engine_set);
     ap_proxy_strmatch_path = apr_strmatch_precompile(pconf, "path=", 0);
     ap_proxy_strmatch_domain = apr_strmatch_precompile(pconf, "domain=", 0);
+
+    proxy_declare_wait_timeouts(ptemp, main_s);
 
     for (; s; s = s->next) {
         int rc, i;

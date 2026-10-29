@@ -435,11 +435,49 @@ static const char * proxyws_fallback_to_proxy_http(cmd_parms *cmd, void *conf, i
     return NULL;
 }
 
-static int proxy_wstunnel_post_config(apr_pool_t *pconf, apr_pool_t *plog,
-                                      apr_pool_t *ptemp, server_rec *s)
+static void proxyws_wait_timeouts_dirs(apr_array_header_t *timeouts,
+                                       apr_array_header_t *sections)
 {
+    ap_conf_vector_t **elts = (ap_conf_vector_t **)sections->elts;
+    int i;
+
+    for (i = 0; i < sections->nelts; i++) {
+        proxyws_dir_conf *dconf = ap_get_module_config(elts[i],
+                                                       &proxy_wstunnel_module);
+        if (dconf && dconf->idle_timeout >= 0) {
+            APR_ARRAY_PUSH(timeouts, apr_interval_time_t) =
+                dconf->idle_timeout;
+        }
+    }
+}
+
+static int proxy_wstunnel_post_config(apr_pool_t *pconf, apr_pool_t *plog,
+                                      apr_pool_t *ptemp, server_rec *main_s)
+{
+    apr_array_header_t *timeouts, *defaults;
+    server_rec *s;
+
     can_fallback_to_proxy_http =
         (ap_find_linked_module("mod_proxy_http.c") != NULL);
+
+    /* Declare the timeouts of the tunnels' waits to the MPM (a hint), i.e.
+     * ProxyWebsocketIdleTimeout (mod_proxy declares the others).
+     */
+    timeouts = apr_array_make(ptemp, 4, sizeof(apr_interval_time_t));
+    defaults = apr_array_make(ptemp, 1, sizeof(ap_conf_vector_t *));
+    for (s = main_s; s; s = s->next) {
+        proxy_server_conf *sconf = ap_get_module_config(s->module_config,
+                                                        &proxy_module);
+        core_server_config *core = ap_get_core_module_config(s->module_config);
+
+        apr_array_clear(defaults);
+        APR_ARRAY_PUSH(defaults, ap_conf_vector_t *) = s->lookup_defaults;
+        proxyws_wait_timeouts_dirs(timeouts, defaults);
+        proxyws_wait_timeouts_dirs(timeouts, sconf->sec_proxy);
+        proxyws_wait_timeouts_dirs(timeouts, core->sec_dir);
+        proxyws_wait_timeouts_dirs(timeouts, core->sec_url);
+    }
+    (void)ap_mpm_register_timeouts(timeouts);
 
     return OK;
 }
