@@ -761,11 +761,13 @@
  *                         ap_mpm_release_pfds(), ap_mpm_notifier_t,
  *                         ap_mpm_notifier_create(), ap_mpm_notify(),
  *                         ap_mpm_notifier_rearm(),
+ *                         ap_mpm_register_timeouts(),
  *                         AP_MPMQ_CAN_REGISTER_WAIT and
  *                         AP_MPMQ_MAX_CONNECTIONS to ap_mpm.h, and the
  *                         mpm_register_wait, mpm_release_pfd,
- *                         mpm_notifier_create and mpm_notify hooks to
- *                         mpm_common.h; conn_rec->partial_request,
+ *                         mpm_notifier_create, mpm_notify,
+ *                         mpm_notifier_rearm and
+ *                         mpm_register_timeouts hooks to mpm_common.h; conn_rec->partial_request,
  *                         conn_state_t->timed_out and
  *                         AP_EXPECT_100_NONBLOCK to httpd.h;
  *                         ap_read_request_ex(), ap_get_mime_headers_ex(),

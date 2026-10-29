@@ -450,6 +450,12 @@ AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
                  apr_interval_time_t timeout, ap_mpm_notifier_t *notifier,
                  unsigned int flags, ap_mpm_continuation_fn_t *fn, void *baton))
 
+/** Declare the timeouts of the waits (see ap_mpm_register_timeouts())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_register_timeouts,
+                (const apr_array_header_t *timeouts))
+
 /** Release a kept descriptor (see ap_mpm_release_pfd())
  * @ingroup hooks
  */

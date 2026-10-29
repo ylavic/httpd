@@ -274,6 +274,21 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
                                               void *baton);
 
 /**
+ * Declare timeouts that the module gives to its waits (ap_mpm_register_wait()),
+ * as a hint for the MPM to prepare for them (e.g. a timeout queue per value,
+ * cheaper than a timer per wait).
+ * @param timeouts The timeouts (apr_interval_time_t), negative ones ignored
+ * @return APR_SUCCESS, or APR_ENOTIMPL if the MPM doesn't use the hint
+ * @remark It's called at post-config, for each configuration (the values
+ * declared for the previous one are forgotten). It's never required: a wait
+ * with a timeout not declared works the same, possibly at a higher cost. So
+ * modules declare the fixed values they wait with (e.g. configured timeouts),
+ * not the variable ones (e.g. what's left of a time limit).
+ */
+AP_DECLARE(apr_status_t) ap_mpm_register_timeouts(
+        const apr_array_header_t *timeouts);
+
+/**
  * Flag for ap_mpm_register_wait(): keep the pfds registered in the MPM once
  * the wait completes (armed, or their readiness remembered), for the next
  * waits on them, until ap_mpm_release_pfds() or ap_mpm_release_pfd(), or
