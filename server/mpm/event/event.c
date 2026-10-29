@@ -929,6 +929,7 @@ typedef struct event_retained_data {
 
     ap_listen_rec **listen_buckets;
     int num_listen_buckets;
+    int listen_buckets_ratio; /* the ListenCoresBucketsRatio of the count */
 
     int first_server_limit;
     int first_thread_limit;
@@ -7707,6 +7708,54 @@ static int event_protocol_switch(conn_rec *c, request_rec *r, server_rec *s,
     return DECLINED;
 }
 
+/* The number of listeners buckets for active_daemons_limit children: the
+ * largest divisor of the children count not above num_cpus (those this
+ * process can run on) / ListenCoresBucketsRatio, so that every bucket has the
+ * same number of children and MaxRequestWorkers is not changed.  A graceful
+ * restart keeps the previous count (prev > 0) when it still fits and the
+ * ratio is unchanged, the configuration deciding otherwise.  Zero lets
+ * ap_duplicate_listeners() warn and use one bucket without SO_REUSEPORT.
+ */
+static int event_listen_buckets(server_rec *s, int prev)
+{
+    int ratio = ap_get_listen_buckets_ratio();
+    int max, n;
+
+    if (ratio != retained->listen_buckets_ratio) {
+        retained->listen_buckets_ratio = ratio;
+        prev = 0;
+    }
+    if (one_process || ratio <= 0) {
+        return 1;
+    }
+    if (!ap_have_so_reuseport) {
+        return 0;
+    }
+    max = num_cpus / ratio;
+    if (max < 1) {
+        max = 1;
+    }
+    if (prev > 0 && prev <= max && active_daemons_limit % prev == 0) {
+        return prev;
+    }
+    for (n = max; n > 1 && active_daemons_limit % n; n--) {
+        continue;
+    }
+    if (n < max) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO()
+                     "Using %d listeners bucket(s) instead of %d (%d CPUs, "
+                     "ListenCoresBucketsRatio %d): the largest divisor of "
+                     "the %d children (MaxRequestWorkers / ThreadsPerChild)",
+                     n, max, num_cpus, ratio, active_daemons_limit);
+    }
+    else {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, s, APLOGNO()
+                     "Using %d listeners bucket(s) based on %d CPUs and "
+                     "ListenCoresBucketsRatio %d", n, num_cpus, ratio);
+    }
+    return n;
+}
+
 /* This really should be a post_config hook, but the error log is already
  * redirected by that point, so we need to do this in the open_logs phase.
  * We compute num_buckets here too, thus the definitive AP_MPMQ_* settings
@@ -7787,27 +7836,14 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         ++retained->mpm->my_generation;
     }
 
-    /* On graceful restart, preserve the listeners buckets. When ungraceful,
-     * set num_buckets to zero to let ap_duplicate_listeners() below determine
-     * how many are needed/configured.
+    /* The previous generation's buckets count, kept on graceful restart if it
+     * still fits and the ratio is unchanged (see event_listen_buckets()).
      */
     if (!retained->mpm->was_graceful) {
-        num_buckets = (one_process) ? 1 : 0; /* one_process => one bucket */
+        num_buckets = 0;
         retained->mpm->num_buckets = 0; /* old gen's until event_run() */
     }
-    if ((rv = ap_duplicate_listeners(retained->gen_pool, ap_server_conf,
-                                     &retained->listen_buckets,
-                                     &num_buckets))) {
-        ap_log_error(APLOG_MARK, APLOG_ALERT | level_flags, rv,
-                     (startup ? NULL : s), APLOGNO(03273)
-                     "could not duplicate listeners, shutting down");
-        return !OK;
-    }
-    retained->num_listen_buckets = num_buckets;
 
-    /* Don't thrash since num_buckets depends on the system and the
-     * number of CPU cores, so make the settings consistent.
-     */
     if (retained->first_thread_limit) {
         if (threads_per_child > retained->first_thread_limit) {
             ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10465)
@@ -7823,33 +7859,45 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         }
         retained->first_thread_limit = thread_limit;
     }
-    min_threads = threads_per_child * num_buckets;
-    if (max_workers < min_threads) {
-        max_workers = min_threads;
+
+    /* MaxRequestWorkers is a multiple of ThreadsPerChild (already the case
+     * without the auto settings), limited on restart by the scoreboard.
+     */
+    if (max_workers < threads_per_child) {
+        max_workers = threads_per_child;
     }
     else {
-        max_workers = (max_workers / min_threads) * min_threads;
+        max_workers = (max_workers / threads_per_child) * threads_per_child;
     }
     active_daemons_limit = max_workers / threads_per_child;
+    if (retained->first_server_limit
+        && active_daemons_limit > retained->first_server_sb_limit) {
+        int new_max_workers = retained->first_server_sb_limit * threads_per_child;
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10466)
+                     "MaxRequestWorkers (%d) / ThreadsPerChild (%d) would "
+                     "exceed initial scoreboard limit (%d), forcing "
+                     "MaxRequestWorkers to %d",
+                     max_workers, threads_per_child,
+                     retained->first_server_sb_limit,
+                     new_max_workers);
+        max_workers = new_max_workers;
+        active_daemons_limit = retained->first_server_sb_limit;
+    }
+
+    /* The buckets divide the children, so MaxRequestWorkers is not changed */
+    num_buckets = event_listen_buckets(s, num_buckets);
+    if ((rv = ap_duplicate_listeners(retained->gen_pool, ap_server_conf,
+                                     &retained->listen_buckets,
+                                     &num_buckets))) {
+        ap_log_error(APLOG_MARK, APLOG_ALERT | level_flags, rv,
+                     (startup ? NULL : s), APLOGNO(03273)
+                     "could not duplicate listeners, shutting down");
+        return !OK;
+    }
+    retained->num_listen_buckets = num_buckets;
+    min_threads = threads_per_child * num_buckets;
+
     if (retained->first_server_limit) {
-        if (active_daemons_limit > retained->first_server_sb_limit) {
-            int new_max_workers = retained->first_server_sb_limit * threads_per_child;
-            if (new_max_workers < min_threads) {
-                new_max_workers = min_threads;
-            }
-            else {
-                new_max_workers = (new_max_workers / min_threads) * min_threads;
-            }
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10466)
-                         "MaxRequestWorkers (%d) / ThreadsPerChild (%d) would "
-                         "exceed initial scoreboard limit (%d), forcing "
-                         "MaxRequestWorkers to %d",
-                         max_workers, threads_per_child,
-                         retained->first_server_sb_limit,
-                         new_max_workers);
-            max_workers = new_max_workers;
-            active_daemons_limit = retained->first_server_sb_limit;
-        }
         server_limit = retained->first_server_sb_limit;
     }
     else {
@@ -7864,11 +7912,13 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         }
         retained->first_server_sb_limit = server_limit;
     }
+    /* Start the same number of children per bucket */
     if (ap_daemons_to_start < num_buckets) {
         ap_daemons_to_start = num_buckets;
     }
     else if (ap_daemons_to_start < active_daemons_limit) {
-        ap_daemons_to_start = (ap_daemons_to_start / num_buckets) * num_buckets;
+        ap_daemons_to_start = ((ap_daemons_to_start + num_buckets - 1)
+                               / num_buckets) * num_buckets;
     }
     else {
         ap_daemons_to_start = active_daemons_limit;

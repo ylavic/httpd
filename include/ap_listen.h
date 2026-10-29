@@ -130,6 +130,15 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
                                                 int *num_buckets);
 
 /**
+ * Get the configured ListenCoresBucketsRatio.
+ * @return The ratio, 0 when not configured.
+ * @remark For an MPM computing the number of buckets it passes to
+ *         ap_duplicate_listeners(); ap_have_so_reuseport tells whether
+ *         more than one bucket is possible.
+ */
+AP_DECLARE(int) ap_get_listen_buckets_ratio(void);
+
+/**
  * Loop through the global ap_listen_rec list and close each of the sockets.
  */
 AP_DECLARE_NONSTD(void) ap_close_listeners(void);

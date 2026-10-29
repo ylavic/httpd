@@ -1017,6 +1017,11 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
     return APR_SUCCESS;
 }
 
+AP_DECLARE(int) ap_get_listen_buckets_ratio(void)
+{
+    return ap_listencbratio;
+}
+
 AP_DECLARE_NONSTD(void) ap_close_listeners(void)
 {
     int i;

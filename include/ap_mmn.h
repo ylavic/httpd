@@ -789,7 +789,8 @@
  *                         ap_proxy_connect_backend_cancel(),
  *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
  *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
- *                         ap_proxy_tunnel_run_ex() to mod_proxy.h
+ *                         ap_proxy_tunnel_run_ex() to mod_proxy.h;
+ *                         ap_get_listen_buckets_ratio() to ap_listen.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
