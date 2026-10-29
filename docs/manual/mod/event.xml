@@ -147,6 +147,13 @@ and <directive>AsyncWorkerPollers</directive>.</p>
         <code>AP_EVENT_ADMISSION_INTERVAL</code> (in milliseconds).</p>
         </note>
 
+        <p>An accepted connection waits for a worker thread without a
+        timeout, however long the requests ahead of it take: the admission
+        bounds how many connections wait, hence how long, and those accepted
+        are served late rather than dropped. <directive
+        module="core">Timeout</directive> applies once a worker processes
+        it.</p>
+
         <p>The connections that don't need a worker while they wait (idle
         keep-alive connections, write completion, lingering close, requests
         suspended by asynchronous modules) are not limited by the admission,

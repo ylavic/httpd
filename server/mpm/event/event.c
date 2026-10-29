@@ -370,13 +370,20 @@ struct event_srv_cfg_s;
 typedef struct event_srv_cfg_s event_srv_cfg;
 
 struct timeout_queue;
-static apr_thread_mutex_t *timeout_mutex;
+
+/* An entry of a timeout queue (TO_QUEUE_APPEND()), in what it times out */
+struct timeout_entry {
+    APR_RING_ENTRY(timeout_entry) link;
+    struct timeout_queue *q; /* its queue, while in there */
+    apr_time_t queued;       /* when it was appended */
+    void *owner;             /* what it times out (TO_ENTRY_*()), set once */
+};
 
 struct user_wait;
 
 /*
  * The pollset for sockets that are in any of the timeout queues. Currently
- * we use the timeout_mutex to make sure that connections are added/removed
+ * we use conn_queues.mutex to make sure that connections are added/removed
  * atomically to/from both event_pollset and a timeout queue. Otherwise
  * some confusion can happen under high load if timeout queues and pollset
  * get out of sync.
@@ -424,8 +431,8 @@ struct kept_pfd;
 
 typedef struct event_conn_state_t event_conn_state_t;
 struct event_conn_state_t {
-    /** APR_RING of expiration timeouts */
-    APR_RING_ENTRY(event_conn_state_t) timeout_list;
+    /** the entry in its timeout queue (to.q), if any */
+    struct timeout_entry to;
     /** public parts of the connection state */
     conn_state_t pub;
     /** memory pool allocated on and to allocate from (ptrans) */
@@ -448,10 +455,6 @@ struct event_conn_state_t {
      */
     /** poll file descriptor information */
     apr_pollfd_t pfd;
-    /** the time when the entry was queued */
-    apr_time_t queue_timestamp;
-    /** the timeout queue for this entry */
-    struct timeout_queue *q;
     /** the timer event for this entry */
     timer_event_t *te;
     /** user pollfds (for suspended connection) */
@@ -514,6 +517,8 @@ struct event_conn_state_t {
 #define cs_se(cs) (&(cs)->bse.se)
 #define cs_qe(cs) (&(cs)->bse.qe)
 #define cs_in_backlog(cs) (cs_qe(cs)->cb != NULL)
+/* The connection of a timeout queue's entry */
+#define TO_ENTRY_CS(e) ((event_conn_state_t *)(e)->owner)
 
 static APR_INLINE apr_socket_t *cs_sd(event_conn_state_t *cs)
 {
@@ -576,7 +581,21 @@ static apr_time_t event_time_now(void)
 #endif
 }
 
-APR_RING_HEAD(timeout_head_t, event_conn_state_t);
+APR_RING_HEAD(timeout_head_t, timeout_entry);
+
+/* Timeout queues sharing a mutex (for their entries and counts) and a next
+ * expiry (the earliest of their first entries' expiries, for the listener's
+ * poll()ing timeout), which an append lowers only past the fudge so as not to
+ * wake up the listener for close timeouts. The backlog queues are protected
+ * by the worker_queue's lock instead (and the mutex too for their
+ * expiry, see listener_thread()).
+ */
+struct timeout_queues {
+    apr_thread_mutex_t *mutex;
+    volatile apr_time_t next_expiry;
+    apr_interval_time_t fudge;
+};
+
 struct timeout_queue {
     struct timeout_head_t head;
     apr_interval_time_t timeout;
@@ -584,6 +603,7 @@ struct timeout_queue {
     apr_uint32_t *total;        /* for all chained/related queues */
     const char *name;           /* for logging */
     struct timeout_queue *next; /* chaining */
+    struct timeout_queues *qs;  /* its mutex and next expiry */
 };
 
 /*
@@ -594,8 +614,11 @@ struct timeout_queue {
  *   keepalive_q        uses vhost's KeepAliveTimeOut
  *   shutdown_q         uses vhost's TimeOut
  *   linger_q           uses LINGER_READ_TIMEOUT
- *   backlog_q          uses vhost's TimeOut, LINGER_READ_TIMEOUT for the
+ *   backlog_q          no timeout (backlog_conn_q, the admission bounds how
+ *                      many wait and how long), LINGER_READ_TIMEOUT for the
  *                      lingering connections (backlog_linger_q, chained)
+ * A queue whose timeout is negative has none: its entries never expire, it's
+ * only walked to shrink it.
  */
 static struct timeout_queue *waitio_q,           /* wait for I/O to happen */
                             *write_completion_q, /* completion or user async poll */
@@ -603,21 +626,37 @@ static struct timeout_queue *waitio_q,           /* wait for I/O to happen */
                             *shutdown_q,         /* shutting down (write) before close */
                             *linger_q,           /* lingering (read) before close */
                             *backlog_q,          /* waiting for a worker */
+                            *backlog_conn_q,     /* not lingering (no timeout) */
                             *backlog_linger_q;   /* lingering, waiting for a worker */
-static volatile apr_time_t queues_next_expiry; /* next expiry time accross all queues */
+/* The connections' queues, their mutex and next expiry */
+static struct timeout_queues conn_queues = { NULL, 0, QUEUES_FUDGE_TIMEOUT };
 
 /*
  * Macros for accessing struct timeout_queue.
- * For TO_QUEUE_APPEND and TO_QUEUE_REMOVE, timeout_mutex must be held.
+ * For TO_QUEUE_APPEND and TO_QUEUE_REMOVE, q->qs->mutex must be held.
  * TO_QUEUE_APPEND returns whether the listener has to be woken up to update
  * its poll()ing timeout, for the caller to do it once the mutex released
  * (wakeup_listener()).
  */
-static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
-{
-    apr_time_t elem_expiry;
-    apr_time_t next_expiry;
+#define TO_QUEUE_EXPIRY(q, e) ((e)->queued + (q)->timeout)
+#define TO_QUEUE_EXPIRES(q) ((q)->timeout >= 0)
 
+/* Lower the next expiry of q's queues to an entry's expiry if it's earlier,
+ * past the fudge, returning whether it was lowered.
+ */
+static APR_INLINE int TO_QUEUE_NEXT_EXPIRY(struct timeout_queue *q,
+                                           apr_time_t elem_expiry)
+{
+    apr_time_t next_expiry = q->qs->next_expiry;
+    if (!next_expiry || next_expiry > elem_expiry + q->qs->fudge) {
+        q->qs->next_expiry = elem_expiry;
+        return 1;
+    }
+    return 0;
+}
+
+static int TO_QUEUE_APPEND(struct timeout_queue *q, struct timeout_entry *e)
+{
     /* It greatly simplifies the logic to use a single timeout value per q
      * because the new element can just be added to the end of the list and
      * it will stay sorted in expiration time sequence.  If brand new
@@ -627,11 +666,11 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
      * a few milliseconds anyway.
      */
 
-    ap_assert(q && !cs->q);
+    ap_assert(q && !e->q);
 
-    cs->q = q;
-    cs->queue_timestamp = event_time_now();
-    APR_RING_INSERT_TAIL(&q->head, cs, event_conn_state_t, timeout_list);
+    e->q = q;
+    e->queued = event_time_now();
+    APR_RING_INSERT_TAIL(&q->head, e, timeout_entry, link);
     ++q->count;
 
     /* Use atomic_set to be ordered/consistent with potential atomic reads
@@ -640,26 +679,23 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *cs)
      */
     apr_atomic_set32(q->total, *q->total + 1);
 
-    /* Cheaply update the global queues_next_expiry with the one of the
+    /* Cheaply update the next expiry of the queues with the one of the
      * first entry of this queue (oldest) if it expires before.
      */
-    cs = APR_RING_FIRST(&q->head);
-    elem_expiry = cs->queue_timestamp + q->timeout;
-    next_expiry = queues_next_expiry;
-    if (!next_expiry || next_expiry > elem_expiry + QUEUES_FUDGE_TIMEOUT) {
-        queues_next_expiry = elem_expiry;
-        return 1;
+    if (!TO_QUEUE_EXPIRES(q)) {
+        return 0;
     }
-    return 0;
+    e = APR_RING_FIRST(&q->head);
+    return TO_QUEUE_NEXT_EXPIRY(q, TO_QUEUE_EXPIRY(q, e));
 }
 
-static void TO_QUEUE_REMOVE(struct timeout_queue *q, event_conn_state_t *cs)
+static void TO_QUEUE_REMOVE(struct timeout_queue *q, struct timeout_entry *e)
 {
-    ap_assert(q && cs->q == q);
-    cs->q = NULL;
+    ap_assert(q && e->q == q);
+    e->q = NULL;
 
-    APR_RING_REMOVE(cs, timeout_list);
-    APR_RING_ELEM_INIT(cs, timeout_list);
+    APR_RING_REMOVE(e, link);
+    APR_RING_ELEM_INIT(e, link);
     --q->count;
 
     /* Use atomic_set to be ordered/consistent with potential atomic reads
@@ -670,6 +706,7 @@ static void TO_QUEUE_REMOVE(struct timeout_queue *q, event_conn_state_t *cs)
 }
 
 static struct timeout_queue *TO_QUEUE_MAKE(apr_pool_t *p,
+                                           struct timeout_queues *qs,
                                            const char *name,
                                            apr_interval_time_t t,
                                            struct timeout_queue *ref)
@@ -677,15 +714,17 @@ static struct timeout_queue *TO_QUEUE_MAKE(apr_pool_t *p,
     struct timeout_queue *q;
 
     q = apr_pcalloc(p, sizeof *q);
-    APR_RING_INIT(&q->head, event_conn_state_t, timeout_list);
+    APR_RING_INIT(&q->head, timeout_entry, link);
     q->total = (ref) ? ref->total : apr_pcalloc(p, sizeof *q->total);
     q->timeout = t;
     q->name = name;
+    q->qs = qs;
 
     return q;
 }
 
 static struct timeout_queue *TO_QUEUE_CHAIN(apr_pool_t *p,
+                                            struct timeout_queues *qs,
                                             const char *name,
                                             apr_interval_time_t t,
                                             struct timeout_queue **ref,
@@ -694,7 +733,7 @@ static struct timeout_queue *TO_QUEUE_CHAIN(apr_pool_t *p,
     struct timeout_queue *q = apr_hash_get(ht, &t, sizeof t);
 
     if (!q) {
-        q = TO_QUEUE_MAKE(p, name, t, *ref);
+        q = TO_QUEUE_MAKE(p, qs, name, t, *ref);
         q->next = *ref;
         *ref = q;
 
@@ -931,8 +970,7 @@ struct event_srv_cfg_s {
     struct timeout_queue *io_q,
                          *wc_q,
                          *ka_q,
-                         *sh_q,
-                         *bl_q;
+                         *sh_q;
     server_rec *s; /* backref */
 };
 
@@ -2073,7 +2111,7 @@ static void cancel_timer_event(timer_event_t *te);
 static void shutdown_connection(event_conn_state_t *cs, apr_time_t now,
                                 int in_backlog)
 {
-    ap_assert(!cs->q && !cs->te);
+    ap_assert(!cs->to.q && !cs->te);
 
     if (in_backlog) {
         backlog_dropped++;
@@ -2269,7 +2307,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
                   CS_ARG(cs), at, line);
 
     ap_assert((q != NULL) ^ (te != NULL));
-    ap_assert(cs->q == NULL && cs->te == NULL);
+    ap_assert(cs->to.q == NULL && cs->te == NULL);
 
     set_conn_state_sense(cs, sense);
 #ifdef APR_POLLONESHOT
@@ -2281,8 +2319,8 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
 #endif
 
     if (q) {
-        apr_thread_mutex_lock(timeout_mutex);
-        wakeup = TO_QUEUE_APPEND(q, cs);
+        apr_thread_mutex_lock(conn_queues.mutex);
+        wakeup = TO_QUEUE_APPEND(q, &cs->to);
     }
     else {
         /* Recorded before it's inserted, see insert_timer_event() */
@@ -2293,8 +2331,8 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
     rv = apr_pollset_add(conn_pollset, &cs->pfd);
     if (rv != APR_SUCCESS) {
         if (q) {
-            TO_QUEUE_REMOVE(q, cs);
-            apr_thread_mutex_unlock(timeout_mutex);
+            TO_QUEUE_REMOVE(q, &cs->to);
+            apr_thread_mutex_unlock(conn_queues.mutex);
         }
         else {
             cancel_timer_event(te);
@@ -2321,7 +2359,7 @@ static int pollset_add_at(event_conn_state_t *cs, int sense,
         return 0;
     }
     if (q) {
-        apr_thread_mutex_unlock(timeout_mutex);
+        apr_thread_mutex_unlock(conn_queues.mutex);
         if (wakeup) {
             wakeup_listener();
         }
@@ -2339,18 +2377,18 @@ static int pollset_del_at(event_conn_state_t *cs, int locked, int fired,
     ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                   "pollset: del %s=%" APR_TIME_T_FMT " events=%x"
                   " for connection %" CS_FMT " at %s:%i",
-                  (cs->q) ? "q" : "t",
-                  (cs->q) ? cs->q->timeout : (cs->te ? cs->te->timeout : -1),
+                  (cs->to.q) ? "q" : "t",
+                  (cs->to.q) ? cs->to.q->timeout : (cs->te ? cs->te->timeout : -1),
                   (int)cs->pfd.reqevents,
                   CS_ARG(cs), at, line);
 
-    if (cs->q) {
+    if (cs->to.q) {
         if (!locked) {
-            apr_thread_mutex_lock(timeout_mutex);
+            apr_thread_mutex_lock(conn_queues.mutex);
         }
-        TO_QUEUE_REMOVE(cs->q, cs);
+        TO_QUEUE_REMOVE(cs->to.q, &cs->to);
         if (!locked) {
-            apr_thread_mutex_unlock(timeout_mutex);
+            apr_thread_mutex_unlock(conn_queues.mutex);
         }
     }
     else if (cs->te) {
@@ -2418,7 +2456,8 @@ static event_conn_state_t *make_conn_state(apr_pool_t *p, apr_socket_t *csd)
     pt->type = PT_CSD;
     pt->baton = cs;
 
-    APR_RING_ELEM_INIT(cs, timeout_list);
+    APR_RING_ELEM_INIT(&cs->to, link);
+    cs->to.owner = cs;
 
     cs->sc = cs->ka_sc = ap_get_module_config(ap_server_conf->module_config,
                                               &mpm_event_module);
@@ -3886,7 +3925,8 @@ static void init_serf(apr_pool_t *p)
 #endif
 
 /* A backlog connection is both in the worker_queue (for a worker to pull
- * it ASAP) and in the backlog_q (for the listener to enforce a timeout).
+ * it ASAP) and in the backlog_q (counted, the lingering ones for the listener
+ * to enforce their timeout).
  * The worker_queue can do the queuing on both queues for us, that is
  * consistently and safely push/pop to/from both queues under its lock,
  * thanks to a callback called when an event is pushed and popped.
@@ -3900,16 +3940,16 @@ static void conn_state_backlog_cb(void *baton, int pushed)
          * the connection may be popped and run by then. A lingering one
          * waits LINGER_READ_TIMEOUT at most.
          */
-        struct timeout_queue *q = cs->sc->bl_q;
+        struct timeout_queue *q = backlog_conn_q;
         if (cs->pub.state == CONN_STATE_LINGER && cs->linger_since) {
             q = backlog_linger_q;
         }
-        if (TO_QUEUE_APPEND(q, cs)) {
+        if (TO_QUEUE_APPEND(q, &cs->to)) {
             wakeup_listener();
         }
     }
     else { /* popped */
-        TO_QUEUE_REMOVE(cs->q, cs);
+        TO_QUEUE_REMOVE(cs->to.q, &cs->to);
 
         /* not in backlog anymore */
         cs_qe(cs)->cb = NULL;
@@ -3971,7 +4011,7 @@ static int push2worker(event_conn_state_t *cs, timer_event_t *te,
     }
     else {
         ap_assert(!cs_in_backlog(cs));
-        ap_assert(!cs->q);
+        ap_assert(!cs->to.q);
 
         if (busy && cs->pub.state == CONN_STATE_LINGER && cs->linger_shutdown) {
             /* Not worth lingering more on this connection if we are short of
@@ -4240,20 +4280,21 @@ static void claimed_user_wait_timer(struct user_wait *user_wait)
 #ifdef APR_POLLONESHOT
 /* Claim a connection whose (one-shot) pfd fired, from any thread, against
  * its expiry by the listener: it's ours if it's still in its timeout queue
- * (timeout_mutex) or its timer is still in the skiplist (cs->te is read under
- * g_timer_skiplist_mtx since the listener recycles it there when it expires).
+ * (conn_queues.mutex) or its timer is still in the skiplist (cs->te is read
+ * under g_timer_skiplist_mtx since the listener recycles it there when it
+ * expires).
  */
 static int claim_connection(event_conn_state_t *cs)
 {
     timer_event_t *te;
     int claimed = 0;
 
-    apr_thread_mutex_lock(timeout_mutex);
-    if (cs->q) {
-        TO_QUEUE_REMOVE(cs->q, cs);
+    apr_thread_mutex_lock(conn_queues.mutex);
+    if (cs->to.q) {
+        TO_QUEUE_REMOVE(cs->to.q, &cs->to);
         claimed = 1;
     }
-    apr_thread_mutex_unlock(timeout_mutex);
+    apr_thread_mutex_unlock(conn_queues.mutex);
     if (claimed) {
         return 1;
     }
@@ -4302,7 +4343,7 @@ static APR_INLINE int linger_expired(event_conn_state_t *cs, apr_time_t now)
  * Only to be called in the worker thread, and since it's in immediate call
  * stack, we can afford a comfortable buffer size to consume data quickly.
  * Pre-condition: cs is not in any timeout queue and not in the pollset,
- *                timeout_mutex is not locked
+ *                conn_queues.mutex is not locked
  */
 #define LINGERING_BUF_SIZE (32 * 1024)
 static void process_lingering_close(event_conn_state_t *cs)
@@ -4400,9 +4441,9 @@ static void process_lingering_close(event_conn_state_t *cs)
  * the worker_queue and chained to *timed_out, for the caller to shut them
  * down once it released the worker_queue's lock. Likewise for the others when
  * timed_out is not NULL, only removed from the pollset, for the caller to
- * shut them down once it released timeout_mutex (closing a connection runs
- * its pool cleanups).
- * Pre-condition: timeout_mutex must already be locked
+ * shut them down once it released conn_queues.mutex (closing a connection
+ * runs its pool cleanups).
+ * Pre-condition: conn_queues.mutex must already be locked
  */
 static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                                              apr_time_t now, int shrink,
@@ -4416,27 +4457,26 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
     }
 
     for (q = queue; q; q = q->next) {
-        while (!APR_RING_EMPTY(&q->head, event_conn_state_t, timeout_list)) {
-            event_conn_state_t *cs = APR_RING_FIRST(&q->head);
+        if (!shrink && !TO_QUEUE_EXPIRES(q)) {
+            continue;
+        }
+        while (!APR_RING_EMPTY(&q->head, timeout_entry, link)) {
+            event_conn_state_t *cs = TO_ENTRY_CS(APR_RING_FIRST(&q->head));
 
-            ap_assert(cs->q == q);
+            ap_assert(cs->to.q == q);
 
             if (!shrink) {
                 /* Stop if this entry did not expire, no following one will
                  * thanks to the single timeout per queue (latest entries are
                  * added to the tail).
                  */
-                apr_time_t elem_expiry = cs->queue_timestamp + q->timeout;
+                apr_time_t elem_expiry = TO_QUEUE_EXPIRY(q, &cs->to);
                 if (elem_expiry > now) {
                     /* This is the next expiring entry of this queue, update
-                     * the global queues_next_expiry if it expires after
-                     * this one.
+                     * the next expiry of the queues if it expires after this
+                     * one.
                      */
-                    apr_time_t next_expiry = queues_next_expiry;
-                    if (!next_expiry
-                        || next_expiry > elem_expiry + QUEUES_FUDGE_TIMEOUT) {
-                        queues_next_expiry = elem_expiry;
-                    }
+                    (void)TO_QUEUE_NEXT_EXPIRY(q, elem_expiry);
                     break;
                 }
             }
@@ -4449,7 +4489,7 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                  * none could handle the event. Ours from now, shut down by
                  * the caller after unlocking.
                  */
-                ap_assert(cs->q == cs->sc->bl_q || cs->q == backlog_linger_q);
+                ap_assert(cs->to.q == backlog_conn_q || cs->to.q == backlog_linger_q);
                 ap_assert(cs_qe(cs)->cb_baton == cs);
                 ap_assert(timed_out != NULL);
                 ap_queue_info_idlers_inc(worker_queue_info);
@@ -4741,7 +4781,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         }
 
         /* Same for queues, use their next expiry, if any. */
-        next_expiry = queues_next_expiry;
+        next_expiry = conn_queues.next_expiry;
         if (next_expiry && (timeout < 0 || next_expiry - now < timeout)) {
             timeout = next_expiry > now ? next_expiry - now : 0;
         }
@@ -4827,7 +4867,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      " timers_timeout=%" APR_TIME_T_FMT
                      " listen=%s conns=%d exit=%d/%d",
                      timeout,
-                     queues_next_expiry ? queues_next_expiry - now : 0,
+                     conn_queues.next_expiry ? conn_queues.next_expiry - now : 0,
                      timers_next_expiry ? timers_next_expiry - now : 0,
                      listensocks_disabled() ? "no" : "yes",
                      apr_atomic_read32(&event_counts.connection_count),
@@ -4864,7 +4904,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      " timers_timeout=%" APR_TIME_T_FMT
                      " listen=%s conns=%d exit=%d/%d",
                      (int)num, now - poll_time, timeout,
-                     queues_next_expiry ? queues_next_expiry - now : 0,
+                     conn_queues.next_expiry ? conn_queues.next_expiry - now : 0,
                      timers_next_expiry ? timers_next_expiry - now : 0,
                      listensocks_disabled() ? "no" : "yes",
                      apr_atomic_read32(&event_counts.connection_count),
@@ -5145,7 +5185,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         }
 
         /* We process the timeout queues here only when the global
-         * queues_next_expiry has passed. This happens accurately since
+         * conn_queues.next_expiry has passed. This happens accurately since
          * adding to the queues (in workers) can only decrease this expiry,
          * while latest ones are only taken into account here (in listener)
          * during queues' processing, with the lock held. This works both
@@ -5154,24 +5194,24 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          * "now" went below "expiry" in the meantime, the next poll() will
          * return immediately so the maintenance will happen then.
          */
-        next_expiry = queues_next_expiry;
+        next_expiry = conn_queues.next_expiry;
         if (next_expiry && next_expiry <= now) {
 do_maintenance:
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "queues maintenance: expired=%" APR_TIME_T_FMT,
                          next_expiry > 0 ? now - next_expiry : -1);
 
-            apr_thread_mutex_lock(timeout_mutex);
+            apr_thread_mutex_lock(conn_queues.mutex);
 
             /* Recompute this by walking the timeout queues (under the lock) */
-            queues_next_expiry = 0;
+            conn_queues.next_expiry = 0;
 
             /* Process shutdown_q first because the expired entries from the
              * other queues will go there and don't need to be checked twice
              * (nor do we want to potentially kill them before the shutdown).
              * The expired shutting down and lingering connections are closed
-             * after releasing timeout_mutex (their pool cleanups must not run
-             * under it).
+             * after releasing conn_queues.mutex (their pool cleanups must not
+             * run under it).
              */
             (void)process_timeout_queue_ex(shutdown_q, now, 0, &expired);
 
@@ -5203,8 +5243,8 @@ do_maintenance:
                 }
             }
 
-            next_expiry = queues_next_expiry;
-            apr_thread_mutex_unlock(timeout_mutex);
+            next_expiry = conn_queues.next_expiry;
+            apr_thread_mutex_unlock(conn_queues.mutex);
 
             while (expired) {
                 event_conn_state_t *cs = expired;
@@ -6090,7 +6130,7 @@ static void setup_threads_runtime(void)
     /* Create the timeout mutex and main pollset before the listener
      * thread starts.
      */
-    rv = apr_thread_mutex_create(&timeout_mutex, APR_THREAD_MUTEX_DEFAULT,
+    rv = apr_thread_mutex_create(&conn_queues.mutex, APR_THREAD_MUTEX_DEFAULT,
                                  pruntime);
     if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO(03102)
@@ -7686,7 +7726,7 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
 static int event_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                              apr_pool_t *ptemp, server_rec *s)
 {
-    apr_hash_t *io_h, *wc_h, *ka_h, *sh_h, *bl_h;
+    apr_hash_t *io_h, *wc_h, *ka_h, *sh_h;
 
     /* Not needed in pre_config stage */
     if (ap_state_query(AP_SQ_MAIN_STATE) == AP_SQ_MS_CREATE_PRE_CONFIG) {
@@ -7697,33 +7737,38 @@ static int event_post_config(apr_pool_t *pconf, apr_pool_t *plog,
     wc_h = apr_hash_make(ptemp);
     ka_h = apr_hash_make(ptemp);
     sh_h = apr_hash_make(ptemp);
-    bl_h = apr_hash_make(ptemp);
 
-    linger_q = TO_QUEUE_MAKE(pconf, "linger", LINGER_READ_TIMEOUT, NULL);
+    linger_q = TO_QUEUE_MAKE(pconf, &conn_queues, "linger",
+                             LINGER_READ_TIMEOUT, NULL);
 
     for (; s; s = s->next) {
         event_srv_cfg *sc = apr_pcalloc(pconf, sizeof *sc);
         ap_set_module_config(s->module_config, &mpm_event_module, sc);
         sc->s = s; /* backref */
 
-        sc->io_q = TO_QUEUE_CHAIN(pconf, "waitio", s->timeout,
-                                  &waitio_q, io_h, ptemp);
+        sc->io_q = TO_QUEUE_CHAIN(pconf, &conn_queues, "waitio",
+                                  s->timeout, &waitio_q, io_h, ptemp);
 
-        sc->wc_q = TO_QUEUE_CHAIN(pconf, "write_completion", s->timeout,
-                                  &write_completion_q, wc_h, ptemp);
+        sc->wc_q = TO_QUEUE_CHAIN(pconf, &conn_queues, "write_completion",
+                                  s->timeout, &write_completion_q, wc_h,
+                                  ptemp);
 
-        sc->ka_q = TO_QUEUE_CHAIN(pconf, "keepalive", s->keep_alive_timeout,
-                                  &keepalive_q, ka_h, ptemp);
+        sc->ka_q = TO_QUEUE_CHAIN(pconf, &conn_queues, "keepalive",
+                                  s->keep_alive_timeout, &keepalive_q, ka_h,
+                                  ptemp);
 
-        sc->sh_q = TO_QUEUE_CHAIN(pconf, "shutdown", s->timeout,
-                                  &shutdown_q, sh_h, ptemp);
-
-        sc->bl_q = TO_QUEUE_CHAIN(pconf, "backlog", s->timeout,
-                                  &backlog_q, bl_h, ptemp);
+        sc->sh_q = TO_QUEUE_CHAIN(pconf, &conn_queues, "shutdown",
+                                  s->timeout, &shutdown_q, sh_h, ptemp);
     }
-    backlog_linger_q = TO_QUEUE_MAKE(pconf, "backlog_linger",
-                                     LINGER_READ_TIMEOUT, backlog_q);
-    backlog_linger_q->next = backlog_q;
+
+    /* The connections waiting for a worker have no timeout (the admission
+     * bounds how many wait and how long: accepted, they're served late rather
+     * than dropped), the lingering ones LINGER_READ_TIMEOUT (chained first).
+     */
+    backlog_conn_q = TO_QUEUE_MAKE(pconf, &conn_queues, "backlog", -1, NULL);
+    backlog_linger_q = TO_QUEUE_MAKE(pconf, &conn_queues, "backlog_linger",
+                                     LINGER_READ_TIMEOUT, backlog_conn_q);
+    backlog_linger_q->next = backlog_conn_q;
     backlog_q = backlog_linger_q;
 
     return OK;
