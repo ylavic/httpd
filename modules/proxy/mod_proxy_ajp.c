@@ -178,6 +178,44 @@ static apr_off_t get_content_length(request_rec * r)
 /*
  * process the request and write the response.
  */
+/* The state of a request whose response is read by ap_proxy_ajp_response(),
+ * kept while waiting for it asynchronously
+ * (ap_proxy_wait()).
+ */
+typedef struct {
+    apr_pool_t *p;
+    request_rec *r;
+    proxy_conn_rec *conn;
+    proxy_dir_conf *conf;
+    apr_bucket_brigade *input_brigade;
+    ajp_msg_t *msg;
+    char *buff;
+    apr_size_t maxsize;
+    int send_body;
+    int original_status;
+    const char *original_status_line;
+} ajp_req_t;
+
+static int ap_proxy_ajp_response(ajp_req_t *req, apr_status_t status);
+
+/*
+ * The continuation of ap_proxy_ajp_request() once the backend's response is
+ * readable (or the wait for it failed): process the response, release the
+ * backend and finish the request.
+ */
+static void ap_proxy_ajp_response_continuation(request_rec *r, apr_status_t rv,
+                                               void *baton)
+{
+    ajp_req_t *req = baton;
+    int status;
+
+    status = ap_proxy_ajp_response(req, rv);
+
+    /* Do not close the socket */
+    ap_proxy_release_connection("AJP", req->conn, r->server);
+    ap_proxy_handler_done(r, status);
+}
+
 static int ap_proxy_ajp_request(apr_pool_t *p, request_rec *r,
                                 proxy_conn_rec *conn,
                                 conn_rec *origin,
@@ -186,27 +224,13 @@ static int ap_proxy_ajp_request(apr_pool_t *p, request_rec *r,
                                 char *url, char *server_portstr)
 {
     apr_status_t status;
-    int result;
-    apr_bucket *e;
     apr_bucket_brigade *input_brigade;
-    apr_bucket_brigade *output_brigade;
     ajp_msg_t *msg;
     apr_size_t bufsiz = 0;
     char *buff;
-    char *send_body_chunk_buff;
-    apr_uint16_t size;
-    apr_byte_t conn_reuse = 0;
     const char *tenc;
-    int havebody = 1;
-    int client_failed = 0;
-    int backend_failed = 0;
-    apr_off_t bb_len;
-    int data_sent = 0;
-    int request_ended = 0;
-    int headers_sent = 0;
-    int rv = OK;
-    apr_int32_t conn_poll_fd;
-    apr_pollfd_t *conn_poll;
+    ajp_req_t *req;
+    apr_interval_time_t timeout;
     proxy_server_conf *psf =
     ap_get_module_config(r->server->module_config, &proxy_module);
     apr_size_t maxsize = AJP_MSG_BUFFER_SZ;
@@ -366,10 +390,70 @@ static int ap_proxy_ajp_request(apr_pool_t *p, request_rec *r,
         }
     }
 
+    req = apr_palloc(p, sizeof(*req));
+    req->p = p;
+    req->r = r;
+    req->conn = conn;
+    req->conf = conf;
+    req->input_brigade = input_brigade;
+    req->msg = msg;
+    req->buff = buff;
+    req->maxsize = maxsize;
+    req->send_body = send_body;
+    req->original_status = original_status;
+    req->original_status_line = original_status_line;
+
+    /* Wait for the response without holding the thread if possible, then
+     * ap_proxy_ajp_response_continuation() continues.
+     */
+    apr_socket_timeout_get(conn->sock, &timeout);
+    if (ap_proxy_wait(r, conn, AP_PROXY_BACKEND_IN, 0, timeout,
+                      ap_proxy_ajp_response_continuation, req) == SUSPENDED) {
+        return SUSPENDED;
+    }
+    return ap_proxy_ajp_response(req, APR_SUCCESS);
+}
+
+/*
+ * Read the response, unless the wait for it failed (status), and process it.
+ */
+static int ap_proxy_ajp_response(ajp_req_t *req, apr_status_t status)
+{
+    apr_pool_t *p = req->p;
+    request_rec *r = req->r;
+    proxy_conn_rec *conn = req->conn;
+    proxy_dir_conf *conf = req->conf;
+    apr_bucket_brigade *input_brigade = req->input_brigade;
+    ajp_msg_t *msg = req->msg;
+    char *buff = req->buff;
+    apr_size_t maxsize = req->maxsize;
+    int send_body = req->send_body;
+    int original_status = req->original_status;
+    const char *original_status_line = req->original_status_line;
+    int result;
+    apr_bucket *e;
+    apr_bucket_brigade *output_brigade;
+    apr_size_t bufsiz;
+    char *send_body_chunk_buff;
+    apr_uint16_t size;
+    apr_byte_t conn_reuse = 0;
+    int havebody = 1;
+    int client_failed = 0;
+    int backend_failed = 0;
+    apr_off_t bb_len;
+    int data_sent = 0;
+    int request_ended = 0;
+    int headers_sent = 0;
+    int rv = OK;
+    apr_int32_t conn_poll_fd;
+    apr_pollfd_t *conn_poll;
+
     /* read the response */
     conn->data = NULL;
-    status = ajp_read_header(conn->sock, r, maxsize,
-                             (ajp_msg_t **)&(conn->data));
+    if (status == APR_SUCCESS) {
+        status = ajp_read_header(conn->sock, r, maxsize,
+                                 (ajp_msg_t **)&(conn->data));
+    }
     if (status != APR_SUCCESS) {
         /* We had a failure: Close connection to backend */
         conn->close = 1;
@@ -853,6 +937,12 @@ static int proxy_ajp_handler(request_rec *r, proxy_worker *worker,
         /* Step Three: Process the Request */
         status = ap_proxy_ajp_request(p, r, backend, origin, dconf, uri, locurl,
                                       server_portstr);
+        if (status == SUSPENDED) {
+            /* ap_proxy_ajp_response_continuation() continues, and releases the
+             * backend
+             */
+            return SUSPENDED;
+        }
         break;
     }
 
