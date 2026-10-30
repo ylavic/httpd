@@ -96,6 +96,8 @@ checks/async-*-check.py PREFIX WORKDIR
   same backend reusing its connection), schemes (mod_proxy_ajp,
   mod_proxy_scgi and mod_proxy_uwsgi against schemebackend: waits on few
   threads, timeout=, large responses, request bodies, early close, backend
-  down, a pool of one connection).
+  down, a pool of one connection), balancer-wait (requests waiting for a
+  usable member until the balancer's timeout=, the backend coming back or
+  not).
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).
