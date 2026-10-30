@@ -788,9 +788,13 @@ static int proxy_ajp_handler(request_rec *r, proxy_worker *worker,
     uri = apr_palloc(p, sizeof(*uri));
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00895) "serving URL %s", url);
 
-    /* create space for state information */
-    status = ap_proxy_acquire_connection(scheme, &backend, worker,
-                                         r->server);
+    /* create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released.
+     */
+    status = ap_proxy_acquire_connection_async(scheme, &backend, r,
+                                               proxy_ajp_handler, worker,
+                                               conf, url, proxyname,
+                                               proxyport);
     if (status != OK) {
         if (backend) {
             backend->close = 1;

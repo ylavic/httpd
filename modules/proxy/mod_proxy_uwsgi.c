@@ -540,6 +540,18 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
         return DECLINED;
     }
 
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released (so url
+     * is unescaped below, after).
+     */
+    status = ap_proxy_acquire_connection_async(UWSGI_SCHEME, &backend, r,
+                                               uwsgi_handler, worker, conf,
+                                               url, proxyname, proxyport);
+    if (status != OK) {
+        goto cleanup;
+    }
+    backend->is_ssl = 0;
+
     uri = apr_palloc(r->pool, sizeof(*uri));
 
     /* ADD PATH_INFO (unescaped) */
@@ -550,7 +562,8 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     else if (ap_unescape_url(u_path_info) != OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10100)
                       "unable to decode uwsgi uri: %s", url);
-        return HTTP_INTERNAL_SERVER_ERROR;
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        goto cleanup;
     }
     else {
         /* Remove duplicate slashes at the beginning of PATH_INFO */
@@ -559,14 +572,6 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
         }
     }
     apr_table_add(r->subprocess_env, "PATH_INFO", u_path_info);
-
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(UWSGI_SCHEME, &backend, worker,
-                                         r->server);
-    if (status != OK) {
-        goto cleanup;
-    }
-    backend->is_ssl = 0;
 
     /* Step One: Determine Who To Connect To */
     status = ap_proxy_determine_connection(p, r, conf, worker, backend,

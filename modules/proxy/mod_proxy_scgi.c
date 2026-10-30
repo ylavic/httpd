@@ -549,9 +549,12 @@ static int scgi_handler(request_rec *r, proxy_worker *worker,
         return DECLINED;
     }
 
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(PROXY_FUNCTION, &backend, worker,
-                                         r->server);
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released.
+     */
+    status = ap_proxy_acquire_connection_async(PROXY_FUNCTION, &backend, r,
+                                               scgi_handler, worker, conf,
+                                               url, proxyname, proxyport);
     if (status != OK) {
         goto cleanup;
     }

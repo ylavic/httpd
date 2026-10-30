@@ -1274,9 +1274,13 @@ static int proxy_fcgi_handler(request_rec *r, proxy_worker *worker,
 
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01078) "serving URL %s", url);
 
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(FCGI_SCHEME, &backend, worker,
-                                         r->server);
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released.
+     */
+    status = ap_proxy_acquire_connection_async(FCGI_SCHEME, &backend, r,
+                                               proxy_fcgi_handler, worker,
+                                               conf, url, proxyname,
+                                               proxyport);
     if (status != OK) {
         if (backend) {
             backend->close = 1;
