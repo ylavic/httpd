@@ -6691,8 +6691,6 @@ done:
 
 PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
 {
-    conn_rec *c = r->connection;
-
     /* Let mod_proxy's handler continue as if the scheme handler had returned
      * this status: it may fail over to another balancer member (suspending
      * again), and runs the post_request hooks once the request is done.
@@ -6702,23 +6700,7 @@ PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
         return;
     }
 
-    /* An error is not a recursive one, as for ap_process_async_request()'s
-     * ap_die_r(access_status, r, HTTP_OK) (not public).
-     */
-    if (status != OK && status != DONE) {
-        r->status = HTTP_OK;
-    }
-    ap_die(status, r);
-    ap_process_request_after_handler(r);
-    /* don't dereference r from here! */
-
-    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
-        c->cs->state = CONN_STATE_LINGER;
-    }
-    else {
-        c->cs->state = CONN_STATE_WRITE_COMPLETION;
-    }
-    ap_mpm_resume_suspended(c);
+    ap_request_finish_suspended(r, status);
 }
 
 /* Whether the MPM can wait for a tunnel or a backend (ap_mpm_register_wait()),

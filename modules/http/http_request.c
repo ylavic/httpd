@@ -477,6 +477,33 @@ void ap_process_async_request(request_rec *r)
     ap_process_request_after_handler(r);
 }
 
+AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
+{
+    conn_rec *c = r->connection;
+
+    /* This run on a worker is timed as one, stopped by
+     * ap_process_request_after_handler() (its STOP_PREQUEST)
+     */
+    if (ap_extended_status) {
+        ap_time_process_request(c->sbh, START_PREQUEST);
+    }
+
+    /* As ap_process_async_request() would have if the handler had returned
+     * this status: an error is not a recursive one.
+     */
+    ap_die_r(status, r, HTTP_OK);
+    ap_process_request_after_handler(r);
+    /* don't dereference r from here! */
+
+    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
+        c->cs->state = CONN_STATE_LINGER;
+    }
+    else {
+        c->cs->state = CONN_STATE_WRITE_COMPLETION;
+    }
+    ap_mpm_resume_suspended(c);
+}
+
 AP_DECLARE(void) ap_process_request(request_rec *r)
 {
     apr_bucket_brigade *bb;

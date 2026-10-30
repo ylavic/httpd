@@ -777,6 +777,7 @@
  *                         process_score->shutdown, ->backlog and
  *                         ->workers_live to scoreboard.h;
  *                         AP_SHUTDOWN_CONN_* to http_connection.h;
+ *                         ap_request_finish_suspended() to http_request.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
  *                         ap_proxy_handler_done(), proxy_req_conf->async,

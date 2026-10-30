@@ -331,6 +331,19 @@ AP_DECLARE(void) ap_process_request_after_handler(request_rec *r);
 void ap_process_async_request(request_rec *r);
 
 /**
+ * Finish a request whose handler returned SUSPENDED, once the module that
+ * suspended it is done with it (e.g. from the continuation of its last
+ * wait, ap_mpm_register_wait()): as ap_process_async_request() would have
+ * continued if the handler had returned status (ap_die() and
+ * ap_process_request_after_handler()), then give the connection back to the
+ * MPM (ap_mpm_resume_suspended()).
+ * @param r The suspended request
+ * @param status The handler's final status (OK, DONE or an HTTP error)
+ * @remark Don't dereference r afterwards.
+ */
+AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
+
+/**
  * Kill the current request
  * @param type Why the request is dying
  * @param r The current request
