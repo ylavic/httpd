@@ -497,8 +497,6 @@ struct event_conn_state_t {
          *  hooks)
          */
         suspended       :1,
-        /** Did the connection timed out? */
-        timed_out       :1,
         /** Is a continuation (continuation.fn) running? */
         in_continuation :1,
         /** Did the running continuation give the conn back? */
@@ -814,7 +812,15 @@ struct user_wait {
                                    * told apart (stale_user_wait()) */
     /*atomic*/ apr_uint32_t claim; /* WAIT_* */
     apr_thread_mutex_t *mutex; /* pfds added/removed atomically */
-    timer_event_t *timer; /* the timer of its timeout if any (also cs->te) */
+    timer_event_t *timer; /* the timer of its timeout if any, unless queued
+                           * (to), also cs->te */
+    struct timeout_entry to; /* in its timeout queue (to.q) while there,
+                              * under wait_queues.mutex */
+    struct timeout_queue *tq; /* the timeout queue it's armed in rather than
+                               * a timer, written only by the arming thread
+                               * before its pfds and notifier are armed (no
+                               * other claimer then) and by the claim's
+                               * winner */
     struct user_wait *expired_next; /* in the listener's expired waits */
     struct user_wait *next; /* chaining */
     int chained; /* in the listener's user_chain (next may be NULL there) */
@@ -825,6 +831,8 @@ struct user_wait {
     int keep; /* keep its pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
     int drained; /* its user drained the pfds (AP_MPM_WAIT_DRAINED) */
 };
+/* The wait of a timeout queue's entry */
+#define TO_ENTRY_WAIT(e) ((struct user_wait *)(e)->owner)
 
 /* A pfd kept registered in conn_pollset across the waits of a connection
  * (AP_MPM_WAIT_KEEP_PFDS), until released (ap_mpm_release_pfd(), or the
@@ -2783,6 +2791,8 @@ static void arm_pending_wait(event_conn_state_t *cs);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 static int claim_user_wait(struct user_wait *user_wait);
 static void claimed_user_wait_timer(struct user_wait *user_wait);
+static int wait_tq_arm(struct user_wait *user_wait,
+                       apr_interval_time_t timeout);
 
 /* The continuation to run since the wait fired (claimed), for why */
 static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
@@ -3238,6 +3248,17 @@ static apr_status_t user_wait_cleanup(void *data)
     apr_status_t rc, final_rc = APR_SUCCESS;
     int i;
 
+    /* Run by the claim's winner when the wait completes, or by the
+     * destruction of its registrant's pool while it's armed (e.g. a killed
+     * connection): claim it then, only the winner releases its timeout (its
+     * entry in a timeout queue would be left linked otherwise).
+     */
+    if (apr_atomic_cas32(&user_wait->claim, WAIT_CLAIMED,
+                         WAIT_ARMED) == WAIT_ARMED) {
+        claimed_user_wait_timer(user_wait);
+    }
+    AP_DEBUG_ASSERT(apr_atomic_read32(&user_wait->claim) == WAIT_CLAIMED);
+
     /* All the pollfds should be added/removed atomically, so synchronize
      * with arm_user_wait().
      */
@@ -3314,9 +3335,12 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
         user_wait->pt_buf[0].type = user_wait->pt_buf[1].type = PT_USER;
         user_wait->pt_buf[0].baton = user_wait->pt_buf[1].baton = user_wait;
         user_wait->cs = cs;
+        APR_RING_ELEM_INIT(&user_wait->to, link);
+        user_wait->to.owner = user_wait;
         cs->wait = user_wait;
     }
     AP_DEBUG_ASSERT(apr_atomic_read32(&user_wait->claim) == WAIT_IDLE);
+    AP_DEBUG_ASSERT(!user_wait->tq && !user_wait->to.q);
 
     user_wait->pfds_cur ^= 1;
     pfds = user_wait->pfds_buf[user_wait->pfds_cur];
@@ -3368,20 +3392,22 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
     apr_atomic_set32(&user_wait->claim, WAIT_ARMED);
 
     if (timeout >= 0) {
-        timer_event_t *te;
-
         /* Prevent the timer from firing before the pollset is updated */
         if (timeout < TIMERS_FUDGE_TIMEOUT) {
             timeout = TIMERS_FUDGE_TIMEOUT;
         }
-        /* Recorded before it's inserted, since the listener may pop it and
-         * claim the wait as soon as it is (this thread preempted for longer
-         * than the timeout): it then finds it this wait's (timer and
-         * cs->te), frees it and clears them.
+        /* The timeout queue of its value if declared, else a timer: recorded
+         * before it's inserted, since the listener may pop it and claim the
+         * wait as soon as it is (this thread preempted for longer than the
+         * timeout): it then finds it this wait's (timer and cs->te),
+         * frees it and clears them.
          */
-        te = get_timer_event(timeout, wait_timer_cb, user_wait, 0);
-        user_wait->timer = cs->te = te;
-        insert_timer_event(te);
+        if (!wait_tq_arm(user_wait, timeout)) {
+            timer_event_t *te = get_timer_event(timeout, wait_timer_cb,
+                                                user_wait, 0);
+            user_wait->timer = cs->te = te;
+            insert_timer_event(te);
+        }
     }
 
     for (i = 0; i < pfds->nelts; i++) {
@@ -4228,6 +4254,189 @@ static void cancel_timer_event(timer_event_t *te)
     apr_thread_mutex_unlock(g_timer_skiplist_mtx);
 }
 
+/* The waits' timeouts: most waits use a few fixed timeouts (the proxy's, the
+ * connect's, the pool acquire's...), declared by the modules at post-config
+ * (ap_mpm_register_timeouts()). Rather than a timer each in the skiplist
+ * (O(log n) to insert and remove, under g_timer_skiplist_mtx with all the
+ * timers), a wait with a declared timeout is appended to the timeout queue of
+ * its value (O(1), its own entry user_wait->to), under wait_queues.mutex;
+ * other timeouts (e.g. the variable ones of mod_reqtimeout) use a timer.
+ * The queues are a fixed array sorted by timeout (wait_tqs), created at the
+ * child's startup, whose first entries the listener expires (the scan is
+ * O(declared values) per expiry, a min-heap of the first entries would do if
+ * configurations ever declare hundreds of values).
+ * The claim of a wait is the CAS on its claim word, whose winner releases its
+ * entry (wait_tq_release()), unless the listener unlinked it already
+ * (expired, then claimed by the listener or not): the mutex only guards the
+ * queues' rings, user_wait->tq is the winner's (or the arming thread's before
+ * the wait's pfds and notifier are armed, the other claimers).
+ */
+static apr_array_header_t *declared_wait_timeouts; /* pconf */
+static struct timeout_queues wait_queues = { NULL, 0, TIMERS_FUDGE_TIMEOUT };
+static struct timeout_queue **wait_tqs; /* pskip */
+static int wait_tqs_num;
+
+/* The first fallbacks to a timer, logged once per timeout value (at debug
+ * level, wait_queues.mutex)
+ */
+#define WAIT_TQ_LOGGED_MAX 16
+static apr_interval_time_t wait_tq_logged[WAIT_TQ_LOGGED_MAX];
+static int wait_tq_logged_num;
+
+/* Declare the timeouts of the waits (ap_mpm_register_timeouts()) */
+static apr_status_t event_register_timeouts(const apr_array_header_t *timeouts)
+{
+    int i;
+
+    if (!declared_wait_timeouts || wait_queues.mutex) {
+        return APR_EINVAL; /* not at post-config */
+    }
+    for (i = 0; timeouts && i < timeouts->nelts; i++) {
+        apr_interval_time_t t = APR_ARRAY_IDX(timeouts, i,
+                                              apr_interval_time_t);
+        if (t >= 0) {
+            APR_ARRAY_PUSH(declared_wait_timeouts, apr_interval_time_t) = t;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+static int wait_timeout_cmp(const void *a, const void *b)
+{
+    apr_interval_time_t ta = *(const apr_interval_time_t *)a,
+                        tb = *(const apr_interval_time_t *)b;
+    return (ta < tb) ? -1 : (ta > tb);
+}
+
+/* Create the timeout queues of the declared values and their mutex, in p
+ * (pskip, see setup_threads_runtime())
+ */
+static void make_wait_queues(apr_pool_t *p)
+{
+    apr_interval_time_t *t = NULL;
+    int i, n = 0;
+
+    apr_thread_mutex_create(&wait_queues.mutex, APR_THREAD_MUTEX_DEFAULT, p);
+    if (declared_wait_timeouts && declared_wait_timeouts->nelts) {
+        /* Sorted and unique, as armed (at least TIMERS_FUDGE_TIMEOUT) */
+        n = declared_wait_timeouts->nelts;
+        t = apr_pmemdup(p, declared_wait_timeouts->elts, n * sizeof(*t));
+        for (i = 0; i < n; i++) {
+            if (t[i] < TIMERS_FUDGE_TIMEOUT) {
+                t[i] = TIMERS_FUDGE_TIMEOUT;
+            }
+        }
+        qsort(t, n, sizeof(*t), wait_timeout_cmp);
+        for (i = 1, n = 1; i < declared_wait_timeouts->nelts; i++) {
+            if (t[i] != t[n - 1]) {
+                t[n++] = t[i];
+            }
+        }
+    }
+    wait_tqs = apr_pcalloc(p, (n + 1) * sizeof(*wait_tqs));
+    for (i = 0; i < n; i++) {
+        wait_tqs[i] = TO_QUEUE_MAKE(p, &wait_queues, "wait", t[i],
+                                    i ? wait_tqs[0] : NULL);
+        ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                     "waits' timeout queue %i: %" APR_TIME_T_FMT "us",
+                     i, t[i]);
+    }
+    wait_tqs_num = n;
+    wait_tq_logged_num = 0;
+}
+
+/* The timeout queue of a value, NULL if not declared */
+static struct timeout_queue *wait_tq_lookup(apr_interval_time_t timeout)
+{
+    int lo = 0, hi = wait_tqs_num;
+
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        apr_interval_time_t t = wait_tqs[mid]->timeout;
+        if (t == timeout) {
+            return wait_tqs[mid];
+        }
+        if (t < timeout) {
+            lo = mid + 1;
+        }
+        else {
+            hi = mid;
+        }
+    }
+    return NULL;
+}
+
+/* Whether a timeout value falls back to a timer for the first time, among
+ * the first WAIT_TQ_LOGGED_MAX ones (wait_queues.mutex)
+ */
+static int wait_tq_fallback_new(apr_interval_time_t timeout)
+{
+    int i;
+
+    for (i = 0; i < wait_tq_logged_num; i++) {
+        if (wait_tq_logged[i] == timeout) {
+            return 0;
+        }
+    }
+    if (wait_tq_logged_num < WAIT_TQ_LOGGED_MAX) {
+        wait_tq_logged[wait_tq_logged_num++] = timeout;
+        return 1;
+    }
+    return 0;
+}
+
+/* Arm the timeout of a wait in the queue of its value, if declared (else 0
+ * for a timer), before the wait can be claimed (its pfds and notifier armed
+ * after): the time is taken under the mutex to keep the queue sorted.
+ */
+static int wait_tq_arm(struct user_wait *user_wait,
+                       apr_interval_time_t timeout)
+{
+    struct timeout_queue *q = wait_tq_lookup(timeout);
+    int wakeup;
+
+    if (!q) {
+        if (APLOGdebug(ap_server_conf)) {
+            int log_it;
+            apr_thread_mutex_lock(wait_queues.mutex);
+            log_it = wait_tq_fallback_new(timeout);
+            apr_thread_mutex_unlock(wait_queues.mutex);
+            if (log_it) {
+                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
+                             "wait timeout %" APR_TIME_T_FMT "us not "
+                             "declared: a timer (logged once per value)",
+                             timeout);
+            }
+        }
+        return 0;
+    }
+
+    AP_DEBUG_ASSERT(!user_wait->tq && !user_wait->to.q);
+    user_wait->tq = q;
+    apr_thread_mutex_lock(wait_queues.mutex);
+    wakeup = TO_QUEUE_APPEND(q, &user_wait->to);
+    apr_thread_mutex_unlock(wait_queues.mutex);
+
+    /* Out of the mutex (a syscall), see get_timer_event() */
+    if (wakeup) {
+        wakeup_listener();
+    }
+    return 1;
+}
+
+/* Release the timeout queue's entry of a wait just claimed by the caller:
+ * unlink it, unless the listener did already (expired, then not claimed).
+ */
+static void wait_tq_release(struct user_wait *user_wait)
+{
+    apr_thread_mutex_lock(wait_queues.mutex);
+    if (user_wait->to.q) {
+        TO_QUEUE_REMOVE(user_wait->to.q, &user_wait->to);
+    }
+    apr_thread_mutex_unlock(wait_queues.mutex);
+    user_wait->tq = NULL;
+}
+
 /* Whether a fired event (its pt) is for a previous wait than the current one
  * (pfds_cur), completed otherwise while the event was being handled: it must
  * not claim the current wait (a spurious completion). Only an event held
@@ -4243,7 +4452,8 @@ static APR_INLINE int stale_user_wait(listener_poll_type *pt)
  * winner completes it. The winner also frees the wait's timer, either still
  * in the skiplist or popped by the listener meanwhile: the listener's timer
  * path claims under g_timer_skiplist_mtx and frees the timer it popped only
- * if it wins, so the timer is freed once whoever wins.
+ * if it wins, so the timer is freed once whoever wins. Likewise the winner
+ * releases the wait's entry in its timeout queue (wait_tq_release()).
  */
 static int claim_user_wait(struct user_wait *user_wait)
 {
@@ -4255,15 +4465,19 @@ static int claim_user_wait(struct user_wait *user_wait)
     return 1;
 }
 
-/* Free the timer of a wait just claimed, see claim_user_wait(): separately
- * for a claim made under notifiers_mutex (event_notify()), since the listener
- * takes g_timer_skiplist_mtx first.
+/* Free the timer of a wait just claimed, or release its timeout queue's
+ * entry, see claim_user_wait(): separately for a claim made under
+ * notifiers_mutex (event_notify()), since the listener takes
+ * g_timer_skiplist_mtx first.
  */
 static void claimed_user_wait_timer(struct user_wait *user_wait)
 {
     timer_event_t *te = user_wait->timer;
 
-    if (te) {
+    if (user_wait->tq) {
+        wait_tq_release(user_wait);
+    }
+    else if (te) {
         apr_thread_mutex_lock(g_timer_skiplist_mtx);
         if (te->node) {
             apr_skiplist_remove_node(timer_skiplist, te->node, NULL);
@@ -4275,6 +4489,98 @@ static void claimed_user_wait_timer(struct user_wait *user_wait)
         user_wait->cs->te = NULL;
         apr_thread_mutex_unlock(g_timer_skiplist_mtx);
     }
+}
+
+/* A wait timed out (its timer te, or its timeout queue with te NULL), just
+ * claimed by the listener: the suspended connection is run by a worker for
+ * the responsible module to know, through its continuation (or with
+ * CONN_STATE_LINGER for a wait without one, which ap_mpm_register_wait()
+ * doesn't register). Returns the connection to push to a worker.
+ */
+static event_conn_state_t *user_wait_timed_out(struct user_wait *user_wait,
+                                               timer_event_t *te)
+{
+    event_conn_state_t *cs = user_wait->cs;
+
+    AP_DEBUG_ASSERT(cs->user_wait == user_wait);
+    AP_DEBUG_ASSERT(cs->te == te);
+    if (te) {
+        put_timer_event(te, 1);
+    }
+    user_wait->timer = cs->te = NULL;
+    user_wait->tq = NULL;
+
+    /* The continuation to run, if any (ap_mpm_register_wait()), which
+     * decides what to do with the connection.
+     */
+    if (user_wait->continuation.fn) {
+        set_user_continuation(cs, user_wait, AP_MPM_WAIT_TIMEOUT);
+    }
+
+    /* Remove all user pollfds from the pollset */
+    apr_pool_cleanup_run(user_wait->pool, user_wait, user_wait_cleanup);
+    cs->user_wait = NULL;
+
+    AP_DEBUG_ASSERT(cs->suspended);
+    if (!cs->continuation.fn) {
+        cs->pub.state = CONN_STATE_LINGER;
+    }
+    return cs;
+}
+
+/* Time out the expired waits of the timeout queues (listener): unlinked and
+ * claimed under the mutex (the losers' claimers find them unlinked), into a
+ * local list, then timed out and pushed to a worker after unlocking (their
+ * cleanups take other locks). Returns the next expiry of the queues.
+ */
+static apr_time_t expire_wait_queues(apr_time_t now, int *above_limit)
+{
+    struct user_wait *expired = NULL, **last = &expired;
+    apr_time_t next_expiry;
+    int i;
+
+    apr_thread_mutex_lock(wait_queues.mutex);
+    wait_queues.next_expiry = 0;
+    for (i = 0; i < wait_tqs_num; i++) {
+        struct timeout_queue *q = wait_tqs[i];
+
+        while (!APR_RING_EMPTY(&q->head, timeout_entry, link)) {
+            struct timeout_entry *e = APR_RING_FIRST(&q->head);
+            apr_time_t elem_expiry = TO_QUEUE_EXPIRY(q, e);
+            struct user_wait *user_wait;
+
+            if (elem_expiry > now) {
+                (void)TO_QUEUE_NEXT_EXPIRY(q, elem_expiry);
+                break;
+            }
+            TO_QUEUE_REMOVE(q, e);
+
+            /* Claimed by another thread already, which then finds it
+             * unlinked (wait_tq_release())
+             */
+            user_wait = TO_ENTRY_WAIT(e);
+            if (apr_atomic_cas32(&user_wait->claim, WAIT_CLAIMED,
+                                 WAIT_ARMED) != WAIT_ARMED) {
+                continue;
+            }
+            user_wait->expired_next = NULL;
+            *last = user_wait;
+            last = &user_wait->expired_next;
+        }
+    }
+    next_expiry = wait_queues.next_expiry;
+    apr_thread_mutex_unlock(wait_queues.mutex);
+
+    while (expired) {
+        struct user_wait *user_wait = expired;
+        event_conn_state_t *cs;
+
+        expired = user_wait->expired_next;
+        user_wait->expired_next = NULL;
+        cs = user_wait_timed_out(user_wait, NULL);
+        push2worker(cs, NULL, BACKLOG_CONTINUATION, now, above_limit, 0);
+    }
+    return next_expiry;
 }
 
 #ifdef APR_POLLONESHOT
@@ -4480,7 +4786,6 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                     break;
                 }
             }
-            cs->timed_out = 1;
 
             if (cs_in_backlog(cs)) {
                 /* Remove the backlog connection from worker_queue (note that
@@ -4682,10 +4987,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                  *     te->baton is the wait, to be claimed first.
                  * For 1. we can shutdow the connection now, but for 2. we
                  * need to resume the suspended connection in a worker thread
-                 * for the responsible module to know, which we do by setting
-                 * CONN_STATE_LINGER but also cs->timed_out to make sure that,
-                 * after the next/last ap_run_resume_connection(), this state
-                 * is maintained/restored to issue the actual close.
+                 * for the responsible module to know (user_wait_timed_out()).
                  */
                 if (te->cbfunc == wait_timer_cb) {
                     struct user_wait *user_wait = te->baton;
@@ -4707,8 +5009,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                                          WAIT_ARMED) != WAIT_ARMED) {
                         continue;
                     }
-                    AP_DEBUG_ASSERT(user_wait->cs->user_wait == user_wait);
-                    AP_DEBUG_ASSERT(user_wait->cs->te == te);
                     put_timer_event(te, 1);
                     user_wait->timer = user_wait->cs->te = NULL;
                     user_wait->expired_next = timed_out;
@@ -4722,7 +5022,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                     AP_DEBUG_ASSERT(!cs->user_wait);
                     put_timer_event(te, 1);
                     cs->te = te = NULL;
-                    cs->timed_out = 1;
 
                     ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
                                   "timed out connection %" CS_FMT,
@@ -4752,31 +5051,20 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
                 timed_out = user_wait->expired_next;
                 user_wait->expired_next = NULL;
-                cs = user_wait->cs;
-                cs->timed_out = 1;
-
-                /* The continuation to run, if any
-                 * (ap_mpm_register_wait()), which decides what to do
-                 * with the connection.
-                 */
-                if (user_wait->continuation.fn) {
-                    cs->timed_out = 0;
-                    set_user_continuation(cs, user_wait, AP_MPM_WAIT_TIMEOUT);
-                }
-
-                /* Remove all user pollfds from the pollset */
-                apr_pool_cleanup_run(user_wait->pool, user_wait,
-                                     user_wait_cleanup);
-                cs->user_wait = NULL;
-
-                AP_DEBUG_ASSERT(cs->suspended);
-                if (!cs->continuation.fn) {
-                    cs->pub.state = CONN_STATE_LINGER;
-                }
+                cs = user_wait_timed_out(user_wait, NULL);
                 push2worker(cs, NULL, BACKLOG_CONTINUATION, now, &above_limit, 0);
             }
         }
         if (next_expiry) {
+            timeout = next_expiry > now ? next_expiry - now : 0;
+        }
+
+        /* Likewise for the waits' timeout queues */
+        next_expiry = wait_queues.next_expiry;
+        if (next_expiry && next_expiry <= now) {
+            next_expiry = expire_wait_queues(now, &above_limit);
+        }
+        if (next_expiry && (timeout < 0 || next_expiry - now < timeout)) {
             timeout = next_expiry > now ? next_expiry - now : 0;
         }
 
@@ -6076,6 +6364,7 @@ static void setup_threads_runtime(void)
     APR_RING_INIT(&timer_free_ring.link, timer_event_t, link);
     apr_skiplist_init(&timer_skiplist, pskip);
     apr_skiplist_set_compare(timer_skiplist, timer_comp, timer_comp);
+    make_wait_queues(pskip);
 
     /* All threads (listener, workers) and synchronization objects (queues,
      * pollset, mutexes...) created here should have at least the lifetime of
@@ -7720,6 +8009,14 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
     admission_interval = apr_time_from_msec(AP_EVENT_ADMISSION_INTERVAL);
     worker_pollers = AP_EVENT_WORKER_POLLERS;
 
+    /* The waits' timeouts declared for this configuration (post-config) */
+    declared_wait_timeouts = apr_array_make(pconf, 8,
+                                            sizeof(apr_interval_time_t));
+    wait_queues.mutex = NULL;
+    wait_queues.next_expiry = 0;
+    wait_tqs = NULL;
+    wait_tqs_num = 0;
+
     return OK;
 }
 
@@ -8062,6 +8359,8 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_get_name(event_get_name, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_resume_suspended(event_resume_suspended, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_register_wait(event_register_wait, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_mpm_register_timeouts(event_register_timeouts, NULL, NULL,
+                                  APR_HOOK_MIDDLE);
     ap_hook_mpm_release_pfd(event_release_pfd, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notifier_create(event_notifier_create, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notify(event_notify, NULL, NULL, APR_HOOK_MIDDLE);
