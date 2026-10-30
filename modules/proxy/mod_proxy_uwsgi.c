@@ -524,6 +524,64 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     return OK;
 }
 
+/* Once the wait for the response failed: let reading it fail at once, as it
+ * would have failed after waiting in the blocking path, with APR_TIMEUP (a
+ * timeout of 1us, since 0 would give EAGAIN), hence the same status and log.
+ * Data arriving between the end of the wait and here is read as usual
+ * though, the response then succeeds. Returns whether it changed the
+ * timeout, the one to restore then in *timeout.
+ */
+static int uwsgi_fail_at_once(request_rec *r,
+                              proxy_conn_rec *backend,
+                              apr_interval_time_t *timeout)
+{
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = backend->sock;
+    pfd.reqevents = APR_POLLIN;
+    if (apr_poll(&pfd, 1, &nready, 0) == APR_SUCCESS) {
+        return 0;
+    }
+    apr_socket_timeout_get(backend->sock, timeout);
+    apr_socket_timeout_set(backend->sock, 1);
+    return 1;
+}
+
+/*
+ * The continuation of uwsgi_handler() once the backend's response is
+ * readable (or the wait for it failed): read and pass the response, release
+ * the backend and finish the request.
+ */
+static void uwsgi_response_continuation(request_rec *r, apr_status_t rv, void *baton)
+{
+    proxy_conn_rec *backend = baton;
+    proxy_server_conf *conf = ap_get_module_config(r->server->module_config,
+                                                   &proxy_module);
+    apr_interval_time_t timeout = 0;
+    int status, restore = 0;
+
+    if (rv != APR_SUCCESS) {
+        /* The response's read doesn't log its failure, so say why here */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "%s waiting for the response of %s:%u",
+                      APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "interrupted",
+                      backend->hostname, backend->port);
+        restore = uwsgi_fail_at_once(r, backend, &timeout);
+    }
+    status = uwsgi_response(r, backend, conf);
+    if (restore) {
+        apr_socket_timeout_set(backend->sock, timeout);
+    }
+
+    backend->close = 1; /* always close the socket */
+    ap_proxy_release_connection(UWSGI_SCHEME, backend, r->server);
+    ap_proxy_handler_done(r, status);
+}
+
 static int uwsgi_handler(request_rec *r, proxy_worker * worker,
                          proxy_server_conf * conf, char *url,
                          const char *proxyname, apr_port_t proxyport)
@@ -534,6 +592,7 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     char server_portstr[32];
     char *u_path_info;
     apr_uri_t *uri;
+    apr_interval_time_t timeout;
 
     if (ap_cstr_casecmpn(url, UWSGI_SCHEME "://", sizeof(UWSGI_SCHEME) + 2)) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining URL %s", url);
@@ -601,10 +660,19 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     /* Step Four: Process the Request */
     if (((status = ap_setup_client_block(r, REQUEST_CHUNKED_ERROR)) != OK)
         || ((status = uwsgi_send_headers(r, backend)) != OK)
-        || ((status = uwsgi_send_body(r, backend)) != OK)
-        || ((status = uwsgi_response(r, backend, conf)) != OK)) {
+        || ((status = uwsgi_send_body(r, backend)) != OK)) {
         goto cleanup;
     }
+
+    /* Wait for the response without holding the thread if possible, then
+     * uwsgi_response_continuation() continues.
+     */
+    apr_socket_timeout_get(backend->sock, &timeout);
+    if (ap_proxy_wait(r, backend, AP_PROXY_BACKEND_IN, 0, timeout,
+                      uwsgi_response_continuation, backend) == SUSPENDED) {
+        return SUSPENDED;
+    }
+    status = uwsgi_response(r, backend, conf);
 
   cleanup:
     if (backend) {
