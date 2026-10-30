@@ -19,7 +19,10 @@ LTLIBRARY_SOURCES = \
 
 LTLIBRARY_DEPENDENCIES = test_char.h
 
-TARGETS = delete-exports $(LTLIBRARY_NAME) $(CORE_IMPLIB_FILE) export_vars.h httpd.exp
+TARGETS = $(LTLIBRARY_NAME) $(CORE_IMPLIB_FILE) export_vars.h httpd.exp
+
+# Phony (rules.mk's .PHONY), set before it's included
+PHONY_TARGETS = FORCE
 
 include $(top_builddir)/build/rules.mk
 include $(top_srcdir)/build/library.mk
@@ -41,41 +44,32 @@ util.lo: test_char.h
 EXPORT_DIRS = $(top_srcdir)/include $(top_srcdir)/os/$(OS_DIR)
 EXPORT_DIRS_APR = $(APR_INCLUDEDIR) $(APU_INCLUDEDIR)
 
-# If export_files is a dependency here, but we remove it during this stage,
-# when exports.c is generated, make will not detect that export_files is no
-# longer here and deadlock.  So, export_files can't be a dependency of
-# delete-exports.
-delete-exports:
-	@if test -f exports.c; then \
-	    if test -f export_files; then \
-	        files=`cat export_files`; \
-	        headers="`find $$files -newer exports.c`"; \
-	        if test -n "$$headers"; then \
-	           echo Found newer headers. Will rebuild exports.c.; \
-	           echo rm -f exports.c export_files; \
-	           rm -f exports.c export_files; \
-	        fi; \
-	    else \
-	        rm -f exports.c; \
-	    fi; \
-	fi
-
-export_files:
-	( for dir in $(EXPORT_DIRS); do \
+# The export files depend on the headers' contents, which make can't track:
+# they're regenerated at every build and replaced only when their content
+# changes, so that exports.c (hence libmain) is rebuilt only then. Generating
+# them in place (rather than deleting stale ones first) also keeps a parallel
+# build from compiling exports.c while it's missing: exports.lo depends on it.
+export_files: FORCE
+	@( for dir in $(EXPORT_DIRS); do \
 	      ls $$dir/*.h ; \
 	  done; \
-          echo "$(top_srcdir)/server/core.h"; \
+	  echo "$(top_srcdir)/server/core.h"; \
 	  echo "$(top_srcdir)/server/mpm_fdqueue.h"; \
 	  for dir in $(EXPORT_DIRS_APR); do \
 	      ls $$dir/ap[ru].h $$dir/ap[ru]_*.h 2>/dev/null; \
 	  done; \
-	) | sed -e s,//,/,g | sort -u > $@
+	) | sed -e s,//,/,g | sort -u > $@.tmp && \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
-exports.c: export_files
-	$(AWK) -f $(top_srcdir)/build/make_exports.awk `cat $?` > $@
+exports.c: export_files FORCE
+	@$(AWK) -f $(top_srcdir)/build/make_exports.awk `cat export_files` > $@.tmp && \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
-export_vars.h: export_files
-	$(AWK) -f $(top_srcdir)/build/make_var_export.awk `cat $?` > $@
+export_vars.h: export_files FORCE
+	@$(AWK) -f $(top_srcdir)/build/make_var_export.awk `cat export_files` > $@.tmp && \
+	if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+
+FORCE:
 
 # Rule to make def file for OS/2 core dll
 ApacheCoreOS2.def: exports.c export_vars.h $(top_srcdir)/os/$(OS_DIR)/core_header.def
