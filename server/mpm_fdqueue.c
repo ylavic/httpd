@@ -36,15 +36,18 @@ struct fd_queue_t
     /*atomic*/ apr_uint32_t lane_nelts[QUEUE_MAX_LANES];
     unsigned int lane_weight[QUEUE_MAX_LANES];
     unsigned int nlanes, cur_lane, cur_credit;
-    apr_uint32_t nelts;
+    /* nelts, interrupted and terminated are changed under the lock, with
+     * atomic stores for ap_queue_trypop_event() to read them without it
+     */
+    /*atomic*/ apr_uint32_t nelts;
     apr_uint32_t bounds;
     apr_pool_t *spare_pool;
     fd_queue_elem_t *spare_elems;
     apr_thread_mutex_t *one_big_mutex;
     apr_thread_cond_t *not_empty;
     apr_uint32_t num_waiters;
-    apr_uint32_t interrupted;
-    apr_uint32_t terminated;
+    /*atomic*/ apr_uint32_t interrupted;
+    /*atomic*/ apr_uint32_t terminated;
 };
 
 struct recycled_pool
@@ -496,7 +499,7 @@ static APR_INLINE void enqueue_elem(fd_queue_t *queue, fd_queue_elem_t *elem,
      */
     apr_atomic_set32(&queue->lane_nelts[elem->lane],
                      queue->lane_nelts[elem->lane] + 1);
-    queue->nelts++;
+    apr_atomic_set32(&queue->nelts, queue->nelts + 1);
 }
 
 static APR_INLINE void dequeue_elem(fd_queue_t *queue, fd_queue_elem_t *elem)
@@ -508,7 +511,7 @@ static APR_INLINE void dequeue_elem(fd_queue_t *queue, fd_queue_elem_t *elem)
     APR_RING_ELEM_INIT(elem, link);
     apr_atomic_set32(&queue->lane_nelts[elem->lane],
                      queue->lane_nelts[elem->lane] - 1);
-    queue->nelts--;
+    apr_atomic_set32(&queue->nelts, queue->nelts - 1);
 }
 
 /* The next element to pop (the queue is not empty): weighted round-robin
@@ -574,7 +577,7 @@ static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem,
         }
 
         if (queue->interrupted) {
-            queue->interrupted--;
+            apr_atomic_set32(&queue->interrupted, queue->interrupted - 1);
             return APR_EINTR;
         }
 
@@ -666,6 +669,18 @@ AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
 AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
                                                ap_queue_event_t **pevent)
 {
+    /* Most tries find the queue empty: tell it without the lock when nothing
+     * is queued nor an interrupt or termination pending. A push racing with
+     * this is missed as if the try ran a moment earlier, which a try that
+     * doesn't wait can't tell apart (the pusher signals or rings the caller
+     * after unlocking anyway).
+     */
+    if (!apr_atomic_read32(&queue->nelts)
+        && !apr_atomic_read32(&queue->interrupted)
+        && !apr_atomic_read32(&queue->terminated)) {
+        *pevent = NULL;
+        return APR_EAGAIN;
+    }
     return pop_event(queue, pevent, 0);
 }
 
@@ -777,13 +792,14 @@ static apr_status_t queue_interrupt(fd_queue_t *queue, int all, int term)
      * must not count on a given thread getting it, only on some pop seeing
      * it (or popping what's queued meanwhile).
      */
-    queue->interrupted = 1;
+    apr_atomic_set32(&queue->interrupted, 1);
     if (term) {
-        queue->terminated = 1;
+        apr_atomic_set32(&queue->terminated, 1);
     }
     if (all) {
         if (queue->num_waiters > 1)
-            queue->interrupted += queue->num_waiters - 1;
+            apr_atomic_set32(&queue->interrupted,
+                             queue->interrupted + queue->num_waiters - 1);
         apr_thread_cond_broadcast(queue->not_empty);
     }
     else {
