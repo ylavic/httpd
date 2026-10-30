@@ -10,11 +10,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"syscall"
@@ -96,6 +98,9 @@ func main() {
 	var mu sync.Mutex
 	var lats []time.Duration
 	errs := 0
+	// The errors by kind, reported on stderr with the first few messages
+	kinds := map[string]int{}
+	var firsts []string
 	start := time.Now()
 	measureFrom := start.Add(*warm)
 	end := measureFrom.Add(*dur)
@@ -117,6 +122,10 @@ func main() {
 			resp, err = client.Get(*url)
 		}
 		ok := err == nil
+		var kind, msg string
+		if !ok {
+			kind, msg = errorKind(err), err.Error()
+		}
 		if ok {
 			if *rchunk > 0 {
 				buf := make([]byte, *rchunk)
@@ -136,6 +145,10 @@ func main() {
 			}
 			resp.Body.Close()
 			ok = resp.StatusCode == 200
+			if !ok {
+				kind = fmt.Sprintf("status %d", resp.StatusCode)
+				msg = kind
+			}
 		}
 		if scheduled.After(measureFrom) && scheduled.Before(end) {
 			mu.Lock()
@@ -144,6 +157,10 @@ func main() {
 				nbytes += n
 			} else {
 				errs++
+				kinds[kind]++
+				if len(firsts) < 5 {
+					firsts = append(firsts, time.Since(start).Truncate(time.Millisecond).String()+": "+msg)
+				}
 			}
 			mu.Unlock()
 		}
@@ -195,4 +212,30 @@ func main() {
 		fmt.Printf(" mbps %.1f", float64(nbytes)/dur.Seconds()/1e6)
 	}
 	fmt.Printf("\n")
+	if errs > 0 {
+		fmt.Fprintf(os.Stderr, "loadgen errors:")
+		for k, v := range kinds {
+			fmt.Fprintf(os.Stderr, " [%s]=%d", k, v)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+		for _, f := range firsts {
+			fmt.Fprintf(os.Stderr, "  %s\n", f)
+		}
+	}
+}
+
+// errorKind classifies a request error: refused, reset, timeout, eof, other
+func errorKind(err error) string {
+	var ne net.Error
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+		return "reset"
+	case errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "eof"
+	}
+	return "other"
 }
