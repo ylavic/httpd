@@ -566,9 +566,13 @@ static void push_elem(fd_queue_t *queue, fd_queue_elem_t **pushed_elem,
  * terminated: APR_EOF (terminated) or APR_EINTR (interrupted) only when it's
  * empty, so that nothing queued is lost.
  */
+/* timeout: < 0 to wait for an element, 0 not to wait (APR_EAGAIN), > 0 to
+ * wait up to that long (APR_TIMEUP)
+ */
 static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem,
-                             int block)
+                             apr_interval_time_t timeout)
 {
+    apr_time_t deadline = (timeout > 0) ? apr_time_now() + timeout : 0;
     apr_status_t rv;
 
     for (;;) {
@@ -587,13 +591,27 @@ static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem,
             return APR_EINTR;
         }
 
-        if (!block) {
-            return APR_EAGAIN;
+        if (!timeout) {
+            return (deadline) ? APR_TIMEUP : APR_EAGAIN;
         }
 
         queue->num_waiters++;
-        rv = apr_thread_cond_wait(queue->not_empty, queue->one_big_mutex);
+        if (timeout < 0) {
+            rv = apr_thread_cond_wait(queue->not_empty, queue->one_big_mutex);
+        }
+        else {
+            apr_time_t now = apr_time_now();
+            rv = (now < deadline) ? apr_thread_cond_timedwait(queue->not_empty,
+                                                              queue->one_big_mutex,
+                                                              deadline - now)
+                                  : APR_TIMEUP;
+        }
         queue->num_waiters--;
+        if (APR_STATUS_IS_TIMEUP(rv)) {
+            /* Checked once more, APR_TIMEUP if still nothing */
+            timeout = 0;
+            rv = APR_SUCCESS;
+        }
         if (rv != APR_SUCCESS) {
             return rv;
         }
@@ -640,7 +658,7 @@ AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
 }
 
 static apr_status_t pop_event(fd_queue_t *queue, ap_queue_event_t **pevent,
-                              int block)
+                              apr_interval_time_t timeout)
 {
     apr_status_t rv;
     fd_queue_elem_t *elem;
@@ -651,7 +669,7 @@ static apr_status_t pop_event(fd_queue_t *queue, ap_queue_event_t **pevent,
         return rv;
     }
 
-    rv = pop_elem(queue, &elem, block);
+    rv = pop_elem(queue, &elem, timeout);
     if (rv == APR_SUCCESS) {
         ap_queue_event_t *event = elem->event;
         ap_assert(event && event != &elem->self_event);
@@ -669,7 +687,7 @@ static apr_status_t pop_event(fd_queue_t *queue, ap_queue_event_t **pevent,
 AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
                                             ap_queue_event_t **pevent)
 {
-    return pop_event(queue, pevent, 1);
+    return pop_event(queue, pevent, -1);
 }
 
 AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
@@ -688,6 +706,13 @@ AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
         return APR_EAGAIN;
     }
     return pop_event(queue, pevent, 0);
+}
+
+AP_DECLARE(apr_status_t) ap_queue_pop_event_timeout(fd_queue_t *queue,
+                                                    ap_queue_event_t **pevent,
+                                                    apr_interval_time_t timeout)
+{
+    return pop_event(queue, pevent, (timeout > 0) ? timeout : 0);
 }
 
 AP_DECLARE(void) ap_queue_kill_event_locked(fd_queue_t *queue,
@@ -761,7 +786,7 @@ AP_DECLARE(apr_status_t) ap_queue_pop_socket(fd_queue_t *queue, apr_socket_t **p
         return rv;
     }
 
-    rv = pop_elem(queue, &elem, 1);
+    rv = pop_elem(queue, &elem, -1);
     if (rv == APR_SUCCESS) {
         ap_queue_event_t *event = elem->event;
         ap_assert(event && event == &elem->self_event);
