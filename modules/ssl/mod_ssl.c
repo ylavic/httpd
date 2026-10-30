@@ -30,6 +30,7 @@
 #include "util_mutex.h"
 #include "ap_provider.h"
 #include "http_config.h"
+#include "mpm_common.h" /* for the input_pending hook */
 
 #include "mod_proxy.h" /* for proxy_hook_section_post_config() */
 
@@ -754,6 +755,21 @@ static int ssl_hook_process_connection(conn_rec* c)
     return DECLINED;
 }
 
+/* Data OpenSSL decrypted but the input filter didn't read yet (the rest of
+ * a record larger than its read) is pending input the filters' brigades
+ * don't show; what the filter holds (its char buffer) is in its pending
+ * brigade already.
+ */
+static int ssl_hook_input_pending(conn_rec *c)
+{
+    SSLConnRec *sslconn = myConnConfig(c);
+
+    if (sslconn && sslconn->ssl && SSL_pending(sslconn->ssl) > 0) {
+        return OK;
+    }
+    return DECLINED;
+}
+
 /*
  *  the module registration phase
  */
@@ -775,6 +791,7 @@ static void ssl_register_hooks(apr_pool_t *p)
     ap_hook_pre_connection(ssl_hook_pre_connection,NULL,NULL, APR_HOOK_MIDDLE);
     ap_hook_process_connection(ssl_hook_process_connection, 
                                                    NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_input_pending (ssl_hook_input_pending, NULL,NULL, APR_HOOK_MIDDLE);
     ap_hook_test_config   (ssl_hook_ConfigTest,    NULL,NULL, APR_HOOK_MIDDLE);
     ap_hook_post_config   (ssl_init_Module,        NULL,b_pc, APR_HOOK_MIDDLE);
     ap_hook_http_scheme   (ssl_hook_http_scheme,   NULL,NULL, APR_HOOK_MIDDLE);
