@@ -789,7 +789,10 @@
  *                         ap_proxy_connect_backend_cancel(),
  *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
  *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
- *                         ap_proxy_tunnel_run_ex() to mod_proxy.h;
+ *                         ap_proxy_tunnel_run_ex(),
+ *                         ap_proxy_wait_continuation_fn
+ *                         and ap_proxy_wait() to
+ *                         mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained() to http_core.h
  */

@@ -6715,8 +6715,8 @@ PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
     ap_mpm_resume_suspended(c);
 }
 
-/* Whether the MPM can wait for a tunnel (ap_mpm_register_wait()), resolved
- * by proxy_util_post_config().
+/* Whether the MPM can wait for a tunnel or a backend (ap_mpm_register_wait()),
+ * resolved by proxy_util_post_config().
  */
 static int mpm_can_wait = 0;
 
@@ -6901,6 +6901,191 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
     return proxy_tunnel_async_pump(ta, NULL);
 }
 
+/* The directions' names in the logs (ap_proxy_direction_e) */
+static const char *const proxy_wait_direction_names[] = {
+    "client", "client (output)", "backend", "backend (output)"
+};
+
+/* The state of a request's waits with ap_proxy_wait(), per direction */
+typedef struct {
+    apr_socket_t *sock;       /* waited for last in this direction */
+    apr_array_header_t *pfds; /* for sock, the same for every wait */
+    int waits;                /* registered so far, the next ones keep pfds */
+    int pending_ready;        /* answered OK for the filters' pending input,
+                               * see ap_proxy_wait() */
+} proxy_wait_dir_t;
+
+/* The state of a request's waits with ap_proxy_wait(), in its
+ * proxy_req_async
+ */
+struct proxy_wait_ctx {
+    request_rec *r;
+    ap_proxy_direction_e direction; /* of the current wait */
+    ap_proxy_wait_continuation_fn *fn;
+    void *baton;
+    proxy_wait_dir_t dirs[AP_PROXY_BACKEND_OUT + 1];
+};
+
+static void proxy_wait_continuation(conn_rec *c, request_rec *r,
+                                    ap_mpm_wait_result_e why,
+                                    const apr_array_header_t *pfds,
+                                    void *baton)
+{
+    struct proxy_wait_ctx *w = baton;
+    apr_status_t rv;
+
+    AP_DEBUG_ASSERT(w->r == r);
+    switch (why) {
+    case AP_MPM_WAIT_READY:
+        rv = APR_SUCCESS;
+        break;
+    case AP_MPM_WAIT_TIMEOUT:
+        rv = APR_TIMEUP;
+        break;
+    default:
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "proxy: waiting for the %s interrupted (async, %i)",
+                      proxy_wait_direction_names[w->direction], (int)why);
+        rv = APR_EGENERAL;
+        break;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, rv, r,
+                  "proxy: done waiting for the %s (async)",
+                  proxy_wait_direction_names[w->direction]);
+    w->fn(r, rv, w->baton);
+}
+
+PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
+                                 ap_proxy_direction_e direction,
+                                 unsigned int flags,
+                                 apr_interval_time_t timeout,
+                                 ap_proxy_wait_continuation_fn *fn,
+                                 void *baton)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+    conn_rec *c = r->connection;
+    struct proxy_req_async *ra;
+    struct proxy_wait_ctx *w;
+    proxy_wait_dir_t *d;
+    apr_socket_t *sock;
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+    unsigned int wait_flags = 0;
+    int pending = 0, ready = 0;
+    apr_status_t rv;
+
+    if (dconf->async_delay < 0 || !proxy_can_suspend(r)) {
+        return DECLINED;
+    }
+
+    ra = ap_proxy_req_async(r);
+    w = ra->wait;
+    if (!w) {
+        w = apr_pcalloc(r->pool, sizeof(*w));
+        w->r = r;
+        ra->wait = w;
+    }
+    d = &w->dirs[direction];
+
+    /* Ready in the filters already? Input pending (or an error the read will
+     * report) for the client, or the backend when the scheme reads through
+     * filters; no output pending (or an error) for the client. The backend's
+     * output is polled only.
+     */
+    memset(&pfd, 0, sizeof(pfd));
+    switch (direction) {
+    case AP_PROXY_CLIENT_IN:
+        pending = (ap_check_input_pending(c) != OK);
+        sock = ap_get_conn_socket(c);
+        pfd.reqevents = APR_POLLIN;
+        break;
+    case AP_PROXY_CLIENT_OUT:
+        ready = (ap_check_output_pending(c) != AGAIN);
+        sock = ap_get_conn_socket(c);
+        pfd.reqevents = APR_POLLOUT;
+        break;
+    case AP_PROXY_BACKEND_IN:
+        pending = (conn->connection
+                   && ap_check_input_pending(conn->connection) != OK);
+        sock = conn->sock;
+        pfd.reqevents = APR_POLLIN;
+        break;
+    default:
+        sock = conn->sock;
+        pfd.reqevents = APR_POLLOUT;
+        break;
+    }
+    if (pending) {
+        /* Input kept by the filters after the caller's last read said EAGAIN
+         * (e.g. mod_ssl's part of a line) is pending but not readable: after
+         * an OK for it, the next wait in this direction polls the socket.
+         */
+        if (!d->pending_ready) {
+            d->pending_ready = 1;
+            return OK;
+        }
+    }
+    d->pending_ready = 0;
+    if (ready) {
+        return OK;
+    }
+
+    /* Ready within ProxyAsyncDelay: no need to wait. Anything but a timeout
+     * lets the caller do its I/O as usual: readiness, an error the I/O will
+     * report, or the poll's own failure (e.g. EINTR, which must not fail
+     * the request).
+     */
+    pfd.p = r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = sock;
+    rv = apr_poll(&pfd, 1, &nready, dconf->async_delay);
+    if (!APR_STATUS_IS_TIMEUP(rv)) {
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, rv, r,
+                          "proxy: polling the %s failed, going on",
+                          proxy_wait_direction_names[direction]);
+        }
+        return OK;
+    }
+
+    if (!d->pfds || d->sock != sock) {
+        apr_pollfd_t *ppfd;
+
+        d->sock = sock;
+        d->waits = 0;
+        d->pfds = apr_array_make(r->pool, 1, sizeof(apr_pollfd_t));
+        ppfd = apr_array_push(d->pfds);
+        *ppfd = pfd;
+        ppfd->rtnevents = 0;
+    }
+    w->direction = direction;
+    w->fn = fn;
+    w->baton = baton;
+
+    /* From the second wait on this socket and direction, keep it registered
+     * in the MPM. The poll above found it not ready, so a readiness the MPM
+     * saw for the last wait was consumed since (AP_MPM_WAIT_DRAINED).
+     */
+    if (d->waits) {
+        wait_flags = AP_MPM_WAIT_KEEP_PFDS | AP_MPM_WAIT_DRAINED;
+    }
+    rv = ap_mpm_register_wait(c, r->pool, d->pfds, timeout, NULL, wait_flags,
+                              proxy_wait_continuation, w);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "proxy: can't wait for the %s asynchronously",
+                      proxy_wait_direction_names[direction]);
+        return DECLINED; /* the caller waits synchronously */
+    }
+    d->waits++;
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: waiting for the %s (async)",
+                  proxy_wait_direction_names[direction]);
+    return SUSPENDED;
+}
+
 PROXY_DECLARE (const char *) ap_proxy_show_hcmethod(hcmethod_t method)
 {
     proxy_hcmethods_t *m = proxy_hcmethods;
@@ -6915,7 +7100,7 @@ PROXY_DECLARE (const char *) ap_proxy_show_hcmethod(hcmethod_t method)
 static int proxy_util_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                                   apr_pool_t *ptemp, server_rec *s)
 {
-    /* For ap_proxy_tunnel_run_ex() */
+    /* For ap_proxy_tunnel_run_ex() and ap_proxy_wait() */
     if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &mpm_can_wait)) {
         mpm_can_wait = 0;
     }
