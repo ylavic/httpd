@@ -105,6 +105,16 @@
 #ifdef HAVE_SCHED_GETAFFINITY
 #include <sched.h>              /* for sched_getaffinity() */
 #endif
+#if defined(HAVE_GETRUSAGE) && defined(HAVE_SYS_RESOURCE_H)
+#include <sys/time.h>
+#include <sys/resource.h>       /* for getrusage() */
+#define EVENT_ELASTIC_THREADS 1
+/* Where getrusage() fills the context switches too (POSIX only has the times) */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) \
+    || defined(__OpenBSD__) || defined(__DragonFly__) || defined(__sun)
+#define EVENT_RUSAGE_CSW 1
+#endif
+#endif
 
 
 #if HAVE_SERF
@@ -182,6 +192,17 @@
 #ifndef AUTO_FDS_MAX
 #define AUTO_FDS_MAX (1 << 24)
 #endif
+/* The derived ThreadLimit (auto) at most */
+#ifndef AUTO_THREAD_LIMIT_MAX
+#define AUTO_THREAD_LIMIT_MAX 1024
+#endif
+/* An extra worker (auto) idle for this long exits, checking every
+ * WORKER_IDLE_TIMEOUT
+ */
+#ifndef AUTO_WORKER_RETIRE_TIMEOUT
+#define AUTO_WORKER_RETIRE_TIMEOUT apr_time_from_sec(10)
+#endif
+#define WORKER_IDLE_TIMEOUT apr_time_from_sec(1)
 
 #ifndef SCOREBOARD_DAEMONS_FACTOR
 #define SCOREBOARD_DAEMONS_FACTOR 4
@@ -287,6 +308,28 @@ static int num_cpus = 0;                    /* Number of CPUs usable (the
 
 static int workers_backlog_limit = 0;       /* Max number of events in the workers' backlog
                                                (above which not accepting new connections) */
+
+/* Elastic worker threads (auto, needs getrusage()): a child starts its base
+ * workers (threads_per_child) and grows extra ones while they're all blocked,
+ * up to threads_max (ThreadLimit), an extra one exiting once idle for
+ * AUTO_WORKER_RETIRE_TIMEOUT (workers_grow_check(), worker_thread()).
+ * Without, threads_max is threads_per_child.
+ */
+static int elastic_threads = 0;
+static int threads_max = 0;
+static /*atomic*/ apr_uint32_t workers_live;    /* running worker threads */
+static /*atomic*/ apr_uint32_t workers_retired; /* extra ones that exited (stats) */
+static /*atomic*/ apr_uint32_t workers_unjoined; /* retired, not joined yet */
+
+/* When the listener last saw no idle worker (written by the listener only),
+ * and the second the last extra worker retired since (see worker_unneeded())
+ */
+static volatile apr_time_t workers_last_short;
+static /*atomic*/ apr_uint32_t workers_retire_sec;
+
+static apr_thread_t **worker_threads;           /* [threads_max] */
+static apr_pool_t **worker_thread_pools;        /* [threads_max], the extra ones' */
+static apr_threadattr_t *worker_thread_attr;
 
 static /*atomic*/ apr_uint32_t dying = 0;
 static /*atomic*/ apr_uint32_t workers_may_exit = 0;
@@ -990,6 +1033,7 @@ typedef struct event_retained_data {
 
     int first_server_limit;
     int first_thread_limit;
+    int first_thread_limit_derived; /* by MaxRequestWorkers auto */
     int first_server_sb_limit;
     int gen_daemons_limit; /* the children limit of the PODs' generation */
     int sick_child_detected;
@@ -1083,6 +1127,20 @@ static apr_os_thread_t *listener_os_thread;
 
 static int ap_child_slot;       /* Current child process slot in scoreboard */
 
+/* Count a worker thread in or out of workers_live, and of the process score's
+ * (mod_status)
+ */
+static APR_INLINE void workers_live_inc(void)
+{
+    apr_atomic_inc32(&workers_live);
+    apr_atomic_inc32(&ap_scoreboard_image->parent[ap_child_slot].workers_live);
+}
+static APR_INLINE void workers_live_dec(void)
+{
+    apr_atomic_dec32(&workers_live);
+    apr_atomic_dec32(&ap_scoreboard_image->parent[ap_child_slot].workers_live);
+}
+
 /* The LISTENER_SIGNAL signal will be sent from the main thread to the
  * listener thread to wake it up for graceful termination (what a child
  * process from an old generation does when the admin does "apachectl
@@ -1092,15 +1150,17 @@ static int ap_child_slot;       /* Current child process slot in scoreboard */
 #define LISTENER_SIGNAL     SIGHUP
 
 /* What each worker publishes for the other threads, written by the worker
- * only, in a cache line of its own (worker_slots[threads_per_child], aligned
- * on a cache line): the socket it processes, closed by a non-graceful (forced)
- * shutdown of the server (close_worker_sockets()), and its drain epoch
- * (drain_epoch_enter()).
+ * only, in a cache line of its own (worker_slots[threads_max], aligned on a
+ * cache line): the socket it processes, closed by a non-graceful (forced)
+ * shutdown of the server (close_worker_sockets()), its drain epoch
+ * (drain_epoch_enter()), and for an extra worker that it retired (exited, to
+ * be joined by the listener, reset then).
  */
 struct worker_slot {
     CACHE_LINE_ALIGNED
     apr_socket_t *csd;
     apr_uint32_t drain_epoch;
+    apr_uint32_t retired;
 };
 static struct worker_slot *worker_slots;
 #ifdef AP_THREAD_LOCAL
@@ -1816,7 +1876,7 @@ static void close_socket_at(apr_socket_t *csd,
 static void close_worker_sockets(void)
 {
     int i;
-    for (i = 0; i < threads_per_child; i++) {
+    for (i = 0; i < threads_max; i++) {
         /* Taken from the worker, which leaves the socket and its pool
          * alone from then on (take_back_worker_socket())
          */
@@ -1952,7 +2012,11 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
         *result = thread_limit;
         break;
     case AP_MPMQ_MAX_THREADS:
-        *result = threads_per_child;
+        /* The base threads, but more than one when they can grow (for the
+         * modules that don't lock when single-threaded)
+         */
+        *result = (elastic_threads && threads_per_child < 2) ? 2
+                                                              : threads_per_child;
         break;
     case AP_MPMQ_MIN_SPARE_DAEMONS:
         *result = 0;
@@ -1990,9 +2054,11 @@ static int event_query(int query_code, int *result, apr_status_t *rv)
     case AP_MPMQ_MAX_CONNECTIONS:
         /* Not a hard limit (connections_above_limit() doesn't bound the
          * suspended ones), but what a child processes or queues for its
-         * workers at once: its threads plus the workers' backlog limit.
+         * workers at once: its threads (up to threads_max when they grow,
+         * e.g. for mod_proxy to size its pools for them) plus the workers'
+         * backlog limit.
          */
-        *result = threads_per_child + workers_backlog_limit;
+        *result = threads_max + workers_backlog_limit;
         break;
     default:
         *rv = APR_ENOTIMPL;
@@ -2009,7 +2075,10 @@ static void event_note_child_stopped(int slot, pid_t pid, ap_generation_t gen)
 
         pid = ps->pid;
         gen = ps->generation;
-        for (i = 0; i < threads_per_child; i++) {
+        /* Up to the scoreboard's limit: the extra workers of a child of a
+         * previous generation may be beyond the current threads_max.
+         */
+        for (i = 0; i < thread_limit; i++) {
             ap_update_child_status_from_indexes(slot, i, SERVER_DEAD, NULL);
         }
         ap_run_child_status(ap_server_conf, pid, gen, slot, MPM_CHILD_EXITED);
@@ -2035,6 +2104,7 @@ static void event_note_child_stopped(int slot, pid_t pid, ap_generation_t gen)
         apr_atomic_set32(&ps->shutdown, 0);
         apr_atomic_set32(&ps->lingering_close, 0);
         apr_atomic_set32(&ps->suspended, 0);
+        apr_atomic_set32(&ps->workers_live, 0);
         ps->pid = 0;
     }
     else {
@@ -2278,7 +2348,7 @@ static int take_back_worker_socket(apr_socket_t *csd)
     slot = worker_current_slot;
 #else
     int i;
-    for (i = 0; i < threads_per_child; i++) {
+    for (i = 0; i < threads_max; i++) {
         if (apr_atomic_casptr((void *volatile *)&worker_slots[i].csd,
                               csd, csd) == csd) {
             slot = &worker_slots[i];
@@ -5107,6 +5177,334 @@ static void shutdown_timed_out(event_conn_state_t *timed_out, apr_time_t now,
     }
 }
 
+static void *APR_THREAD_FUNC worker_thread(apr_thread_t *thd, void *dummy);
+
+/* elastic_threads: join the extra worker of slot i, which retired */
+static void reap_extra_worker(int i)
+{
+    apr_status_t rv, thread_rv;
+
+    rv = apr_thread_join(&thread_rv, worker_threads[i]);
+    if (rv != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_CRIT, rv, ap_server_conf, APLOGNO()
+                     "apr_thread_join: unable to join worker thread %d", i);
+    }
+    worker_threads[i] = NULL;
+    apr_pool_clear(worker_thread_pools[i]);
+    apr_atomic_set32(&worker_slots[i].retired, 0);
+    apr_atomic_dec32(&workers_unjoined);
+}
+
+/* elastic_threads: join the extra workers that retired (listener thread),
+ * not once the child stops (join_workers() joins them)
+ */
+static void reap_retired_workers(void)
+{
+    int i;
+
+    if (apr_atomic_read32(&listener_may_exit)) {
+        return;
+    }
+    for (i = threads_per_child; i < threads_max; i++) {
+        if (worker_threads[i]
+            && apr_atomic_read32(&worker_slots[i].retired)) {
+            reap_extra_worker(i);
+        }
+    }
+}
+
+#ifdef EVENT_ELASTIC_THREADS
+/* elastic_threads: start an extra worker in the first free slot above the
+ * base ones (listener thread, the only one starting them while running),
+ * with a pool of its own for its creation (cleared once joined).
+ */
+static int start_extra_worker(void)
+{
+    int i;
+
+    for (i = threads_per_child; i < threads_max; i++) {
+        proc_info *info;
+        apr_status_t rv;
+
+        if (worker_threads[i]) {
+            if (!apr_atomic_read32(&worker_slots[i].retired)
+                || apr_atomic_read32(&listener_may_exit)) {
+                continue;
+            }
+            reap_extra_worker(i);
+        }
+        if (ap_scoreboard_image->servers[ap_child_slot][i].status
+            != SERVER_DEAD) {
+            continue;
+        }
+        if (!worker_thread_pools[i]) {
+            apr_pool_create(&worker_thread_pools[i], pruntime);
+            apr_pool_tag(worker_thread_pools[i], "mpm_extra_worker");
+        }
+
+        /* Not anymore once the child stops, the extra workers are joined
+         * by join_workers() then (maybe without the listener's join)
+         */
+        if (apr_atomic_read32(&listener_may_exit)
+            || apr_atomic_read32(&dying)) {
+            return 0;
+        }
+
+        info = ap_malloc(sizeof(*info));
+        info->pslot = ap_child_slot;
+        info->tslot = i;
+        ap_update_child_status_from_indexes(ap_child_slot, i,
+                                            SERVER_STARTING, NULL);
+        workers_live_inc();
+        rv = ap_thread_create(&worker_threads[i], worker_thread_attr,
+                              worker_thread, info, worker_thread_pools[i]);
+        if (rv != APR_SUCCESS) {
+            workers_live_dec();
+            worker_threads[i] = NULL;
+            free(info);
+            ap_update_child_status_from_indexes(ap_child_slot, i,
+                                                SERVER_DEAD, NULL);
+            {
+                static log_ratelimit_t rl;
+                if (LOG_RATELIMIT(&rl, APLOG_ERR, 0, ap_server_conf, NULL)) {
+                    ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO()
+                                 "ap_thread_create: unable to create an extra worker "
+                                 "thread");
+                }
+            }
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* What the process used so far (all its threads): CPU time, and context
+ * switches where known (0 otherwise)
+ */
+struct process_usage {
+    apr_time_t cpu;
+    apr_int64_t vcsw, ivcsw;    /* voluntary, involuntary */
+};
+
+/* The listener's state for growing the workers (workers_grow_check()): the
+ * usage sampled at each check of a wait, the last GROW_SAMPLES of them, to
+ * compare over admission_interval at least (a shorter time is within the
+ * scheduler's slices: a child short of CPU may not run at all then).
+ */
+#define GROW_SAMPLES 32
+static struct {
+    apr_time_t next_check;  /* not before, a new worker per target at most */
+    apr_time_t busy_since;  /* since when no worker is idle, 0 if one is */
+    apr_time_t sample_time[GROW_SAMPLES];
+    struct process_usage sample[GROW_SAMPLES];
+    unsigned int first, count; /* the oldest sample, how many */
+    int limit_reported;
+    int backoff;            /* next_check delayed after a CPU refusal */
+    apr_uint32_t grown;     /* stats */
+} workers_growth;
+
+static int process_usage(struct process_usage *u)
+{
+    struct rusage ru;
+
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return 0;
+    }
+    u->cpu = (apr_time_make(ru.ru_utime.tv_sec, ru.ru_utime.tv_usec) +
+              apr_time_make(ru.ru_stime.tv_sec, ru.ru_stime.tv_usec));
+#ifdef EVENT_RUSAGE_CSW
+    u->vcsw = ru.ru_nvcsw;
+    u->ivcsw = ru.ru_nivcsw;
+#else
+    u->vcsw = u->ivcsw = 0;
+#endif
+    return 1;
+}
+
+/* When the oldest event waiting for a worker was queued, 0 if none */
+static apr_time_t backlog_head_time(void)
+{
+    apr_time_t oldest = 0;
+    int i;
+
+    for (i = 0; i < BACKLOG_CLASSES; i++) {
+        if (ap_queue_lane_nelts(worker_queue, i)) {
+            apr_time_t t = ap_queue_lane_head_time(worker_queue, i);
+            if (t && (!oldest || t < oldest)) {
+                oldest = t;
+            }
+        }
+    }
+    return oldest;
+}
+
+/* elastic_threads: start an extra worker when the workers are blocked rather
+ * than busy on the CPU: none is idle, something has been waiting for one
+ * longer than the admission target (the oldest event queued, or with
+ * worker_poll the connections nobody polls while none is idle), and over the
+ * last admission_interval (at least) the CPU time of the process is below
+ * half of what its
+ * (busy) workers could use, that is their time but not more than this child's
+ * share of the CPUs (num_cpus / the children: those that get less are short
+ * of CPU, not blocked), and where known its involuntary context switches stay
+ * below half of the voluntary ones (blocking shows as voluntary switches,
+ * waiting for a CPU as involuntary ones). Another thread couldn't run
+ * otherwise. At most one per admission target, up to threads_max. After a
+ * check refused because of the CPU (busy or short of it), the next one
+ * waits for the admission interval, or for a worker to have idled meanwhile
+ * (backoff). Listener thread, at every loop, woken up in time by its
+ * deadline (workers_grow_deadline()).
+ */
+static void workers_grow_check(apr_time_t now)
+{
+    struct process_usage u;
+    apr_time_t head, elapsed, used;
+    apr_int64_t vcsw, ivcsw;
+    apr_uint32_t live, cpu_share;
+    unsigned int i, n;
+
+    if (ap_queue_info_idlers_count(worker_queue_info) > 0
+        || apr_atomic_read32(&dying)) {
+        workers_growth.busy_since = 0;
+        workers_growth.count = 0;
+        if (workers_growth.backoff) {
+            workers_growth.next_check = 0;
+            workers_growth.backoff = 0;
+        }
+        return;
+    }
+    workers_last_short = now;
+    if (!workers_growth.busy_since) {
+        workers_growth.busy_since = now;
+    }
+    if (now < workers_growth.next_check) {
+        return;
+    }
+    head = backlog_head_time();
+    if (!(head && now - head > admission_target)
+        && !(worker_poll && now - workers_growth.busy_since > admission_target)) {
+        workers_growth.count = 0;
+        workers_growth.backoff = 0;
+        return;
+    }
+    workers_growth.next_check = now + admission_target;
+
+    if (!process_usage(&u)) {
+        return;
+    }
+    /* A new wait if the previous sample is not the previous check's (the
+     * backoff spaces them on purpose)
+     */
+    if (workers_growth.count && !workers_growth.backoff
+        && now - workers_growth.sample_time[(workers_growth.first
+                                             + workers_growth.count - 1)
+                                            % GROW_SAMPLES]
+           > 4 * admission_target) {
+        workers_growth.count = 0;
+    }
+    if (workers_growth.count == GROW_SAMPLES) {
+        workers_growth.first = (workers_growth.first + 1) % GROW_SAMPLES;
+        workers_growth.count--;
+    }
+    if (!workers_growth.count) {
+        workers_growth.first = 0;
+    }
+    i = (workers_growth.first + workers_growth.count++) % GROW_SAMPLES;
+    workers_growth.sample_time[i] = now;
+    workers_growth.sample[i] = u;
+
+    /* Compare with the latest sample at least admission_interval old, the
+     * oldest one if none is (all of the ring when full)
+     */
+    for (n = 0, i = workers_growth.first; n + 1 < workers_growth.count;
+         n++, i = (i + 1) % GROW_SAMPLES) {
+        unsigned int next = (i + 1) % GROW_SAMPLES;
+        if (now - workers_growth.sample_time[next] < admission_interval) {
+            break;
+        }
+    }
+    elapsed = now - workers_growth.sample_time[i];
+    if (elapsed < admission_interval
+        && workers_growth.count < GROW_SAMPLES) {
+        return; /* not enough time to tell yet */
+    }
+    used = u.cpu - workers_growth.sample[i].cpu;
+    vcsw = u.vcsw - workers_growth.sample[i].vcsw;
+    ivcsw = u.ivcsw - workers_growth.sample[i].ivcsw;
+
+    /* The CPUs this child can get, in thousandths (a tenth at least) */
+    cpu_share = (apr_uint32_t)num_cpus * 1000 / (apr_uint32_t)active_daemons_limit;
+    if (cpu_share < 100) {
+        cpu_share = 100;
+    }
+    live = apr_atomic_read32(&workers_live);
+    if (cpu_share > live * 1000) {
+        cpu_share = live * 1000;
+    }
+    if (used * 2 * 1000 >= (apr_time_t)cpu_share * elapsed
+        || ivcsw * 2 > vcsw) {
+        /* Busy on the CPU, or short of CPU: back off */
+        workers_growth.next_check = now + admission_interval;
+        workers_growth.backoff = 1;
+        return;
+    }
+    workers_growth.backoff = 0;
+    if (live >= (apr_uint32_t)threads_max) {
+        if (!workers_growth.limit_reported) {
+            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, ap_server_conf, APLOGNO()
+                         "all the %d worker threads of this child (ThreadLimit) "
+                         "are blocked: consider raising ThreadLimit, or "
+                         "running the blocking work out of process (e.g. "
+                         "PHP-FPM with mod_proxy_fcgi)", threads_max);
+            workers_growth.limit_reported = 1;
+        }
+        return;
+    }
+    if (start_extra_worker()) {
+        workers_growth.grown++;
+        ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
+                     "workers blocked (cpu %" APR_TIME_T_FMT "us in %"
+                     APR_TIME_T_FMT "us for %u, share %u/1000, csw %"
+                     APR_INT64_T_FMT "/%" APR_INT64_T_FMT "), one more "
+                     "worker", used, elapsed, live, cpu_share, vcsw, ivcsw);
+    }
+}
+
+/* When the listener should check next whether the workers are blocked
+ * (workers_grow_check()), 0 for no need: while no worker is idle and more can
+ * start, once the oldest event queued would have waited for the admission
+ * target (or with worker_poll, once none has been idle for the target), not
+ * before the next check is due. A worker popping the head or idling moves or
+ * drops it, seen when the listener wakes up then (at the deadline at worst).
+ */
+static apr_time_t workers_grow_deadline(apr_time_t now)
+{
+    apr_time_t head, when = 0;
+
+    if (apr_atomic_read32(&dying)
+        || ap_queue_info_idlers_count(worker_queue_info) > 0
+        || apr_atomic_read32(&workers_live) >= (apr_uint32_t)threads_max) {
+        return 0;
+    }
+    head = backlog_head_time();
+    if (head) {
+        when = head + admission_target;
+    }
+    if (worker_poll) {
+        apr_time_t since = (workers_growth.busy_since) ? workers_growth.busy_since
+                                                       : now;
+        if (!when || since + admission_target < when) {
+            when = since + admission_target;
+        }
+    }
+    if (when && when < workers_growth.next_check) {
+        when = workers_growth.next_check;
+    }
+    return when;
+}
+#endif /* EVENT_ELASTIC_THREADS */
+
 static void update_stats(process_score *ps, apr_time_t now,
                          apr_time_t *when, int force)
 {
@@ -5124,12 +5522,16 @@ static void update_stats(process_score *ps, apr_time_t now,
     }
 
     if (expired) {
+        /* Reset at each period, whether logged or not */
+        apr_uint32_t retired = apr_atomic_xchg32(&workers_retired, 0);
+
         fair_share_update();
 
         ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
                      "child: idlers:%i conns:%u backlog:%u "
                      "waitio:%u write:%u keepalive:%u shutdown:%u linger:%u "
-                     "timers:%u suspended:%u (%u/%u workers shutdown)",
+                     "timers:%u suspended:%u (%u/%u workers shutdown) "
+                     "workers:%u/%d grown:%u retired:%u",
                      ap_queue_info_idlers_count(worker_queue_info),
                      apr_atomic_read32(&event_counts.connection_count),
                      apr_atomic_read32(backlog_q->total),
@@ -5141,7 +5543,20 @@ static void update_stats(process_score *ps, apr_time_t now,
                      apr_atomic_read32(&event_counts.timers_count),
                      apr_atomic_read32(&event_counts.suspended_count),
                      apr_atomic_read32(&threads_shutdown),
-                     threads_per_child);
+                     threads_per_child,
+                     apr_atomic_read32(&workers_live), threads_max,
+#ifdef EVENT_ELASTIC_THREADS
+                     workers_growth.grown,
+#else
+                     0u,
+#endif
+                     retired);
+#ifdef EVENT_ELASTIC_THREADS
+        workers_growth.grown = 0;
+#endif
+        if (elastic_threads) {
+            reap_retired_workers();
+        }
         if (backlog_stats_on) {
             backlog_stats_report(now);
         }
@@ -5345,7 +5760,11 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          */
         if (timeout < 0 || timeout > STATS_UPDATE_TIMEOUT) {
             if (timeout > 0
-                || apr_atomic_read32(&event_counts.connection_count)) {
+                || apr_atomic_read32(&event_counts.connection_count)
+                /* extra workers to retire or join (elastic_threads) */
+                || (elastic_threads
+                    && (apr_atomic_read32(&workers_live) > (apr_uint32_t)threads_per_child
+                        || apr_atomic_read32(&workers_unjoined)))) {
                 timeout = next_stats_time - now;
                 if (timeout <= 0 || timeout > STATS_UPDATE_TIMEOUT) {
                     timeout = STATS_UPDATE_TIMEOUT;
@@ -5388,6 +5807,19 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 recheck = RECHECK_BACKSTOP;
             }
         }
+#ifdef EVENT_ELASTIC_THREADS
+        /* Likewise for the next check of whether the workers are blocked
+         * (workers_grow_deadline())
+         */
+        if (elastic_threads) {
+            apr_time_t when = workers_grow_deadline(now);
+            if (when && (timeout < 0 || timeout > when - now)) {
+                /* due already: in 1ms rather than spinning */
+                timeout = (when > now) ? when - now : apr_time_from_msec(1);
+                recheck = 0;
+            }
+        }
+#endif
 
         /* apr_pollset_poll() might round down the timeout to
          * milliseconds, let's forcibly round up here to never
@@ -5779,6 +6211,12 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             flush_limbo();
         }
 
+#ifdef EVENT_ELASTIC_THREADS
+        if (elastic_threads) {
+            workers_grow_check(now);
+        }
+#endif
+
         /* We process the timeout queues here only when the global
          * conn_queues.next_expiry has passed. This happens accurately since
          * adding to the queues (in workers) can only decrease this expiry,
@@ -5881,23 +6319,27 @@ do_maintenance:
  */
 static int worker_thread_should_exit_early(int slot)
 {
-    const apr_uint32_t max = threads_per_child;
     for (;;) {
         apr_uint32_t conns = apr_atomic_read32(&event_counts.connection_count);
-        apr_uint32_t deads = apr_atomic_read32(&threads_shutdown);
+        apr_uint32_t live = apr_atomic_read32(&workers_live);
 
-        AP_DEBUG_ASSERT(deads < max);
-        if (conns >= max - deads)
+        AP_DEBUG_ASSERT(live > 0);
+        if (conns >= live)
             return 0;
 
-        if (apr_atomic_cas32(&threads_shutdown, deads + 1, deads) == deads) {
+        /* Counted out of the live workers by this exit (worker_thread()) */
+        if (apr_atomic_cas32(&workers_live, live - 1, live) == live) {
             /*
              * No other thread has exited in the mean time, safe to exit
              * this one.
              */
+            apr_uint32_t deads = apr_atomic_inc32(&threads_shutdown) + 1;
+
+            apr_atomic_dec32(&ap_scoreboard_image->parent[ap_child_slot]
+                             .workers_live);
             ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
                          "worker thread %i/%i-%i should exit (%i conns)",
-                         slot, threads_per_child, deads + 1, conns);
+                         slot, threads_per_child, deads, conns);
             return 1;
         }
     }
@@ -5946,7 +6388,7 @@ static void drain_epoch_leave(int slot)
 static int drain_epoch_passed(apr_uint32_t epoch)
 {
     int i;
-    for (i = 0; i < threads_per_child; i++) {
+    for (i = 0; i < threads_max; i++) {
         apr_uint32_t held = apr_atomic_read32(&worker_slots[i].drain_epoch);
         if (held && (apr_int32_t)(held - epoch) <= 0) {
             return 0;
@@ -5971,6 +6413,17 @@ static void flush_limbo(void)
         ap_queue_info_push_pool(worker_queue_info, lp->p);
     }
     apr_thread_mutex_unlock(limbo_mutex);
+}
+
+static int worker_queue_empty(void)
+{
+    int i;
+    for (i = 0; i < BACKLOG_CLASSES; i++) {
+        if (ap_queue_lane_nelts(worker_queue, i)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /* Recycle the pool of a closed connection (its socket closed already) */
@@ -6185,9 +6638,11 @@ static event_conn_state_t *worker_poll_slot(int slot,
 }
 
 /* Wait on the worker_queue for an event (or the worker_poll_baton) rather than
- * in conn_pollset, no poll slot being available. APR_EAGAIN if one is now.
+ * in conn_pollset, no poll slot being available. APR_EAGAIN if one is now,
+ * APR_TIMEUP after timeout if positive.
  */
-static apr_status_t worker_park(ap_queue_event_t **pqe)
+static apr_status_t worker_park(ap_queue_event_t **pqe,
+                                apr_interval_time_t timeout)
 {
     apr_status_t rv;
 
@@ -6197,20 +6652,10 @@ static apr_status_t worker_park(ap_queue_event_t **pqe)
         apr_atomic_dec32(&worker_poll_stats.parked);
         return APR_EAGAIN;
     }
-    rv = ap_queue_pop_event(worker_queue, pqe);
+    rv = (timeout > 0) ? ap_queue_pop_event_timeout(worker_queue, pqe, timeout)
+                       : ap_queue_pop_event(worker_queue, pqe);
     apr_atomic_dec32(&worker_poll_stats.parked);
     return rv;
-}
-
-static int worker_queue_empty(void)
-{
-    int i;
-    for (i = 0; i < BACKLOG_CLASSES; i++) {
-        if (ap_queue_lane_nelts(worker_queue, i)) {
-            return 0;
-        }
-    }
-    return 1;
 }
 
 /* worker_poll: wake up one worker blocked polling conn_pollset, unless a
@@ -6292,12 +6737,14 @@ static void worker_poll_round_charge(struct worker_poll_round *round,
  * this (idle) worker to run (*pcs), blocking in conn_pollset while there's
  * none, in this worker's *round. APR_TIMEUP after WORKER_POLL_TIMEOUT
  * without anything, for the caller to check the exit conditions (the exits
- * ring the doorbell anyway) and this thread's drain epoch to move on.
+ * ring the doorbell anyway) and this thread's drain epoch to move on, or
+ * after park_timeout if positive when parked on the worker_queue.
  */
 static apr_status_t worker_poll_next(int slot,
                                      struct worker_poll_round *round,
                                      ap_queue_event_t **pqe,
-                                     event_conn_state_t **pcs)
+                                     event_conn_state_t **pcs,
+                                     apr_interval_time_t park_timeout)
 {
     apr_time_t now = event_time_now();
     int answered = 0;
@@ -6366,7 +6813,7 @@ static apr_status_t worker_poll_next(int slot,
          */
         cs = worker_poll_slot(slot, WORKER_POLL_TIMEOUT, &doorbell, &polled);
         if (!polled) {
-            rv = worker_park(pqe);
+            rv = worker_park(pqe, park_timeout);
             now = event_time_now();
             if (rv == APR_SUCCESS && *pqe == &worker_poll_baton) {
                 apr_atomic_set32(&worker_poll_stats.baton, 0);
@@ -6398,6 +6845,19 @@ static apr_status_t worker_poll_next(int slot,
 }
 #endif /* EVENT_WORKER_POLL */
 
+/* An extra worker (elastic_threads) idle since idle_since retires, unless
+ * something is queued meanwhile: it'd be the one waiting for it maybe. It
+ * leaves the idlers then, unless none is left: the listener counted on it
+ * for an event it's queuing, it stays to take it.
+ */
+static int worker_should_retire(apr_time_t idle_since)
+{
+    return (!apr_atomic_read32(&dying)
+            && event_time_now() - idle_since >= AUTO_WORKER_RETIRE_TIMEOUT
+            && worker_queue_empty()
+            && ap_queue_info_try_get_idler(worker_queue_info) == APR_SUCCESS);
+}
+
 /* XXX For ungraceful termination/restart, we definitely don't want to
  *     wait for active connections to finish but we may want to wait
  *     for idle workers to get out of the queue code and release mutexes,
@@ -6405,6 +6865,26 @@ static apr_status_t worker_poll_next(int slot,
  *     may not react favorably (i.e., segfault) if operations are attempted
  *     on cleaned-up mutexes.
  */
+/* An extra worker (elastic_threads) done with some work retires when the child
+ * hasn't been short of workers (none idle) for AUTO_WORKER_RETIRE_TIMEOUT,
+ * one per second at most: with the idle workers sharing the work (polling the
+ * connections) none may stay idle that long while the extra ones aren't
+ * needed anymore.
+ */
+static int worker_unneeded(void)
+{
+    apr_time_t now = event_time_now();
+    apr_uint32_t sec = (apr_uint32_t)apr_time_sec(now), last;
+
+    if (apr_atomic_read32(&dying)
+        || now - workers_last_short < AUTO_WORKER_RETIRE_TIMEOUT) {
+        return 0;
+    }
+    last = apr_atomic_read32(&workers_retire_sec);
+    return (last != sec
+            && apr_atomic_cas32(&workers_retire_sec, sec, last) == last);
+}
+
 static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
 {
     proc_info *ti = dummy;
@@ -6412,6 +6892,13 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
     int thread_slot = ti->tslot;
     worker_score *ws = &ap_scoreboard_image->servers[process_slot][thread_slot];
     int is_idler = 0;
+    /* An extra worker waits for work for this long before checking whether
+     * it should retire, idle since idle_since.
+     */
+    const apr_interval_time_t idle_timeout =
+        (thread_slot >= threads_per_child) ? WORKER_IDLE_TIMEOUT : -1;
+    apr_time_t idle_since = 0;
+    int retire = 0, counted_out = 0;
 #ifdef EVENT_WORKER_POLL
     struct worker_poll_round round = {0, 0, 0, 0}; /* worker_poll_next()'s */
 #endif
@@ -6435,11 +6922,20 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         ap_queue_event_t *qe;
 
         if (!is_idler) {
-            int idlers = ap_queue_info_idlers_inc(worker_queue_info);
+            int idlers;
+
+            if (idle_timeout > 0 && idle_since && worker_unneeded()) {
+                retire = 1;
+                break;
+            }
+            idlers = ap_queue_info_idlers_inc(worker_queue_info);
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "worker thread %i/%i idle (idlers %i)",
                          thread_slot, threads_per_child, idlers);
             is_idler = 1;
+            if (idle_timeout > 0) {
+                idle_since = event_time_now();
+            }
 
             /* If the listening sockets are paused and this new idler switches
              * connections_above_limit() back, let the listener know and poll
@@ -6463,14 +6959,20 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         }
         if (apr_atomic_read32(&dying)
             && worker_thread_should_exit_early(thread_slot)) {
+            counted_out = 1;
             break;
         }
 
 #ifdef EVENT_WORKER_POLL
         if (worker_poll) {
             event_conn_state_t *cs = NULL;
-            rv = worker_poll_next(thread_slot, &round, &qe, &cs);
+            rv = worker_poll_next(thread_slot, &round, &qe, &cs, idle_timeout);
             if (APR_STATUS_IS_TIMEUP(rv)) {
+                if (idle_timeout > 0 && worker_should_retire(idle_since)) {
+                    is_idler = 0; /* left by worker_should_retire() */
+                    retire = 1;
+                    break;
+                }
                 continue; /* still idle */
             }
             if (rv == APR_SUCCESS && cs) {
@@ -6488,7 +6990,17 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         }
         else
 #endif
-        rv = ap_queue_pop_event(worker_queue, &qe);
+        rv = (idle_timeout > 0) ? ap_queue_pop_event_timeout(worker_queue, &qe,
+                                                             idle_timeout)
+                                : ap_queue_pop_event(worker_queue, &qe);
+        if (APR_STATUS_IS_TIMEUP(rv)) {
+            if (worker_should_retire(idle_since)) {
+                is_idler = 0; /* left by worker_should_retire() */
+                retire = 1;
+                break;
+            }
+            continue; /* still idle */
+        }
         if (rv != APR_SUCCESS) {
             /* We get APR_EOF during a graceful shutdown once all the
              * connections accepted by this server process have been handled.
@@ -6589,6 +7101,12 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         /* Not idling anymore */
         ap_queue_info_idlers_dec(worker_queue_info);
     }
+#ifdef EVENT_WORKER_POLL
+    if (retire && worker_poll) {
+        /* Maybe the last one blocked in conn_pollset, while others park */
+        worker_poll_promote();
+    }
+#endif
 #ifdef EVENT_WORKER_NOTIFY
     worker_thread_polls = 0;
     if (worker_wake_queued) {
@@ -6606,9 +7124,21 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
 #endif
 
     ap_update_child_status_from_indexes(process_slot, thread_slot,
-                                        (apr_atomic_read32(&dying)
+                                        (retire || apr_atomic_read32(&dying)
                                          ? SERVER_DEAD : SERVER_GRACEFUL),
                                         NULL);
+    if (!counted_out) {
+        workers_live_dec();
+    }
+    if (retire) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
+                     "worker thread %i/%i retired (idle)",
+                     thread_slot, threads_per_child);
+        apr_atomic_inc32(&workers_retired);
+        apr_atomic_inc32(&workers_unjoined);
+        /* Last, the listener may join this thread and reuse its slot then */
+        apr_atomic_set32(&worker_slots[thread_slot].retired, 1);
+    }
 
     apr_thread_exit(thd, APR_SUCCESS);
     return NULL;
@@ -6874,7 +7404,7 @@ static void setup_threads_runtime(void)
      * data never straddles into the next slot's line (one more slot for it).
      */
     {
-        char *slots = apr_pcalloc(pruntime, (threads_per_child + 1) *
+        char *slots = apr_pcalloc(pruntime, ((apr_size_t)threads_max + 1) *
                                             sizeof(struct worker_slot));
         worker_slots = (struct worker_slot *)APR_ALIGN((apr_uintptr_t)slots,
                                                        CACHE_LINE_SIZE);
@@ -6925,9 +7455,12 @@ static void *APR_THREAD_FUNC start_threads(apr_thread_t * thd, void *dummy)
             /* We let each thread update its own scoreboard entry.  This is
              * done because it lets us deal with tid better.
              */
+            workers_live_inc();
             rv = ap_thread_create(&threads[i], thread_attr,
                                   worker_thread, my_info, pruntime);
             if (rv != APR_SUCCESS) {
+                workers_live_dec();
+                threads[i] = NULL;
                 ap_update_child_status_from_indexes(my_child_num, i, SERVER_DEAD, NULL);
                 ap_log_error(APLOG_MARK, APLOG_ALERT, rv, ap_server_conf,
                              APLOGNO(03104)
@@ -7038,10 +7571,13 @@ static void join_workers(apr_thread_t * listener, apr_thread_t ** threads)
         }
     }
 
-    for (i = 0; i < threads_per_child; i++) {
+    /* The extra workers too (elastic_threads), the listener which starts
+     * them is gone
+     */
+    for (i = 0; i < threads_max; i++) {
         ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
                      "apr_thread_join: joining thread %pp (%i/%i)",
-                     threads[i], i, threads_per_child);
+                     threads[i], i, threads_max);
         if (threads[i]) {       /* if we ever created this thread */
             rv = apr_thread_join(&thread_rv, threads[i]);
             if (rv != APR_SUCCESS) {
@@ -7058,7 +7594,7 @@ static void join_workers(apr_thread_t * listener, apr_thread_t ** threads)
      * already, before the child exits
      */
     if (joined_all && worker_slots) {
-        for (i = 0; i < threads_per_child; i++) {
+        for (i = 0; i < threads_max; i++) {
             apr_atomic_set32(&worker_slots[i].drain_epoch, 0);
         }
         flush_limbo();
@@ -7165,8 +7701,10 @@ static void child_main(int child_num_arg, int child_bucket)
     /* clear the storage; we may not create all our threads immediately,
      * and we want a 0 entry to indicate a thread which was not created
      */
-    threads = ap_calloc(threads_per_child, sizeof(apr_thread_t *));
+    threads = ap_calloc(threads_max, sizeof(apr_thread_t *));
     ts = apr_palloc(pchild, sizeof(*ts));
+    worker_threads = threads;
+    worker_thread_pools = apr_pcalloc(pchild, threads_max * sizeof(apr_pool_t *));
 
     apr_threadattr_create(&thread_attr, pchild);
     /* 0 means PTHREAD_CREATE_JOINABLE */
@@ -7186,6 +7724,7 @@ static void child_main(int child_num_arg, int child_bucket)
     ts->listener = NULL;
     ts->child_num_arg = child_num_arg;
     ts->threadattr = thread_attr;
+    worker_thread_attr = thread_attr;
 
     rv = ap_thread_create(&start_thread_id, thread_attr, start_threads,
                           ts, pchild);
@@ -7978,13 +8517,14 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
                  APR_TIME_T_FMT "ms "
                  "ThreadsPerChild=%d ThreadLimit=%d MinSpareThreads=%d MaxSpareThreads=%d "
                  "ServerLimit=%d/%d StartServers=%d Buckets=%d CPUs=%d "
-                 "MaxClientConnections=%d (%d/%u per child) WorkerPoll=%s",
+                 "MaxClientConnections=%d (%d/%u per child) ElasticThreads=%s "
+                 "WorkerPoll=%s",
                  auto_settings ? " (auto)" : "", max_workers, admission_backlog,
                  apr_time_as_msec(admission_target), apr_time_as_msec(admission_interval),
                  threads_per_child, thread_limit, min_spare_threads, max_spare_threads,
                  active_daemons_limit, server_limit, ap_daemons_to_start,
                  num_buckets, num_cpus, max_client_conns, clients_per_child,
-                 (unsigned int)clients_share,
+                 (unsigned int)clients_share, elastic_threads ? "on" : "off",
 #ifdef EVENT_WORKER_POLL
                  "on"   /* where the pollset method allows (children) */
 #else
@@ -8265,7 +8805,7 @@ static void auto_settings_derive(server_rec *s, int startup)
                      MAX_THREAD_LIMIT);
         tpc = MAX_THREAD_LIMIT;
     }
-    if (tpc > thread_limit) {
+    if (tpc > thread_limit && (auto_set_flags & AUTO_SET_THREAD_LIMIT)) {
         ap_log_error(APLOG_MARK, APLOG_WARNING | level_flags, 0, ls, APLOGNO()
                      "ThreadsPerChild of %d exceeds ThreadLimit of %d, "
                      "decreasing to match", tpc, thread_limit);
@@ -8354,6 +8894,28 @@ static void auto_settings_derive(server_rec *s, int startup)
                      n, children, per_child, MAX_SERVER_LIMIT,
                      per_child * MAX_SERVER_LIMIT);
         children = MAX_SERVER_LIMIT;
+    }
+
+    /* ThreadLimit: what a fully blocking load needs (a worker per client)
+     * but AUTO_THREAD_LIMIT_MAX at most, the workers growing up to it while
+     * blocked (elastic_threads); the base threads without getrusage(). The
+     * scoreboard's on restart.
+     */
+    if (!(auto_set_flags & AUTO_SET_THREAD_LIMIT)) {
+        if (retained->first_thread_limit) {
+            thread_limit = retained->first_thread_limit;
+        }
+        else {
+#ifdef EVENT_ELASTIC_THREADS
+            apr_int64_t tl = (n + children - 1) / children;
+            if (tl > AUTO_THREAD_LIMIT_MAX) {
+                tl = AUTO_THREAD_LIMIT_MAX;
+            }
+            thread_limit = (tl > tpc) ? (int)tl : tpc;
+#else
+            thread_limit = tpc;
+#endif
+        }
     }
 
     threads_per_child = tpc;
@@ -8471,7 +9033,17 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
             thread_limit = threads_per_child;
         }
         retained->first_thread_limit = thread_limit;
+        retained->first_thread_limit_derived =
+            (auto_settings && !(auto_set_flags & AUTO_SET_THREAD_LIMIT));
     }
+
+    /* The worker threads grow up to ThreadLimit in auto mode */
+#ifdef EVENT_ELASTIC_THREADS
+    elastic_threads = (auto_settings && thread_limit > threads_per_child);
+#else
+    elastic_threads = 0;
+#endif
+    threads_max = (elastic_threads) ? thread_limit : threads_per_child;
 
     /* MaxRequestWorkers is a multiple of ThreadsPerChild (already the case
      * without the auto settings), limited on restart by the scoreboard.
@@ -8842,7 +9414,10 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
     }
 
     if (thread_limit < 0) {
-        thread_limit = DEFAULT_THREAD_LIMIT;
+        /* Derived in auto mode (auto_settings_derive()) */
+        if (!auto_settings) {
+            thread_limit = DEFAULT_THREAD_LIMIT;
+        }
     }
     else if (thread_limit > MAX_THREAD_LIMIT) {
         if (startup) {
@@ -8871,14 +9446,19 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
         thread_limit = 1;
     }
     /* you cannot change ThreadLimit across a restart; ignore
-     * any such attempts
+     * any such attempts (silently when it's not set and the original value
+     * was derived, by MaxRequestWorkers auto)
      */
-    if (retained->first_thread_limit && thread_limit != retained->first_thread_limit) {
-        /* don't need a startup console version here */
-        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(00506)
-                     "changing ThreadLimit to %d from original value of %d "
-                     "not allowed during restart",
-                     thread_limit, retained->first_thread_limit);
+    if (retained->first_thread_limit && thread_limit >= 0
+        && thread_limit != retained->first_thread_limit) {
+        if ((auto_set_flags & AUTO_SET_THREAD_LIMIT)
+            || !retained->first_thread_limit_derived) {
+            /* don't need a startup console version here */
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(00506)
+                         "changing ThreadLimit to %d from original value of %d "
+                         "not allowed during restart",
+                         thread_limit, retained->first_thread_limit);
+        }
         thread_limit = retained->first_thread_limit;
     }
 

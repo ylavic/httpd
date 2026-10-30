@@ -774,8 +774,8 @@
  *                         ap_fgetline_ex(), AP_GETLINE_ALLOC,
  *                         AP_GETLINE_FOLD_COL, ap_send_interim_response_ex()
  *                         and AP_SEND_INTERIM_NONBLOCK to http_protocol.h;
- *                         process_score->shutdown and ->backlog to
- *                         scoreboard.h;
+ *                         process_score->shutdown, ->backlog and
+ *                         ->workers_live to scoreboard.h;
  *                         AP_SHUTDOWN_CONN_* to http_connection.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),

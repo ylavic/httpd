@@ -591,14 +591,16 @@ static int status_handler(request_rec *r)
                      connections = 0, backlog = 0, wait_io = 0, writing = 0,
                      keep_alive = 0, shutdown = 0, suspended = 0, closing = 0;
         int threads_idle = 0, threads_busy = 0, threads_graceful = 0;
+        apr_uint32_t workers_live = 0;
         if (!short_report)
             ap_rputs("<table rules=\"all\" cellpadding=\"1%\">\n"
                      "<tr><th colspan=\"4\">Processes</th>"
-                         "<th colspan=\"3\">Threads</th>"
+                         "<th colspan=\"4\">Threads</th>"
                          "<th colspan=\"2\">Connections</th>"
                          "<th colspan=\"6\">Async queues</th></tr>\n"
                      "<tr><th>Slot</th><th>PID</th><th>stopping</th><th>accepting</th>"
                          "<th>idle</th><th>busy</th><th>graceful</th>"
+                         "<th>live/limit</th>"
                          "<th>total</th><th>backlog</th>"
                          "<th>wait-io</th><th>writing</th>"
                          "<th>keep-alive</th><th>shutdown</th>"
@@ -619,6 +621,7 @@ static int status_handler(request_rec *r)
                 threads_idle     += thread_idle_buffer[i];
                 threads_busy     += thread_busy_buffer[i];
                 threads_graceful += thread_graceful_buffer[i];
+                workers_live     += ps_record->workers_live;
                 procs++;
                 if (ps_record->quiescing) {
                     stopping++;
@@ -642,6 +645,7 @@ static int status_handler(request_rec *r)
                     ap_rprintf(r, "<tr><td>%u</td><td>%" APR_PID_T_FMT "</td>"
                                       "<td>%s%s</td><td>%s</td>"
                                       "<td>%d</td><td>%d</td><td>%d</td>"
+                                      "<td>%u/%d</td>"
                                       "<td>%u</td><td>%u</td>"
                                       "<td>%u</td><td>%u</td>"
                                       "<td>%u</td><td>%u</td>"
@@ -651,6 +655,7 @@ static int status_handler(request_rec *r)
                                thread_idle_buffer[i],
                                thread_busy_buffer[i],
                                thread_graceful_buffer[i],
+                               ps_record->workers_live, thread_limit,
                                ps_record->connections,
                                ps_record->backlog,
                                ps_record->wait_io,
@@ -666,6 +671,7 @@ static int status_handler(request_rec *r)
             ap_rprintf(r, "<tr><td>Sum</td>"
                               "<td>%u</td><td>%u</td><td>%u</td>"
                               "<td>%u</td><td>%u</td><td>%u</td>"
+                              "<td>%u/%u</td>"
                               "<td>%u</td><td>%u</td>"
                               "<td>%u</td><td>%u</td>"
                               "<td>%u</td><td>%u</td>"
@@ -673,6 +679,7 @@ static int status_handler(request_rec *r)
                           "</table>\n",
                           procs, stopping, accepting,
                           threads_idle, threads_busy, threads_graceful,
+                          workers_live, procs * (apr_uint32_t)thread_limit,
                           connections, backlog,
                           wait_io, writing,
                           keep_alive, shutdown,

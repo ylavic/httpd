@@ -10,6 +10,8 @@ APACHE_SUBST(MOD_MPM_EVENT_LDADD)
 
 APACHE_MPM_MODULE(event, $enable_mpm_event, event.lo,[
     AC_CHECK_FUNCS(pthread_kill)
+    dnl The CPU time of the process, for the elastic worker threads (auto)
+    AC_CHECK_FUNCS(getrusage)
     dnl Workers draining the pollset (EVENT_WORKER_DRAIN) need APR to poll the
     dnl same pollset from several threads; a header check since the bundled
     dnl APR isn't built yet.
