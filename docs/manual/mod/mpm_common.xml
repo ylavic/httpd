@@ -625,6 +625,10 @@ will handle during its life</description>
     <p>Setting <directive>MaxConnectionsPerChild</directive> to a
     non-zero value limits the amount of memory that a process can consume
     by (accidental) memory leakage.</p>
+
+    <p>Not to be confused with <directive module="event"
+    >MaxClientConnections</directive> (<module>event</module>), the number
+    of client connections the server holds at once.</p>
 </usage>
 </directivesynopsis>
 

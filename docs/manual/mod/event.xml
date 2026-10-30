@@ -537,4 +537,56 @@ once</description>
 </usage>
 </directivesynopsis>
 
+<directivesynopsis>
+<name>MaxClientConnections</name>
+<description>How many client connections to hold at once, with
+MaxRequestWorkers auto</description>
+<syntax>MaxClientConnections <var>number</var></syntax>
+<default>See usage for details</default>
+<contextlist><context>server config</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
+
+<usage>
+    <p>With <code><directive module="mpm_common">MaxRequestWorkers</directive>
+    auto</code>, the number of simultaneous client connections the server
+    holds, active or idle (e.g. keep-alive): the child processes are derived
+    from it (see <directive module="mpm_common">MaxRequestWorkers</directive>),
+    and each of them stops accepting new connections beyond its share of
+    <var>number</var> (the number divided by the children, plus 10% since
+    the system spreads the new connections only roughly evenly between
+    them), accepting again below 90% of it. The new connections wait in
+    the listen backlog meanwhile (see <directive module="mpm_common"
+    >ListenBacklog</directive>), or go to the other children. The
+    connections in the process of shutting down or lingering count toward
+    the share too (they hold a descriptor): while a child holds its share,
+    its lingering connections are closed rather than waiting for their
+    clients to close.</p>
+
+    <p>The default is what the limit of open files of the server allows (its
+    soft limit, e.g. <code>ulimit -n</code>): up to (the limit - 64 - the
+    listening sockets) / 2 connections per child, times the fewest children
+    (enough for their threads to cover the CPUs: half as many as the CPUs
+    with the default 2 threads per child), or times the listeners buckets the
+    CPUs would have if more (see <directive
+    module="mpm_common">ListenCoresBucketsRatio</directive>). A notice tells when the soft limit is well below the hard one, which
+    the server doesn't raise by itself.</p>
+
+    <p>Without <code>MaxRequestWorkers auto</code> it has no effect, and a
+    warning tells so at startup.</p>
+
+    <p>Not to be confused with <directive module="mpm_common"
+    >MaxConnectionsPerChild</directive>, the number of connections a child
+    process handles over its life before it is replaced.</p>
+
+    <p>During a graceful restart, the children of the previous generation
+    keep their connections until they are done with them, while the new
+    children hold up to <var>number</var> new ones: up to about twice
+    <var>number</var> connections are held for a while, which matters for
+    the system-wide limits (open files, memory). Raising
+    <var>number</var> on a graceful restart is bounded by the scoreboard
+    sized at startup, like <directive module="mpm_common"
+    >MaxRequestWorkers</directive>.</p>
+</usage>
+</directivesynopsis>
+
 </modulesynopsis>
