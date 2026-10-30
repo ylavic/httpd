@@ -10,6 +10,8 @@ Build the Go tools (Go >= 1.21, no module needed):
   go build -o fcgibackend fcgibackend.go # FastCGI backend: GET /?d=MS answers 512 bytes
                                      # after MS ms, /?s=BYTES streams BYTES, POST reads
                                      # its body; -raw ADDR misbehaves (closes early)
+  go build -o schemebackend schemebackend.go # AJP13 (-ajp), SCGI (-scgi) and uwsgi
+                                     # (-uwsgi) responders: ?d=MS, ?s=BYTES, ?close=0
 
 Build mod_aptest (its "aptest-queue" handler, controlled service times):
   cd ../pyhttpd/mod_aptest && $PREFIX/bin/apxs -c mod_aptest.c
@@ -91,6 +93,9 @@ checks/async-*-check.py PREFIX WORKDIR
   error's ErrorDocument after an async wait to clients that stop reading),
   redirect (an ErrorDocument proxied over http and fcgi: internally
   redirected requests don't suspend; and after an async wait, proxied to the
-  same backend reusing its connection).
+  same backend reusing its connection), schemes (mod_proxy_ajp,
+  mod_proxy_scgi and mod_proxy_uwsgi against schemebackend: waits on few
+  threads, timeout=, large responses, request bodies, early close, backend
+  down, a pool of one connection).
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).

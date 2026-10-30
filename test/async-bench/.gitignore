@@ -2,6 +2,7 @@ backend
 loadgen
 tunnelgen
 fcgibackend
+schemebackend
 .gocache/
 .gopath/
 run-*/
