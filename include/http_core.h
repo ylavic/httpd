@@ -795,6 +795,17 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                                   apr_off_t readbytes);
 apr_status_t ap_core_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
 
+/**
+ * Whether the last nonblocking AP_MODE_READBYTES read of the core input
+ * filter emptied the connection's socket, so that reading it again would get
+ * EAGAIN until new data arrive: its last recv() got EAGAIN and the core holds
+ * no data. Only when the core input filter is the connection's first input
+ * filter (none above it may hold data, e.g. TLS).
+ * @param c The connection
+ * @return Non-zero if drained
+ */
+AP_DECLARE(int) ap_core_input_drained(conn_rec *c);
+
 
 AP_DECLARE(const char*) ap_get_server_protocol(server_rec* s);
 AP_DECLARE(void) ap_set_server_protocol(server_rec* s, const char* proto);

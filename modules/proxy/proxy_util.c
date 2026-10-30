@@ -5907,6 +5907,17 @@ static apr_status_t proxy_transfer(request_rec *r,
             rv = APR_SUCCESS;
             break;
         }
+
+        /* Don't read again if the core knows its socket is emptied (no
+         * filter holding data above it), the read would get EAGAIN: the
+         * caller waits for the next input as after an EAGAIN read.
+         */
+        if (read_eagain && ap_core_input_drained(c_i)) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "proxy_transfer: %s drained", name);
+            *read_eagain = 1;
+            break;
+        }
     }
 
     /* bb_o first to avoid protential dangling buckets (transient) */

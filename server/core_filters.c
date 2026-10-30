@@ -85,7 +85,32 @@ typedef struct {
 typedef struct {
     apr_bucket_brigade *bb;
     apr_bucket_brigade *tmpbb;
+    /* The last nonblocking READBYTES read emptied the socket: its last
+     * recv() got EAGAIN, and nothing is held besides the socket bucket
+     * (ap_core_input_drained())
+     */
+    int drained;
 } core_input_ctx_t;
+
+AP_DECLARE(int) ap_core_input_drained(conn_rec *c)
+{
+    ap_filter_t *f;
+    core_input_ctx_t *ctx;
+
+    for (f = c->input_filters; f; f = f->next) {
+        if (f->frec == ap_core_input_filter_handle) {
+            break;
+        }
+    }
+    if (!f || !(ctx = f->ctx) || !ctx->drained) {
+        return 0;
+    }
+
+    /* Nothing pending in the filters above the core either (those holding
+     * data report it, e.g. TLS what's decrypted but not read yet)
+     */
+    return ap_check_input_pending(c) == OK;
+}
 
 
 apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
@@ -125,6 +150,7 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     else {
         ap_filter_reinstate_brigade(f, ctx->bb, NULL);
     }
+    ctx->drained = 0;
 
     /* ### This is bad. */
     BRIGADE_NORMALIZE(ctx->bb);
@@ -236,6 +262,12 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     /* read up to the amount they specified. */
     if (mode == AP_MODE_READBYTES || mode == AP_MODE_SPECULATIVE) {
         apr_bucket *e;
+        /* Whether the greedy read of the socket bucket emptied the socket:
+         * its recv() got EAGAIN (a short recv() doesn't tell, e.g. the peer's
+         * shutdown may follow the data and an edge-triggered poll wouldn't
+         * report it again)
+         */
+        int emptied = 0;
 
         AP_DEBUG_ASSERT(readbytes > 0);
 
@@ -299,11 +331,15 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                      * not wait for more since we already got some and we are
                      * only checking if there isn't more.
                      */
+                    int socket_read = APR_BUCKET_IS_SOCKET(e);
                     rv = apr_bucket_read(e, &str, &bucket_len,
                                          APR_NONBLOCK_READ);
                     if (rv == APR_SUCCESS) {
                         len += bucket_len;
                         e = APR_BUCKET_NEXT(e);
+                    }
+                    else if (socket_read && APR_STATUS_IS_EAGAIN(rv)) {
+                        emptied = 1;
                     }
                 }
             }
@@ -342,6 +378,14 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
         /* Take what was originally there and place it back on ctx->bb */
         APR_BRIGADE_CONCAT(ctx->bb, ctx->tmpbb);
+
+        /* Drained if the socket was emptied and nothing else is held */
+        if (emptied && mode == AP_MODE_READBYTES
+            && block == APR_NONBLOCK_READ
+            && !APR_BRIGADE_EMPTY(ctx->bb)
+            && APR_BUCKET_IS_SOCKET(APR_BRIGADE_FIRST(ctx->bb))) {
+            ctx->drained = 1;
+        }
     }
 
 cleanup:
