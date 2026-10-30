@@ -335,6 +335,9 @@ static proxy_worker *find_session_route(proxy_balancer *balancer,
         return NULL;
 }
 
+/* Elect the best worker for the request (the lbmethod's), NULL if none is
+ * usable.
+ */
 static proxy_worker *find_best_worker(proxy_balancer *balancer,
                                       request_rec *r)
 {
@@ -363,6 +366,17 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
     }
 #endif
 
+    return candidate;
+}
+
+/* Elect the best worker for the request, retrying for up to the balancer's
+ * timeout if none is usable, NULL if none was.
+ */
+static proxy_worker *find_best_worker_retry(proxy_balancer *balancer,
+                                            request_rec *r)
+{
+    proxy_worker *candidate = find_best_worker(balancer, r);
+
     if (candidate == NULL) {
         /* All the workers are in error state or disabled.
          * If the balancer has a timeout sleep for a while
@@ -370,19 +384,20 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
          * that some other thread will release a connection.
          * By default the timeout is not set, and the server
          * returns SERVER_BUSY.
+         * The timeout is read once, balancer->s being shared (other
+         * threads, other children and the balancer-manager): never
+         * written here.
          */
-        if (balancer->s->timeout) {
+        apr_interval_time_t timeout = balancer->s->timeout;
+
+        if (timeout) {
             /* XXX: This can perhaps be build using some
              * smarter mechanism, like tread_cond.
              * But since the statuses can came from
              * different children, use the provided algo.
              */
-            apr_interval_time_t timeout = balancer->s->timeout;
             apr_interval_time_t step, tval = 0;
-            /* Set the timeout to 0 so that we don't
-             * end in infinite loop
-             */
-            balancer->s->timeout = 0;
+
             step = timeout / 100;
             while (tval < timeout) {
                 apr_sleep(step);
@@ -391,13 +406,10 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
                     break;
                 tval += step;
             }
-            /* restore the timeout */
-            balancer->s->timeout = timeout;
         }
     }
 
     return candidate;
-
 }
 
 static int balancer_fixup(request_rec *r, proxy_worker *worker, char **url)
@@ -568,7 +580,7 @@ static int proxy_balancer_pre_request(proxy_worker **worker,
     }
 #endif
     if (!*worker) {
-        runtime = find_best_worker(*balancer, r);
+        runtime = find_best_worker_retry(*balancer, r);
         if (!runtime) {
             if ((*balancer)->workers->nelts) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01170)
