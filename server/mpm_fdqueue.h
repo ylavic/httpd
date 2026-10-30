@@ -131,7 +131,7 @@ AP_DECLARE(apr_status_t) ap_queue_set_lanes(fd_queue_t *queue,
 /* The number of elements in a lane (unlocked, for stats or heuristics) */
 AP_DECLARE(apr_uint32_t) ap_queue_lane_nelts(fd_queue_t *queue,
                                              unsigned int lane);
-/* The queued_at of the oldest event in a lane, 0 if empty (locked) */
+/* The queued_at of the oldest event in a lane, 0 if empty (unlocked) */
 AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
                                                unsigned int lane);
 

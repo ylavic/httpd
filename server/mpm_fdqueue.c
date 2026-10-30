@@ -33,6 +33,10 @@ APR_RING_HEAD(fd_queue_ring, fd_queue_elem_t);
 struct fd_queue_t
 {
     struct fd_queue_ring elts[QUEUE_MAX_LANES];
+    /* The queued_at of each lane's first element (0 if empty), stored under
+     * the lock for ap_queue_lane_head_time() to read without it
+     */
+    /*atomic*/ apr_uint64_t lane_head_time[QUEUE_MAX_LANES];
     /*atomic*/ apr_uint32_t lane_nelts[QUEUE_MAX_LANES];
     unsigned int lane_weight[QUEUE_MAX_LANES];
     unsigned int nlanes, cur_lane, cur_credit;
@@ -424,6 +428,7 @@ AP_DECLARE(apr_status_t) ap_queue_set_lanes(fd_queue_t *queue,
     }
     for (i = 0; i < nlanes; i++) {
         APR_RING_INIT(&queue->elts[i], fd_queue_elem_t, link);
+        queue->lane_head_time[i] = 0;
         queue->lane_nelts[i] = 0;
         queue->lane_weight[i] = weights[i];
     }
@@ -444,16 +449,9 @@ AP_DECLARE(apr_uint32_t) ap_queue_lane_nelts(fd_queue_t *queue,
 AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
                                                unsigned int lane)
 {
-    apr_time_t when = 0;
-
-    if (lane < queue->nlanes && queue_lock(queue) == APR_SUCCESS) {
-        if (queue->lane_nelts[lane]) {
-            fd_queue_elem_t *elem = APR_RING_FIRST(&queue->elts[lane]);
-            when = elem->event->queued_at;
-        }
-        queue_unlock(queue);
-    }
-    return when;
+    return (lane < queue->nlanes)
+           ? (apr_time_t)apr_atomic_read64(&queue->lane_head_time[lane])
+           : 0;
 }
 
 static APR_INLINE fd_queue_elem_t *get_spare_elem(fd_queue_t *queue)
@@ -497,6 +495,10 @@ static APR_INLINE void enqueue_elem(fd_queue_t *queue, fd_queue_elem_t *elem,
     /* Read without the lock by ap_queue_lane_nelts(): atomic stores, though
      * the lock serializes the updates
      */
+    if (!queue->lane_nelts[elem->lane]) {
+        apr_atomic_set64(&queue->lane_head_time[elem->lane],
+                         (apr_uint64_t)elem->event->queued_at);
+    }
     apr_atomic_set32(&queue->lane_nelts[elem->lane],
                      queue->lane_nelts[elem->lane] + 1);
     apr_atomic_set32(&queue->nelts, queue->nelts + 1);
@@ -512,6 +514,10 @@ static APR_INLINE void dequeue_elem(fd_queue_t *queue, fd_queue_elem_t *elem)
     apr_atomic_set32(&queue->lane_nelts[elem->lane],
                      queue->lane_nelts[elem->lane] - 1);
     apr_atomic_set32(&queue->nelts, queue->nelts - 1);
+    apr_atomic_set64(&queue->lane_head_time[elem->lane],
+                     (queue->lane_nelts[elem->lane])
+                     ? (apr_uint64_t)APR_RING_FIRST(&queue->elts[elem->lane])->event->queued_at
+                     : 0);
 }
 
 /* The next element to pop (the queue is not empty): weighted round-robin
