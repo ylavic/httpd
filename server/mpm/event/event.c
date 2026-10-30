@@ -916,6 +916,7 @@ typedef struct event_child_bucket {
     ap_listen_rec *listeners;
 } event_child_bucket;
 static event_child_bucket *my_bucket;  /* Current child bucket */
+static int my_bucket_num;              /* Its index */
 
 /* data retained by event across load/unload of the module
  * allocated on first call to pre-config hook; located on
@@ -1043,8 +1044,11 @@ static AP_THREAD_LOCAL struct worker_slot *worker_current_slot;
 /* Disabling / enabling listening sockets can only happen in the listener
  * thread, which is the only one to set 'dying' to 1 too, so it's all thread
  * safe. 'listensocks_off' is changed atomically still because it's read
- * concurrently in listensocks_disabled().
+ * concurrently in listensocks_disabled(). It holds the reasons for not
+ * accepting, the listening sockets being polled only when there is none.
  */
+#define ACCEPT_OFF_LIMIT (1u << 0) /* connections_above_limit(), or dying */
+#define ACCEPT_OFF_SHARE (1u << 1) /* above the fair share (fair_share_above()) */
 static /*atomic*/ apr_uint32_t listensocks_off = 0;
 
 /* Instrumentation of the workers' backlog: how long the entries wait there
@@ -1199,12 +1203,13 @@ static void admission_sample(apr_time_t wait, apr_time_t now)
  * the oldest one still waiting (the lane's head) has waited longer than the
  * target at least, which counts the blocked workers too.
  *
- * Hysteresis: once refusing, accept again only when the new connections are
- * clearly back under (no wait above half the target nor count above half
- * the backstop, or none waiting), so that floods don't toggle the listening
- * sockets at the rate of the workers. A minimum time off as well would cost
- * throughput (workers idle while connections wait in the kernel) for fewer
- * toggles than this already avoids.
+ * Hysteresis: once refusing for the limits (ACCEPT_OFF_LIMIT), accept again
+ * only when the new connections are clearly back under (no wait above half
+ * the target nor count above half the backstop, or none waiting), so that
+ * floods don't toggle the listening sockets at the rate of the workers. A
+ * minimum time off as well would cost throughput (workers idle while
+ * connections wait in the kernel) for fewer toggles than this already
+ * avoids.
  */
 static int admission_above_target(apr_time_t now)
 {
@@ -1216,7 +1221,7 @@ static int admission_above_target(apr_time_t now)
         return ADMISSION_UNDER; /* no new connection waiting */
     }
     count = ap_queue_lane_nelts(worker_queue, BACKLOG_NEW);
-    if (apr_atomic_read32(&listensocks_off)) {
+    if (apr_atomic_read32(&listensocks_off) & ACCEPT_OFF_LIMIT) {
         if (now - head > admission_target / 2) {
             return ADMISSION_SOJOURN;
         }
@@ -1240,9 +1245,13 @@ static int admission_above_target(apr_time_t now)
     return ADMISSION_UNDER;
 }
 
-/* Changed by the listener only (see above) */
-static apr_uint32_t listensocks_toggles;
+/* Changed by the listener only (see above), for any reason and for the fair
+ * share alone
+ */
+static apr_uint32_t listensocks_toggles, share_toggles;
 static apr_time_t listensocks_off_since, listensocks_off_time;
+static apr_time_t share_off_since, share_off_time;
+static apr_time_t fair_share_stopped; /* when it last stopped for the share */
 
 /* The backlog's connections shut down for their timeout (listener only) */
 static apr_uint32_t backlog_dropped;
@@ -1258,16 +1267,19 @@ static apr_uint32_t accept_off_hist[BACKLOG_HIST_SLOTS], accept_off_ended,
 /* What made the listener accept again (with the backlog stats): the wakes
  * asking for it (wakeup_listener_by() the ACCEPT_WAKE_* flags of who woke
  * it up, accumulated until the listener takes them), else the timeout of its
- * backstop re-check (RECHECK_BACKSTOP), else anything else that woke it
- * up. Counted by the listener only.
+ * backstop re-check (RECHECK_BACKSTOP), else that of the fair share's
+ * re-check (RECHECK_SHARE), else anything else that woke it up. Counted
+ * by the listener only.
  */
 #define ACCEPT_WAKE_WORKER (1u << 0) /* a worker took new ones or idled */
 #define ACCEPT_WAKE_CLOSE  (1u << 1) /* a connection was closed */
 static /*atomic*/ apr_uint32_t accept_wakes;
-static apr_uint32_t resumes_woken, resumes_recheck, resumes_other;
+static apr_uint32_t resumes_woken, resumes_recheck, resumes_share,
+                    resumes_other;
 
 /* The re-check whose timeout the listener's poll used, if any */
 #define RECHECK_BACKSTOP 1u /* ACCEPT_RECHECK_TIMEOUT, see listener_thread() */
+#define RECHECK_SHARE    2u /* the fair share's (fair_share_stopped) */
 
 /* Account for an entry popped from the backlog (any thread) */
 static void backlog_stats_record(int qclass, apr_time_t sojourn)
@@ -1361,8 +1373,8 @@ static void backlog_stats_report(apr_time_t now)
 {
     char buf[1024];
     apr_size_t len = 0;
-    apr_time_t off;
-    apr_uint32_t toggles;
+    apr_time_t off, share_off;
+    apr_uint32_t toggles, share_n;
     int i, j;
 
     for (i = 0; i < BACKLOG_CLASSES; i++) {
@@ -1394,18 +1406,28 @@ static void backlog_stats_report(apr_time_t now)
     listensocks_off_time = 0;
     toggles = listensocks_toggles;
     listensocks_toggles = 0;
+    share_off = share_off_time;
+    if (share_off_since) {
+        share_off += now - share_off_since;
+        share_off_since = now;
+    }
+    share_off_time = 0;
+    share_n = share_toggles;
+    share_toggles = 0;
 
     ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
                  "backlog sojourn:%s; dropped %u; accept off %u times, %"
                  APR_TIME_T_FMT "ms, backstop %u,"
-                 " resumed woken %u recheck %u other %u;"
+                 " share %u times %" APR_TIME_T_FMT "ms,"
+                 " resumed woken %u recheck %u share %u other %u;"
                  " drain polls=%u csd=%u user=%u dropped=%u"
                  " misses=%u promotions=%u; wait timeouts queued=%u"
                  " skiplist=%u; accept offs ended %u: p50<%uus,max=%uus",
                  len ? buf : " none", backlog_dropped,
                  toggles, apr_time_as_msec(off),
                  apr_atomic_xchg32(&admission_backstops, 0),
-                 resumes_woken, resumes_recheck, resumes_other,
+                 share_n, apr_time_as_msec(share_off),
+                 resumes_woken, resumes_recheck, resumes_share, resumes_other,
                  apr_atomic_xchg32(&drain_polls, 0),
                  apr_atomic_xchg32(&drain_csd, 0),
                  apr_atomic_xchg32(&drain_user, 0),
@@ -1419,23 +1441,35 @@ static void backlog_stats_report(apr_time_t now)
                   ? backlog_hist_bound(accept_off_hist, accept_off_ended, 50)
                   : 0),
                  accept_off_max);
-    resumes_woken = resumes_recheck = resumes_other = 0;
+    resumes_woken = resumes_recheck = resumes_share = resumes_other = 0;
     backlog_dropped = 0;
     memset(accept_off_hist, 0, sizeof(accept_off_hist));
     accept_off_ended = accept_off_max = 0;
 }
 
-static int disable_listensocks(apr_time_t now)
+/* Stop accepting for a reason (ACCEPT_OFF_*), returns whether accepting
+ * stopped (not if it was stopped already, for another reason)
+ */
+static int disable_listensocks(apr_time_t now, unsigned int reason)
 {
     volatile process_score *ps;
+    apr_uint32_t off = apr_atomic_read32(&listensocks_off);
     int i;
 
-    if (!apr_atomic_read32(&listensocks_off)
+    if (off & reason) {
+        return 0;
+    }
+    if ((reason & ACCEPT_OFF_LIMIT)
         && !apr_atomic_read32(&dying)
         && admission_above_target(now) == ADMISSION_BACKSTOP) {
         admission_backstops++;
     }
-    if (apr_atomic_cas32(&listensocks_off, 1, 0) != 0) {
+    apr_atomic_set32(&listensocks_off, off | reason);
+    if (reason & ACCEPT_OFF_SHARE) {
+        share_toggles++;
+        share_off_since = fair_share_stopped = now;
+    }
+    if (off) {
         return 0;
     }
     listensocks_toggles++;
@@ -1470,17 +1504,22 @@ static int disable_listensocks(apr_time_t now)
     return 1;
 }
 
-/* Accept again (should_enable_listensocks()), "by" what made the listener
- * find it out (traced)
+/* Accept again, all the reasons cleared (should_enable_listensocks()), "by"
+ * what made the listener find it out (traced)
  */
 static int enable_listensocks(apr_time_t now, const char *by)
 {
     volatile process_score *ps;
+    apr_uint32_t off = apr_atomic_read32(&listensocks_off);
     int i;
 
-    if (apr_atomic_read32(&dying)
-        || apr_atomic_cas32(&listensocks_off, 0, 1) != 1) {
+    if (!off || apr_atomic_read32(&dying)) {
         return 0;
+    }
+    apr_atomic_set32(&listensocks_off, 0);
+    if (share_off_since) {
+        share_off_time += now - share_off_since;
+        share_off_since = 0;
     }
     if (listensocks_off_since) {
         listensocks_off_time += now - listensocks_off_since;
@@ -1528,6 +1567,92 @@ static APR_INLINE int listensocks_disabled(void)
     return apr_atomic_read32(&listensocks_off) != 0;
 }
 
+/* Whether not accepting for this reason (among others possibly) */
+static APR_INLINE int listensocks_disabled_for(unsigned int reason)
+{
+    return (apr_atomic_read32(&listensocks_off) & reason) != 0;
+}
+
+/* The fair share of the connections, in auto mode (MaxRequestWorkers auto):
+ * while it has no idle worker, a child stops accepting (ACCEPT_OFF_SHARE)
+ * when its connections exceed the average of the accepting children of its
+ * bucket plus a slack, provided another of them accepts, and accepts again
+ * once back at or below that average, or with an idle worker. So a busy child
+ * doesn't keep accepting a whole burst while its siblings sleep, and the
+ * connections (staying where they were accepted for their keep-alive life)
+ * spread over the children once requests would queue; a child with idle
+ * workers takes more connections at no harm, gathering them batches the work
+ * (fewer children woken for the same requests). The counts are the
+ * scoreboard's (ps->connections, published by each child at its stats tick
+ * and on each accept). The listener computes the average at the stats tick,
+ * before stopping and while stopped; the workers read the last one
+ * (fair_share_above()).
+ */
+static int fair_share_on;
+static apr_uint32_t fair_share_slack;
+static /*atomic*/ apr_uint32_t fair_share_avg, fair_share_others;
+
+/* The slack (a count margin above the average, for hysteresis): a quarter
+ * of the threads per child, at least 2, so that a child doesn't stop and
+ * start accepting at each connection around the average, and stops only for
+ * an excess worth a part of what it serves at once.
+ */
+#define FAIR_SHARE_SLACK(threads) (((threads) / 4 > 2) ? (threads) / 4 : 2)
+
+/* Compute the average connections of the accepting children of this bucket
+ * (this one included while it accepts), and how many others accept (listener)
+ */
+static void fair_share_update(void)
+{
+    const int n = retained->mpm->num_buckets;
+    apr_uint32_t sum = 0, count = 0, others = 0;
+    int i;
+
+    if (!fair_share_on) {
+        return;
+    }
+    for (i = my_bucket_num; i < server_limit; i += n) {
+        volatile process_score *ps = &ap_scoreboard_image->parent[i];
+
+        if (i == ap_child_slot) {
+            if (!listensocks_disabled()) {
+                sum += apr_atomic_read32(&event_counts.connection_count);
+                count++;
+            }
+        }
+        else if (ps->pid != 0
+                 && ps->generation == retained->mpm->my_generation
+                 && !ps->quiescing
+                 && !ps->not_accepting) {
+            sum += apr_atomic_read32(&ps->connections);
+            count++;
+            others++;
+        }
+    }
+    apr_atomic_set32(&fair_share_avg, (count) ? sum / count : 0);
+    apr_atomic_set32(&fair_share_others, others);
+}
+
+/* Whether this child's connections are above its fair share: above the
+ * average plus the slack to stop accepting, above the average to stay
+ * stopped (stopped != 0); never when no other child of the bucket accepts,
+ * nor while it has an idle worker.
+ */
+static int fair_share_above(int stopped)
+{
+    apr_uint32_t conns, avg;
+
+    if (!fair_share_on || !apr_atomic_read32(&fair_share_others)) {
+        return 0;
+    }
+    if (ap_queue_info_idlers_count(worker_queue_info) > 0) {
+        return 0;
+    }
+    conns = apr_atomic_read32(&event_counts.connection_count);
+    avg = apr_atomic_read32(&fair_share_avg);
+    return conns > ((stopped) ? avg : avg + fair_share_slack);
+}
+
 /* Whether to stop accepting for the limits, or not to accept again yet once
  * stopped, for any thread (read-only). now: the caller's current time if at
  * hand, otherwise 0 (fetched if needed)
@@ -1543,12 +1668,17 @@ static APR_INLINE int connections_above_limit(apr_time_t now)
     return admission_above_target(now) != ADMISSION_UNDER;
 }
 
-/* Whether to accept again, for any thread (see connections_above_limit()) */
+/* Whether every reason for not accepting is gone, for any thread (see
+ * connections_above_limit())
+ */
 static APR_INLINE int should_enable_listensocks(apr_time_t now)
 {
-    return (listensocks_disabled()
+    apr_uint32_t off = apr_atomic_read32(&listensocks_off);
+
+    return (off
             && !apr_atomic_read32(&dying)
-            && !connections_above_limit(now));
+            && (!(off & ACCEPT_OFF_LIMIT) || !connections_above_limit(now))
+            && (!(off & ACCEPT_OFF_SHARE) || !fair_share_above(1)));
 }
 
 static void close_socket_at(apr_socket_t *csd,
@@ -3871,7 +4001,8 @@ static void set_child_dying(void)
     ps->quiescing = 1;
 
     apr_atomic_set32(&dying, 1);
-    disable_listensocks(event_time_now()); /* definitively with dying = 1 */
+    /* definitively with dying = 1 */
+    disable_listensocks(event_time_now(), ACCEPT_OFF_LIMIT);
     ap_close_listeners_ex(my_bucket->listeners);
 
 #if 0
@@ -4031,7 +4162,7 @@ static int push2worker(event_conn_state_t *cs, timer_event_t *te,
          * test for should_enable_listensocks() to recover (when suitable).
          */
         if (connections_above_limit(now)) {
-            disable_listensocks(now);
+            disable_listensocks(now, ACCEPT_OFF_LIMIT);
             if (above_limit) {
                 *above_limit = 1;
             }
@@ -4871,6 +5002,8 @@ static void update_stats(process_score *ps, apr_time_t now,
     }
 
     if (expired) {
+        fair_share_update();
+
         ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
                      "child: idlers:%i conns:%u backlog:%u "
                      "waitio:%u write:%u keepalive:%u shutdown:%u linger:%u "
@@ -5110,15 +5243,28 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
          * closed or a worker takes new connections or idles, which wake up
          * the listener when it should accept again (see
          * wakeup_listener_by()), so this is a backstop against a lost
-         * wake only, not expected to decide (ACCEPT_RECHECK_TIMEOUT). A
+         * wake only, not expected to decide (ACCEPT_RECHECK_TIMEOUT). After
+         * stopping for the fair share though, re-evaluate within the
+         * admission's target during the admission's interval, when a burst
+         * is spreading over the children (other children's connections, no
+         * local event to wake up the listener), then at the stats tick. A
          * resume counts as a re-check's (backlog stats) only when that
          * re-check's own timeout ended the poll.
          */
         recheck = 0;
-        if (listensocks_disabled() && !apr_atomic_read32(&dying)
-            && (timeout < 0 || timeout > ACCEPT_RECHECK_TIMEOUT)) {
-            timeout = ACCEPT_RECHECK_TIMEOUT;
-            recheck = RECHECK_BACKSTOP;
+        if (!apr_atomic_read32(&dying)) {
+            if (listensocks_disabled_for(ACCEPT_OFF_SHARE)
+                && now - fair_share_stopped < admission_interval) {
+                if (timeout < 0 || timeout > admission_target) {
+                    timeout = admission_target;
+                    recheck = RECHECK_SHARE;
+                }
+            }
+            else if (listensocks_disabled_for(ACCEPT_OFF_LIMIT)
+                     && (timeout < 0 || timeout > ACCEPT_RECHECK_TIMEOUT)) {
+                timeout = ACCEPT_RECHECK_TIMEOUT;
+                recheck = RECHECK_BACKSTOP;
+            }
         }
 
         /* apr_pollset_poll() might round down the timeout to
@@ -5131,7 +5277,12 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             );
         }
 
-        /* Unpause listening sockets before poll()ing if possible */
+        /* Unpause listening sockets before poll()ing if possible (with the
+         * current fair share if stopped for it).
+         */
+        if (listensocks_disabled_for(ACCEPT_OFF_SHARE)) {
+            fair_share_update();
+        }
         if (listensocks_disabled()) {
             /* The wakes asking to accept, up to now (any later one will
              * make the poll below return).
@@ -5151,6 +5302,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 else if (recheck_timedout == RECHECK_BACKSTOP) {
                     resumes_recheck++;
                     by = "recheck";
+                }
+                else if (recheck_timedout == RECHECK_SHARE) {
+                    resumes_share++;
+                    by = "share";
                 }
                 else {
                     resumes_other++;
@@ -5276,9 +5431,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 
             case PT_ACCEPT:
                 /* A Listener Socket is ready for an accept() */
-                if (above_limit) {
+                if (above_limit || listensocks_disabled_for(ACCEPT_OFF_SHARE)) {
                     /* Listeners disabled for now, keep the new connection in
-                     * the socket backlog until listening again.
+                     * the socket backlog until listening again (or for
+                     * another child, above the fair share).
                      */
                     continue;
                 }
@@ -5329,6 +5485,24 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                         cs = make_conn_state(ptrans, csd);
                         push2worker(cs, NULL, BACKLOG_NEW, now,
                                     &above_limit, 0);
+
+                        /* Stop accepting above the fair share, with the
+                         * average recomputed (fresh counts) before
+                         */
+                        if (fair_share_on) {
+                            apr_uint32_t conns = apr_atomic_read32(&event_counts.connection_count);
+                            apr_atomic_set32(&ps->connections, conns);
+                            /* Rescan whatever the last scan found of the
+                             * others (none before the first stats tick)
+                             */
+                            if (!above_limit
+                                && conns > apr_atomic_read32(&fair_share_avg) + fair_share_slack) {
+                                fair_share_update();
+                                if (fair_share_above(0)) {
+                                    disable_listensocks(now, ACCEPT_OFF_SHARE);
+                                }
+                            }
+                        }
                     }
                     else {
                         if (rc == APR_EGENERAL) {
@@ -6229,7 +6403,8 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
                  * the listener can accept again, let it know now rather than
                  * when this worker idles.
                  */
-                if (should_enable_listensocks(now)) {
+                if (listensocks_disabled_for(ACCEPT_OFF_LIMIT)
+                    && should_enable_listensocks(now)) {
                     wakeup_listener_by(ACCEPT_WAKE_WORKER);
                 }
             }
@@ -6566,6 +6741,15 @@ static void setup_threads_runtime(void)
         lr->accept_func = ap_unixd_accept;
     }
 
+    /* The fair share of the connections in auto mode (see fair_share_update()) */
+    fair_share_on = auto_settings;
+    fair_share_slack = FAIR_SHARE_SLACK(threads_per_child);
+    if (fair_share_on) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                     "fair share of the connections: on, slack %u",
+                     fair_share_slack);
+    }
+
     /* Aligned on a cache line (APR allocates on 8 bytes), so that a slot's
      * data never straddles into the next slot's line (one more slot for it).
      */
@@ -6811,6 +6995,7 @@ static void child_main(int child_num_arg, int child_bucket)
 #endif
 
     /* close unused listeners and pods */
+    my_bucket_num = child_bucket;
     for (i = 0; i < retained->mpm->num_buckets; i++) {
         if (i != child_bucket) {
             ap_close_listeners_ex(retained->buckets[i].listeners);
