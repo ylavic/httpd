@@ -163,10 +163,6 @@
 #define DEFAULT_ADMISSION_BACKLOG 16.0
 #endif
 
-#ifndef MAX_SPARE_THREADS_RATIO
-#define MAX_SPARE_THREADS_RATIO 0.75 /* of MaxRequestWorkers */
-#endif
-
 /* MaxRequestWorkers auto: the threads per child (one on a single CPU), and the
  * client connections a child can hold from its descriptors limit: what's left
  * after AUTO_FDS_RESERVE (logs, modules' files...) and the listeners, at
@@ -1028,6 +1024,17 @@ typedef struct event_retained_data {
     int idle_spawn_rate;
     int max_spawn_rate, *free_slots;
     int hold_off_on_exponential_spawning;
+
+    /* MaxRequestWorkers auto: the active children per bucket (reset per
+     * generation), and whether the scoreboard couldn't hold them all.
+     */
+    int *bucket_children;
+    int target_full_reported;
+    /* When each scoreboard slot's child was last started, and the last one
+     * (see replace_at_once())
+     */
+    apr_time_t *slot_started;
+    apr_time_t last_started;
 } event_retained_data;
 static event_retained_data *retained;
 
@@ -7283,6 +7290,9 @@ static int make_child(server_rec *s, int slot)
     if (slot + 1 > retained->max_daemon_used) {
         retained->max_daemon_used = slot + 1;
     }
+    if (retained->slot_started) {
+        retained->slot_started[slot] = retained->last_started = apr_time_now();
+    }
 
     if (ap_scoreboard_image->parent[slot].pid != 0) {
         /* XXX replace with assert or remove ? */
@@ -7607,6 +7617,143 @@ static void perform_idle_server_maintenance(void)
     }
 }
 
+/* MaxRequestWorkers auto: keep the target of children running (all of them,
+ * active_daemons_limit), the same number per bucket, replacing those that
+ * exited or stopped accepting for good (quiescing, e.g. MaxConnectionsPerChild
+ * or a descriptors shortage) at once, in the free scoreboard slots of their
+ * bucket. Never stop a child for its idle threads, they may hold many
+ * connections, nor start more than the target because threads are blocked
+ * (connections can't move to another child, its own workers grow instead).
+ */
+static void perform_children_target_maintenance(void)
+{
+    const int num_buckets = retained->mpm->num_buckets;
+    const int per_bucket = active_daemons_limit / num_buckets;
+    int *children = retained->bucket_children;
+    int max_daemon_used = 0, active = 0, missing = 0;
+    int i, j, b;
+
+    for (b = 0; b < num_buckets; b++) {
+        children[b] = 0;
+    }
+    for (i = 0; i < server_limit; ++i) {
+        volatile process_score *ps = &ap_scoreboard_image->parent[i];
+
+        if (ps->pid == 0) {
+            continue;
+        }
+        if (ps->quiescing == 1) {
+            ps->quiescing = 2;
+            retained->active_daemons--;
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
+                         "Child %d quiescing: pid %d, gen %d, "
+                         "active %d/%d, total %d/%d/%d",
+                         i, (int)ps->pid, (int)ps->generation,
+                         retained->active_daemons, active_daemons_limit,
+                         retained->total_daemons, retained->max_daemon_used,
+                         server_limit);
+        }
+        if (!ps->quiescing
+            && ps->generation == retained->mpm->my_generation) {
+            int threads_active = 0;
+            for (j = 0; j < threads_per_child; j++) {
+                int status = ap_scoreboard_image->servers[i][j].status;
+                if (status >= SERVER_READY && status < SERVER_GRACEFUL) {
+                    ++threads_active;
+                }
+            }
+            if (threads_active == threads_per_child) {
+                had_healthy_child = 1;
+            }
+            children[i % num_buckets]++;
+            active++;
+        }
+        max_daemon_used = i + 1;
+    }
+
+    if (retained->sick_child_detected) {
+        if (had_healthy_child) {
+            /* Assume this is a transient error (see
+             * perform_idle_server_maintenance())
+             */
+            retained->sick_child_detected = 0;
+        }
+        else {
+            retained->mpm->shutdown_pending = 1;
+            child_fatal = 1;
+            ap_log_error(APLOG_MARK, APLOG_ALERT, 0,
+                         ap_server_conf, APLOGNO()
+                         "A resource shortage or other unrecoverable failure "
+                         "was encountered before any child process initialized "
+                         "successfully... httpd is exiting!");
+            return;
+        }
+    }
+
+    for (b = 0; b < num_buckets; b++) {
+        for (i = b; children[b] < per_bucket && i < server_limit;
+             i += num_buckets) {
+            if (ap_scoreboard_image->parent[i].pid != 0) {
+                continue;
+            }
+            if (make_child(ap_server_conf, i) < 0) {
+                break;
+            }
+            children[b]++;
+            active++;
+            if (max_daemon_used < i + 1) {
+                max_daemon_used = i + 1;
+            }
+        }
+        if (children[b] < per_bucket) {
+            missing += per_bucket - children[b];
+        }
+    }
+    if (missing) {
+        if (!retained->target_full_reported) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf, APLOGNO()
+                         "scoreboard is full, %d of the %d children are "
+                         "missing (MaxRequestWorkers auto): increase "
+                         "ServerLimit", missing, active_daemons_limit);
+            retained->target_full_reported = 1;
+        }
+    }
+    else {
+        retained->target_full_reported = 0;
+    }
+
+    if (retained->max_daemon_used < max_daemon_used) {
+        retained->max_daemon_used = max_daemon_used;
+    }
+    if (APLOGdebug(ap_server_conf)) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
+                     "score: children target %d, active:%d/%d total:%d "
+                     "used:%d/%d/%d",
+                     active_daemons_limit, active, retained->active_daemons,
+                     retained->total_daemons, max_daemon_used,
+                     retained->max_daemon_used, server_limit);
+    }
+}
+
+/* MaxRequestWorkers auto: whether a child that exited from slot can be
+ * replaced at once, else on the next timeout (like the idle maintenance):
+ * not when the previous child of that slot or the last one started less than
+ * REPLACE_AT_ONCE_INTERVAL ago (children exiting right after their start,
+ * e.g. a module failing at child_init, would be forked again and again), nor
+ * after a sick child (perform_children_target_maintenance() decides then).
+ * The interval is above ap_wait_or_timeout()'s 1s, after which such a child
+ * is reaped.
+ */
+#define REPLACE_AT_ONCE_INTERVAL apr_time_from_sec(2)
+static int replace_at_once(int slot)
+{
+    apr_time_t now = apr_time_now();
+
+    return (!retained->sick_child_detected
+            && now - retained->slot_started[slot] >= REPLACE_AT_ONCE_INTERVAL
+            && now - retained->last_started >= REPLACE_AT_ONCE_INTERVAL);
+}
+
 static void server_main_loop(int remaining_children_to_start)
 {
     int successive_kills = 0;
@@ -7693,6 +7840,15 @@ static void server_main_loop(int remaining_children_to_start)
              * processes that keep being killed early).
              */
             if (child_slot < 0 || !APR_PROC_CHECK_SIGNALED(exitwhy)) {
+                /* MaxRequestWorkers auto: replace it at once, unless sick
+                 * or too soon (on the next timeout then)
+                 */
+                if (auto_settings && child_slot >= 0
+                    && processed_status != APEXIT_CHILDSICK
+                    && !remaining_children_to_start
+                    && replace_at_once(child_slot)) {
+                    perform_children_target_maintenance();
+                }
                 continue;
             }
             if (++successive_kills >= 3) {
@@ -7700,6 +7856,12 @@ static void server_main_loop(int remaining_children_to_start)
                     ap_log_error(APLOG_MARK, APLOG_WARNING, 0,
                                  ap_server_conf, APLOGNO(10392)
                                  "children are killed successively!");
+                }
+                continue;
+            }
+            if (auto_settings && !remaining_children_to_start) {
+                if (replace_at_once(child_slot)) {
+                    perform_children_target_maintenance();
                 }
                 continue;
             }
@@ -7723,7 +7885,12 @@ static void server_main_loop(int remaining_children_to_start)
             continue;
         }
 
-        perform_idle_server_maintenance();
+        if (auto_settings) {
+            perform_children_target_maintenance();
+        }
+        else {
+            perform_idle_server_maintenance();
+        }
     }
 }
 
@@ -7766,6 +7933,13 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
     /* Reset for the next generation/restart */
     retained->listen_buckets = NULL;
     retained->num_listen_buckets = 0;
+    retained->bucket_children = apr_pcalloc(retained->gen_pool,
+                                            num_buckets * sizeof(int));
+    /* server_limit (the scoreboard's) doesn't change across restarts */
+    if (!retained->slot_started) {
+        retained->slot_started = apr_pcalloc(ap_pglobal, server_limit *
+                                                         sizeof(apr_time_t));
+    }
 
     /* If num_buckets changed, adjust max_spawn_rate and the free_slots buffer */
     if (retained->mpm->num_buckets != num_buckets) {
@@ -7833,6 +8007,13 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
     }
     if (!retained->mpm->was_graceful) {
         startup_children(remaining_children_to_start);
+        remaining_children_to_start = 0;
+    }
+    else if (auto_settings) {
+        /* The whole target at once, in the slots the previous generation's
+         * children don't hold (the scoreboard has room for both)
+         */
+        perform_children_target_maintenance();
         remaining_children_to_start = 0;
     }
     else {
@@ -8302,8 +8483,29 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         max_workers = (max_workers / threads_per_child) * threads_per_child;
     }
     active_daemons_limit = max_workers / threads_per_child;
-    if (retained->first_server_limit
-        && active_daemons_limit > retained->first_server_sb_limit) {
+    if (auto_settings && retained->first_server_limit) {
+        /* The children target is started whole on graceful restart while the
+         * previous generation drains (perform_children_target_maintenance()),
+         * so it takes half of the initial scoreboard at most.
+         */
+        int limit = retained->first_server_sb_limit / 2;
+        if (limit < 1) {
+            limit = 1;
+        }
+        if (active_daemons_limit > limit) {
+            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO()
+                         "MaxClientConnections (%d) would need %d children, "
+                         "above half of the initial scoreboard limit (%d) "
+                         "kept for a graceful restart: %d children, up to %"
+                         APR_INT64_T_FMT " connections", max_client_conns,
+                         active_daemons_limit, retained->first_server_sb_limit,
+                         limit, (apr_int64_t)limit * clients_per_child);
+            max_workers = limit * threads_per_child;
+            active_daemons_limit = limit;
+        }
+    }
+    else if (retained->first_server_limit
+             && active_daemons_limit > retained->first_server_sb_limit) {
         int new_max_workers = retained->first_server_sb_limit * threads_per_child;
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO(10466)
                      "MaxRequestWorkers (%d) / ThreadsPerChild (%d) would "
@@ -8366,26 +8568,29 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
     else {
         ap_daemons_to_start = active_daemons_limit;
     }
-    if (min_spare_threads < ap_daemons_to_start * threads_per_child) {
-        min_spare_threads = ap_daemons_to_start * threads_per_child;
-    }
-    else if (min_spare_threads < max_workers) {
-        min_spare_threads = (min_spare_threads / min_threads) * min_threads;
+    if (auto_settings) {
+        /* Not used (perform_children_target_maintenance()) */
+        min_spare_threads = max_spare_threads = 0;
     }
     else {
-        min_spare_threads = max_workers;
-    }
-    if (max_spare_threads < 0) { /* auto settings */
-        max_spare_threads = max_workers * MAX_SPARE_THREADS_RATIO;
-    }
-    if (max_spare_threads < min_spare_threads + min_threads) {
-        max_spare_threads = min_spare_threads + min_threads;
-    }
-    else if (max_spare_threads < max_workers) {
-        max_spare_threads = (max_spare_threads / min_threads) * min_threads;
-    }
-    else {
-        max_spare_threads = max_workers;
+        if (min_spare_threads < ap_daemons_to_start * threads_per_child) {
+            min_spare_threads = ap_daemons_to_start * threads_per_child;
+        }
+        else if (min_spare_threads < max_workers) {
+            min_spare_threads = (min_spare_threads / min_threads) * min_threads;
+        }
+        else {
+            min_spare_threads = max_workers;
+        }
+        if (max_spare_threads < min_spare_threads + min_threads) {
+            max_spare_threads = min_spare_threads + min_threads;
+        }
+        else if (max_spare_threads < max_workers) {
+            max_spare_threads = (max_spare_threads / min_threads) * min_threads;
+        }
+        else {
+            max_spare_threads = max_workers;
+        }
     }
 
     workers_backlog_limit = threads_per_child * admission_backlog;
@@ -8682,6 +8887,20 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
      * (auto_settings_derive()).
      */
     if (auto_settings) {
+        /* The children target is kept running whatever their idle threads
+         * (perform_children_target_maintenance())
+         */
+        if (min_spare_threads >= 0 || max_spare_threads >= 0) {
+            if (startup) {
+                ap_log_error(APLOG_MARK, APLOG_WARNING | APLOG_STARTUP, 0, NULL, APLOGNO()
+                             "WARNING: MinSpareThreads and MaxSpareThreads have "
+                             "no effect with MaxRequestWorkers auto, ignored.");
+            } else {
+                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO()
+                             "MinSpareThreads and MaxSpareThreads have no "
+                             "effect with MaxRequestWorkers auto, ignored");
+            }
+        }
         return OK; /* => event_open_logs() */
     }
 
