@@ -98,6 +98,9 @@ checks/async-*-check.py PREFIX WORKDIR
   threads, timeout=, large responses, request bodies, early close, backend
   down, a pool of one connection), balancer-wait (requests waiting for a
   usable member until the balancer's timeout=, the backend coming back or
-  not).
+  not), tlsfront (mod_ssl's client connections: silent clients timing out in
+  the handshake, clients not reading the server's handshake flight, slow TLS
+  downloads of a large static file, a TLS backend not reading the proxy's
+  handshake flight, none holding a worker).
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).
