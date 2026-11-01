@@ -1929,10 +1929,19 @@ static apr_status_t ssl_io_filter_output(ap_filter_t *f,
     bio_filter_out_ctx_t *outctx;
     apr_bucket *flush_upto = NULL;
     apr_read_type_e rblock = APR_NONBLOCK_READ;
+    core_server_config *core_conf;
+    apr_size_t max_piece;
 
     if (f->c->aborted) {
         apr_brigade_cleanup(bb);
         return APR_ECONNABORTED;
+    }
+
+    /* The most of a data bucket to read and write at once, see below */
+    core_conf = ap_get_core_module_config(f->c->base_server->module_config);
+    max_piece = core_conf->flush_max_threshold / 2;
+    if (max_piece < AP_IOBUFSIZE) {
+        max_piece = AP_IOBUFSIZE;
     }
 
     /* Reinstate any buffered content */
@@ -1991,6 +2000,20 @@ static apr_status_t ssl_io_filter_output(ap_filter_t *f,
             /* Filter a data bucket. */
             const char *data;
             apr_size_t len;
+
+            /* Read a large bucket in pieces (e.g. a file bucket, mapped up
+             * to 4MB at once with EnableMMAP), so that the core's flow
+             * control is checked between them (ap_filter_should_yield()
+             * above) and the rest is set aside for later. A piece goes down
+             * to the core within a single call (ssl_filter_write()), where
+             * more than FlushMaxThreshold bytes of pending memory would block
+             * until most of it is written: half of that leaves room for the
+             * records' overhead.
+             */
+            if (bucket->length != (apr_size_t)-1
+                && bucket->length > max_piece) {
+                (void)apr_bucket_split(bucket, max_piece);
+            }
 
             status = apr_bucket_read(bucket, &data, &len, rblock);
 
