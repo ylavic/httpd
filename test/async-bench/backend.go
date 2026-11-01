@@ -1,4 +1,5 @@
-// Benchmark backend: GET /?d=MS sleeps MS milliseconds, answers 512 bytes.
+// Benchmark backend: GET /?d=MS[&st=STATUS] sleeps MS milliseconds, answers
+// 512 bytes (with STATUS, 200 by default).
 // A request with "Upgrade: echo" gets a 101 and then its bytes echoed back
 // (the tunnels of tunnelgen). GET /?s=BYTES[&c=CHUNK][&i=US] answers BYTES
 // written CHUNK bytes at a time (64KB by default), each flushed, with US
@@ -77,6 +78,9 @@ func main() {
 			time.Sleep(time.Duration(d) * time.Millisecond)
 		}
 		w.Header().Set("Content-Length", "512")
+		if st, err := strconv.Atoi(r.URL.Query().Get("st")); err == nil && st >= 200 {
+			w.WriteHeader(st)
+		}
 		w.Write(body)
 	})
 	srv := &http.Server{Addr: *addr}

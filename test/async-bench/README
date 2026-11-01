@@ -88,6 +88,9 @@ checks/async-*-check.py PREFIX WORKDIR
   fcgibackend: waits on few threads, timeout=, large streamed responses,
   request bodies, the backend closing early or down, pipelined requests,
   backend keep-alive with disablereuse=off, flushes (flushpackets=on) and an
-  error's ErrorDocument after an async wait to clients that stop reading).
+  error's ErrorDocument after an async wait to clients that stop reading),
+  redirect (an ErrorDocument proxied over http and fcgi: internally
+  redirected requests don't suspend; and after an async wait, proxied to the
+  same backend reusing its connection).
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).
