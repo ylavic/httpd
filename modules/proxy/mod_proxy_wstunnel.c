@@ -342,6 +342,7 @@ static int proxy_wstunnel_handler(request_rec *r, proxy_worker *worker,
     if (status != OK) {
         goto cleanup;
     }
+    ap_proxy_hold_connection(r, backend);
 
     backend->is_ssl = is_ssl;
 

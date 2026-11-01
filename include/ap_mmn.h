@@ -790,11 +790,15 @@
  *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
  *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
  *                         ap_proxy_tunnel_run_ex(),
- *                         ap_proxy_wait_continuation_fn
- *                         and ap_proxy_wait() to
+ *                         ap_proxy_wait_continuation_fn,
+ *                         ap_proxy_wait(),
+ *                         ap_proxy_scheme_handler_fn
+ *                         and ap_proxy_acquire_connection_async() to
  *                         mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained() to http_core.h
+ * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and
+ *                         proxy_conn_rec->holder to mod_proxy.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -802,7 +806,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 6     /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 7     /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

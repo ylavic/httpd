@@ -101,6 +101,12 @@ struct proxy_req_async {
     struct proxy_handler_ctx *handler;  /* proxy_handler() suspended, see
                                          * ap_proxy_handler_resume() */
     struct proxy_wait_ctx *wait;        /* ap_proxy_wait() */
+    struct proxy_acquire_wait *acquire; /* waiting for a connection, see
+                                         * ap_proxy_acquire_connection_async() */
+    proxy_conn_rec *held;               /* acquired by the request and not
+                                         * released yet, see
+                                         * ap_proxy_hold_connection() */
+    int held_cleanup;                   /* its r->pool cleanup is registered */
 };
 
 /*

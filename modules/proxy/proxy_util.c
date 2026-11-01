@@ -1706,6 +1706,12 @@ static void connection_cleanup(void *theconn)
         return;
     }
 
+    /* Not held by its request anymore */
+    if (conn->holder) {
+        conn->holder->held = NULL;
+        conn->holder = NULL;
+    }
+
     /* Not registered in the MPM for this connection anymore */
     release_kept_pfd(conn);
 
@@ -7084,6 +7090,204 @@ PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
                   "proxy: waiting for the %s (async)",
                   proxy_wait_direction_names[direction]);
     return SUSPENDED;
+}
+
+/* A request waiting for a backend connection from an exhausted pool
+ * (ap_proxy_acquire_connection_async()), with what it needs to run the
+ * scheme handler again.
+ */
+typedef struct proxy_acquire_wait {
+    ap_proxy_conn_pool_waiter *waiter;
+    ap_mpm_notifier_t *notifier;  /* The MPM's notifier of the current wait */
+    apr_pool_t *wait_pool;
+    ap_proxy_scheme_handler_fn *handler;
+    proxy_worker *worker;
+    proxy_server_conf *conf;
+    char *url;
+    const char *proxyname;
+    apr_port_t proxyport;
+} proxy_acquire_wait_t;
+
+/* Called by the pool when a connection is released for the waiter (from any
+ * thread, under the pool's lock): notify the wait in the MPM.
+ */
+static void proxy_acquire_released(void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+
+    ap_mpm_notify(aw->notifier);
+}
+
+/* The continuation of ap_proxy_acquire_connection_async(), called when a
+ * connection was released to the pool (or on timeout or error): run the
+ * scheme handler again, which acquires from the start.
+ */
+static void proxy_acquire_continuation(conn_rec *c, request_rec *r,
+                                       ap_mpm_wait_result_e why,
+                                       const apr_array_header_t *pfds,
+                                       void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+    int status;
+
+    if (why != AP_MPM_WAIT_NOTIFIED) {
+        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy: %s waiting for a connection to (%s:%d) "
+                      "(async, %i)",
+                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
+                      aw->worker->s->hostname_ex, (int)aw->worker->s->port,
+                      (int)why);
+        ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
+        return;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: connection to (%s:%d) available (async)",
+                  aw->worker->s->hostname_ex, (int)aw->worker->s->port);
+    status = aw->handler(r, aw->worker, aw->conf, aw->url,
+                         aw->proxyname, aw->proxyport);
+    if (status == SUSPENDED) {
+        return; /* waiting again (for the pool, or in a later step) */
+    }
+    ap_proxy_handler_done(r, status);
+}
+
+/* The request is gone (its pool cleaned up) without releasing the connection
+ * it holds, e.g. suspended when its connection is killed or the child exits:
+ * close the connection and give it back to the worker, unless the worker's
+ * connection pool is being destroyed (worker->cp NULL). Closing is required,
+ * the connection's filters use the client connection's bucket allocator, that
+ * goes with it.
+ */
+static apr_status_t proxy_held_cleanup(void *baton)
+{
+    struct proxy_req_async *ra = baton;
+    proxy_conn_rec *conn = ra->held;
+
+    ra->held_cleanup = 0;
+    if (!conn) {
+        return APR_SUCCESS;
+    }
+    ra->held = NULL;
+    conn->holder = NULL;
+    if (conn->worker->cp && !conn->inreslist) {
+        ap_log_perror(APLOG_MARK, APLOG_DEBUG, 0, conn->pool, APLOGNO()
+                      "proxy: releasing the connection to (%s:%d) held by a "
+                      "request gone without releasing it",
+                      conn->worker->s->hostname_ex,
+                      (int)conn->worker->s->port);
+        conn->close = 1;
+        connection_cleanup(conn);
+    }
+    return APR_SUCCESS;
+}
+
+PROXY_DECLARE(void) ap_proxy_hold_connection(request_rec *r,
+                                             proxy_conn_rec *conn)
+{
+    struct proxy_req_async *ra = ap_proxy_req_async(r);
+
+    ra->held = conn;
+    conn->holder = ra;
+    if (!ra->held_cleanup) {
+        apr_pool_cleanup_register(r->pool, ra, proxy_held_cleanup,
+                                  apr_pool_cleanup_null);
+        ra->held_cleanup = 1;
+    }
+}
+
+static int proxy_acquire_async(const char *proxy_function,
+                               proxy_conn_rec **conn,
+                               request_rec *r,
+                               ap_proxy_scheme_handler_fn *handler,
+                               proxy_worker *worker,
+                               proxy_server_conf *conf,
+                               char *url,
+                               const char *proxyname,
+                               apr_port_t proxyport)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+    struct proxy_req_async *ra;
+    proxy_acquire_wait_t *aw;
+    apr_status_t rv;
+    int status;
+
+    if (dconf->async_delay < 0 || !proxy_can_suspend(r)) {
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+
+    /* Reuse this request's waiter, if any (not queued anymore) */
+    ra = ap_proxy_req_async(r);
+    aw = ra->acquire;
+    if (!aw) {
+        aw = apr_pcalloc(r->pool, sizeof(*aw));
+        aw->waiter = ap_proxy_conn_pool_waiter_make(r->pool,
+                                                    proxy_acquire_released,
+                                                    aw);
+        ra->acquire = aw;
+    }
+    aw->handler = handler;
+    aw->worker = worker;
+    aw->conf = conf;
+    aw->url = url;
+    aw->proxyname = proxyname;
+    aw->proxyport = proxyport;
+
+    /* A new notifier for the wait, created before the waiter is queued: a
+     * connection released before the wait is armed completes it once armed.
+     */
+    if (aw->wait_pool) {
+        apr_pool_clear(aw->wait_pool);
+    }
+    else {
+        apr_pool_create(&aw->wait_pool, r->pool);
+    }
+    rv = ap_mpm_notifier_create(&aw->notifier, r->connection, aw->wait_pool);
+    if (rv != APR_SUCCESS) {
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+
+    status = ap_proxy_acquire_connection_ex(proxy_function, conn, worker,
+                                            r->server, aw->waiter);
+    if (status != SUSPENDED) {
+        return status;
+    }
+
+    rv = ap_mpm_register_wait(r->connection, aw->wait_pool, NULL,
+                              worker->s->acquire_set ? worker->s->acquire
+                                                       : r->server->timeout,
+                              aw->notifier, 0, proxy_acquire_continuation, aw);
+    if (rv != APR_SUCCESS) {
+        ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: waiting for a connection to (%s:%d) (async)",
+                  worker->s->hostname_ex, (int)worker->s->port);
+    return SUSPENDED;
+}
+
+PROXY_DECLARE(int) ap_proxy_acquire_connection_async(const char *proxy_function,
+                                                     proxy_conn_rec **conn,
+                                                     request_rec *r,
+                                                     ap_proxy_scheme_handler_fn *handler,
+                                                     proxy_worker *worker,
+                                                     proxy_server_conf *conf,
+                                                     char *url,
+                                                     const char *proxyname,
+                                                     apr_port_t proxyport)
+{
+    int status = proxy_acquire_async(proxy_function, conn, r, handler, worker,
+                                     conf, url, proxyname, proxyport);
+    if (status == OK) {
+        ap_proxy_hold_connection(r, *conn);
+    }
+    return status;
 }
 
 PROXY_DECLARE (const char *) ap_proxy_show_hcmethod(hcmethod_t method)

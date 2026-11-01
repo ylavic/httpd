@@ -297,6 +297,9 @@ typedef struct {
     apr_pool_t   *uds_pool;     /* Subpool for reusing UDS paths */
     apr_pool_t   *fwd_pool;     /* Subpool for reusing ProxyRemote infos */
     struct proxy_address *address; /* Current remote address */
+    /* The asynchronous state of the request holding the connection, from
+     * ap_proxy_hold_connection() to the release */
+    struct proxy_req_async *holder;
 } proxy_conn_rec;
 
 typedef struct {
@@ -1225,6 +1228,60 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
  */
 PROXY_DECLARE(void) ap_proxy_cancel_conn_pool_waiter(proxy_worker *worker,
                                                      ap_proxy_conn_pool_waiter *waiter);
+
+/* A scheme handler (the scheme_handler hook's signature) */
+typedef int ap_proxy_scheme_handler_fn(request_rec *r, proxy_worker *worker,
+                                       proxy_server_conf *conf, char *url,
+                                       const char *proxyname,
+                                       apr_port_t proxyport);
+
+/**
+ * Acquire a connection from the worker's connection pool for a scheme
+ * handler, without blocking on an exhausted pool when possible: the request
+ * then waits in the MPM for a connection to be released (or the worker's
+ * acquire= timeout, else the server's Timeout), and the scheme handler runs
+ * again with the same arguments, to acquire from the start.
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn      acquired connection
+ * @param r         the request
+ * @param handler   the scheme handler to run again (called with r and the
+ *                  next arguments), whose status finishes the request
+ *                  (ap_proxy_handler_done()) unless SUSPENDED
+ * @param worker    worker used for obtaining connection
+ * @param conf      the handler's conf
+ * @param url       the handler's url (unchanged by the handler before)
+ * @param proxyname the handler's proxyname
+ * @param proxyport the handler's proxyport
+ * @return          OK, SUSPENDED if waiting asynchronously (the scheme
+ *                  handler returns SUSPENDED), or HTTP_XXX error; it blocks
+ *                  as ap_proxy_acquire_connection() does when the request
+ *                  can't be suspended (ProxyAsyncDelay -1, the MPM can't
+ *                  wait, a subrequest or an HTTP/2 stream)
+ * @remark A timeout finishes the request with HTTP_SERVICE_UNAVAILABLE.
+ */
+PROXY_DECLARE(int) ap_proxy_acquire_connection_async(const char *proxy_function,
+                                                     proxy_conn_rec **conn,
+                                                     request_rec *r,
+                                                     ap_proxy_scheme_handler_fn *handler,
+                                                     proxy_worker *worker,
+                                                     proxy_server_conf *conf,
+                                                     char *url,
+                                                     const char *proxyname,
+                                                     apr_port_t proxyport);
+/**
+ * Make the request the holder of a connection it acquired, whose end is the
+ * release of the connection (ap_proxy_release_connection()). Done by
+ * ap_proxy_acquire_connection_async() already, for the users of the blocking
+ * ap_proxy_acquire_connection() running (or suspended) in a request.
+ * @param r       the request using the connection
+ * @param conn    acquired connection
+ * @note If the pool of the request goes while it still holds the connection
+ *       (e.g. the request is suspended when its connection is killed, or the
+ *       child exits), the connection is closed and released to the worker.
+ */
+PROXY_DECLARE(void) ap_proxy_hold_connection(request_rec *r,
+                                             proxy_conn_rec *conn);
+
 /**
  * Release a connection back to worker connection pool
  * @param proxy_function calling proxy scheme (http, ajp, ...)

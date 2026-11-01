@@ -388,7 +388,6 @@ typedef struct {
     proxy_http_req_t *req;              /* The current attempt, if any */
     apr_bucket_brigade *input;          /* The request body read so far */
     struct proxy_http_preread *preread; /* See proxy_http_request_preread() */
-    struct proxy_http_acquire *acquire; /* See proxy_http_acquire() */
 } proxy_http_rctx_t;
 
 /* Get (or create) the request's proxy_http_rctx_t */
@@ -3342,65 +3341,6 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
                               char *url, const char *proxyname,
                               apr_port_t proxyport);
 
-/* A request waiting for a backend connection from an exhausted pool
- * (proxy_http_acquire()), with what it needs to run the handler again.
- */
-typedef struct proxy_http_acquire {
-    ap_proxy_conn_pool_waiter *waiter;
-    ap_mpm_notifier_t *notifier;  /* The MPM's notifier of the current wait */
-    apr_pool_t *wait_pool;
-    proxy_worker *worker;
-    proxy_server_conf *conf;
-    char *url;
-    const char *proxyname;
-    apr_port_t proxyport;
-} proxy_http_acquire_t;
-
-/* Called by the pool when a connection is released for the waiter (from any
- * thread, under the pool's lock): notify the wait in the MPM.
- */
-static void proxy_http_acquire_released(void *baton)
-{
-    proxy_http_acquire_t *aw = baton;
-
-    ap_mpm_notify(aw->notifier);
-}
-
-/* The continuation of proxy_http_acquire(), called when a connection was
- * released to the pool (or on timeout or error): run the handler again,
- * which acquires from the start.
- */
-static void proxy_http_acquire_continuation(conn_rec *c, request_rec *r,
-                                            ap_mpm_wait_result_e why,
-                                            const apr_array_header_t *pfds,
-                                            void *baton)
-{
-    proxy_http_acquire_t *aw = baton;
-    int status;
-
-    if (why != AP_MPM_WAIT_NOTIFIED) {
-        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
-                      "proxy: %s waiting for a connection to (%s:%d) "
-                      "(async, %i)",
-                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
-                      aw->worker->s->hostname_ex, (int)aw->worker->s->port,
-                      (int)why);
-        ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
-        return;
-    }
-
-    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                  "proxy: connection to (%s:%d) available (async)",
-                  aw->worker->s->hostname_ex, (int)aw->worker->s->port);
-    status = proxy_http_handler(r, aw->worker, aw->conf, aw->url,
-                                aw->proxyname, aw->proxyport);
-    if (status == SUSPENDED) {
-        return; /* waiting again (for the pool, or in a later step) */
-    }
-    ap_proxy_handler_done(r, status);
-}
-
 /* A request whose body is read before acquiring a backend connection
  * (proxy_http_request_preread()), with what it needs to run the handler again.
  */
@@ -3624,77 +3564,6 @@ static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
     return SUSPENDED;
 }
 
-/* Acquire a backend connection, without blocking on an exhausted pool when
- * waiting asynchronously is possible (ProxyAsyncDelay): the request then
- * waits in the MPM for a connection to be released (the pool wakes up its
- * waiter, which notifies the wait from the releasing thread), and
- * the handler runs again. Returns OK, SUSPENDED, or an HTTP error.
- */
-static int proxy_http_acquire(request_rec *r, proxy_conn_rec **backend,
-                              const char *scheme, proxy_worker *worker,
-                              proxy_server_conf *conf, proxy_dir_conf *dconf,
-                              char *url, const char *proxyname,
-                              apr_port_t proxyport)
-{
-    proxy_http_rctx_t *rctx;
-    proxy_http_acquire_t *aw;
-    apr_status_t rv;
-    int status;
-
-    if (!proxy_http_can_suspend(r, dconf)) {
-        return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
-    }
-
-    /* Reuse this request's waiter, if any (not queued anymore) */
-    rctx = proxy_http_rctx(r);
-    aw = rctx->acquire;
-    if (!aw) {
-        aw = apr_pcalloc(r->pool, sizeof(*aw));
-        aw->waiter = ap_proxy_conn_pool_waiter_make(r->pool,
-                                                    proxy_http_acquire_released,
-                                                    aw);
-        rctx->acquire = aw;
-    }
-    aw->worker = worker;
-    aw->conf = conf;
-    aw->url = url;
-    aw->proxyname = proxyname;
-    aw->proxyport = proxyport;
-
-    /* A new notifier for the wait, created before the waiter is queued: a
-     * connection released before the wait is armed wakes it up once armed.
-     */
-    if (aw->wait_pool) {
-        apr_pool_clear(aw->wait_pool);
-    }
-    else {
-        apr_pool_create(&aw->wait_pool, r->pool);
-    }
-    rv = ap_mpm_notifier_create(&aw->notifier, r->connection, aw->wait_pool);
-    if (rv != APR_SUCCESS) {
-        return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
-    }
-
-    status = ap_proxy_acquire_connection_ex(scheme, backend, worker,
-                                            r->server, aw->waiter);
-    if (status != SUSPENDED) {
-        return status;
-    }
-
-    rv = ap_mpm_register_wait(r->connection, aw->wait_pool, NULL,
-                              worker->s->acquire_set ? worker->s->acquire
-                                                       : r->server->timeout,
-                              aw->notifier, 0, proxy_http_acquire_continuation, aw);
-    if (rv != APR_SUCCESS) {
-        ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
-        return ap_proxy_acquire_connection(scheme, backend, worker, r->server);
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                  "proxy: waiting for a connection to (%s:%d) (async)",
-                  worker->s->hostname_ex, (int)worker->s->port);
-    return SUSPENDED;
-}
-
 /*
  * This handles http:// URLs, and other URLs using a remote proxy over http
  * If proxyhost is NULL, then contact the server directly, otherwise
@@ -3763,11 +3632,13 @@ static int proxy_http_handler(request_rec *r, proxy_worker *worker,
     }
 
     /* create space for state information. On SUSPENDED we wait for a
-     * connection, and the handler runs again from
-     * proxy_http_acquire_continuation().
+     * connection, and the handler runs again once one is released.
      */
-    if ((status = proxy_http_acquire(r, &backend, scheme, worker, conf, dconf,
-                                     url, proxyname, proxyport)) != OK) {
+    if ((status = ap_proxy_acquire_connection_async(scheme, &backend, r,
+                                                    proxy_http_handler,
+                                                    worker, conf, url,
+                                                    proxyname,
+                                                    proxyport)) != OK) {
         return status;
     }
     backend->is_ssl = is_ssl;
