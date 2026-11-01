@@ -1230,8 +1230,9 @@ static int proxy_needsdomain(request_rec *r, const char *url, const char *domain
 /* -------------------------------------------------------------- */
 /* Invoke handler */
 
-/* The state of proxy_handler()'s worker loop, kept when a scheme handler
- * suspends the request (SUSPENDED) until it calls ap_proxy_handler_resume().
+/* The state of proxy_handler()'s worker loop, kept when a scheme handler or
+ * a pre_request hook suspends the request (SUSPENDED) until it calls
+ * ap_proxy_handler_resume().
  */
 typedef struct proxy_handler_ctx {
     char *uri;
@@ -1242,6 +1243,7 @@ typedef struct proxy_handler_ctx {
     int attempts, max_attempts;
     int direct_connect;
     int via_proxy; /* suspended while trying a ProxyRemote */
+    int pre_request; /* suspended by a pre_request hook */
 } proxy_handler_ctx;
 
 static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
@@ -1407,7 +1409,9 @@ static int proxy_handler(request_rec *r)
  * on it, fail over to another one (balancer) if needed, and run the
  * post_request hooks once done. If the scheme handler suspends the request,
  * the loop is resumed by ap_proxy_handler_resume() with the status of the
- * attempt (resumed != 0), as if the scheme handler had returned it.
+ * attempt (resumed != 0), as if the scheme handler had returned it. If a
+ * pre_request hook suspends it, the loop is resumed there: with OK the hooks
+ * run again, otherwise the status is taken as theirs.
  */
 static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
                              int resumed, int access_status)
@@ -1421,10 +1425,18 @@ static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
     proxy_worker *worker = x->worker;
     int attempts = x->attempts, max_attempts = x->max_attempts;
     int direct_connect = x->direct_connect;
+    char *url = uri;
     const char *p2;
     int i, saved_status;
 
     if (resumed) {
+        if (x->pre_request) {
+            x->pre_request = 0;
+            if (access_status == OK) {
+                goto pre_request;
+            }
+            goto pre_request_done;
+        }
         if (x->via_proxy) {
             /* No fallback to a direct connection after an async attempt
              * through a ProxyRemote (yet).
@@ -1435,9 +1447,15 @@ static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
     }
 
     do {
-        char *url = uri;
+pre_request:
+        url = uri;
         /* Try to obtain the most suitable worker */
         access_status = ap_proxy_pre_request(&worker, &balancer, r, conf, &url);
+pre_request_done:
+        if (access_status == SUSPENDED) {
+            x->pre_request = 1;
+            goto suspended;
+        }
         if (access_status != OK) {
             /*
              * Only return if access_status is not HTTP_SERVICE_UNAVAILABLE
@@ -1630,8 +1648,8 @@ cleanup:
     return access_status;
 
 suspended:
-    /* The scheme handler continues asynchronously, and calls
-     * ap_proxy_handler_resume() with its status once done.
+    /* The scheme handler (or pre_request hook) continues asynchronously, and
+     * calls ap_proxy_handler_resume() with its status once done.
      */
     x->balancer = balancer;
     x->worker = worker;

@@ -6738,6 +6738,14 @@ static int proxy_can_suspend(request_rec *r)
     return (mpm_can_wait && !r->main && !r->prev && !r->connection->master);
 }
 
+PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+
+    return (dconf->async_delay >= 0 && proxy_can_suspend(r));
+}
+
 /* The state of a tunnel run by ap_proxy_tunnel_run_ex() */
 typedef struct {
     proxy_tunnel_rec *tunnel;
@@ -6981,7 +6989,7 @@ PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
     int pending = 0, ready = 0;
     apr_status_t rv;
 
-    if (dconf->async_delay < 0 || !proxy_can_suspend(r)) {
+    if (!ap_proxy_request_can_suspend(r)) {
         return DECLINED;
     }
 
@@ -7207,14 +7215,12 @@ static int proxy_acquire_async(const char *proxy_function,
                                const char *proxyname,
                                apr_port_t proxyport)
 {
-    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
-                                                 &proxy_module);
     struct proxy_req_async *ra;
     proxy_acquire_wait_t *aw;
     apr_status_t rv;
     int status;
 
-    if (dconf->async_delay < 0 || !proxy_can_suspend(r)) {
+    if (!ap_proxy_request_can_suspend(r)) {
         return ap_proxy_acquire_connection(proxy_function, conn, worker,
                                            r->server);
     }

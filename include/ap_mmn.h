@@ -792,9 +792,9 @@
  *                         ap_proxy_tunnel_run_ex(),
  *                         ap_proxy_wait_continuation_fn,
  *                         ap_proxy_wait(),
- *                         ap_proxy_scheme_handler_fn
- *                         and ap_proxy_acquire_connection_async() to
- *                         mod_proxy.h;
+ *                         ap_proxy_scheme_handler_fn,
+ *                         ap_proxy_acquire_connection_async() and
+ *                         ap_proxy_request_can_suspend() to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained() to http_core.h
  * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and

@@ -698,7 +698,8 @@ PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, detach_backend,
  * and corresponding balancer.
  * The url is rewritten from balancer://cluster/uri to scheme://host:port/uri
  * and then the scheme_handler is called.
- *
+ * It may return SUSPENDED (e.g. waiting for a usable worker), see
+ * ap_proxy_handler_resume().
  */
 APR_DECLARE_EXTERNAL_HOOK(proxy, PROXY, int, pre_request,
                           (proxy_worker **worker, proxy_balancer **balancer,
@@ -1063,7 +1064,8 @@ PROXY_DECLARE(int) ap_proxy_fixup_uds_filename(request_rec *r);
  * @param r        current request
  * @param conf     current proxy server configuration
  * @param url      request url that balancer can rewrite.
- * @return         OK or  HTTP_XXX error
+ * @return         OK, SUSPENDED (a hook waits asynchronously), or HTTP_XXX
+ *                 error
  * @note It calls balancer pre_request hook if the url starts with balancer://
  * The balancer then rewrites the url to particular worker, like http://host:port
  */
@@ -1099,8 +1101,22 @@ PROXY_DECLARE(int) ap_proxy_post_request(proxy_worker *worker,
  * failing over to another balancer member on recoverable errors, then
  * running the post_request hooks. It returns the status as is when the
  * request was not suspended by proxy_handler().
+ * @note A pre_request hook that returned SUSPENDED calls it (or rather
+ * ap_proxy_handler_done()) once done waiting: with OK proxy_handler() runs
+ * the pre_request hooks again, otherwise status is taken as theirs.
  */
 PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
+
+/**
+ * Whether a request can be suspended to wait asynchronously
+ * (ap_mpm_register_wait()): unless ProxyAsyncDelay is -1, when the MPM can
+ * wait, but not for a subrequest nor an internally redirected request
+ * (their caller goes on once the handler returns), nor for an HTTP/2
+ * stream's connection.
+ * @param r  the request
+ * @return   non-zero if it can
+ */
+PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r);
 
 /**
  * Finish a request that a scheme handler suspended (returned SUSPENDED for),
