@@ -24,9 +24,18 @@
 
 APR_RING_HEAD(fd_queue_ring, fd_queue_elem_t);
 
+/* The queue has one or more lanes (ap_queue_set_lanes()), popped by weighted
+ * round-robin: up to lane_weight[] elements from the current lane before the
+ * next non-empty one, in lanes order.
+ */
+#define QUEUE_MAX_LANES 8
+
 struct fd_queue_t
 {
-    struct fd_queue_ring elts;
+    struct fd_queue_ring elts[QUEUE_MAX_LANES];
+    /*atomic*/ apr_uint32_t lane_nelts[QUEUE_MAX_LANES];
+    unsigned int lane_weight[QUEUE_MAX_LANES];
+    unsigned int nlanes, cur_lane, cur_credit;
     apr_uint32_t nelts;
     apr_uint32_t bounds;
     apr_pool_t *spare_pool;
@@ -65,6 +74,7 @@ struct fd_queue_elem_t
     sock_event_t self_sock_event;
     ap_queue_event_t self_event;
     ap_queue_event_t *event;
+    unsigned int lane;
 };
 
 static apr_status_t queue_info_cleanup(void *qi)
@@ -381,7 +391,9 @@ AP_DECLARE(apr_status_t) ap_queue_create(fd_queue_t **pqueue, int capacity,
     }
 
     apr_pool_create(&queue->spare_pool, p);
-    APR_RING_INIT(&queue->elts, fd_queue_elem_t, link);
+    APR_RING_INIT(&queue->elts[0], fd_queue_elem_t, link);
+    queue->nlanes = 1;
+    queue->lane_weight[0] = queue->cur_credit = 1;
     if (capacity > 0) {
         queue->bounds = capacity;
     }
@@ -391,6 +403,54 @@ AP_DECLARE(apr_status_t) ap_queue_create(fd_queue_t **pqueue, int capacity,
 
     *pqueue = queue;
     return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_status_t) ap_queue_set_lanes(fd_queue_t *queue,
+                                            unsigned int nlanes,
+                                            const unsigned int *weights)
+{
+    unsigned int i;
+
+    if (!nlanes || nlanes > QUEUE_MAX_LANES || queue->nelts) {
+        return APR_EINVAL;
+    }
+    for (i = 0; i < nlanes; i++) {
+        if (!weights[i]) {
+            return APR_EINVAL;
+        }
+    }
+    for (i = 0; i < nlanes; i++) {
+        APR_RING_INIT(&queue->elts[i], fd_queue_elem_t, link);
+        queue->lane_nelts[i] = 0;
+        queue->lane_weight[i] = weights[i];
+    }
+    queue->nlanes = nlanes;
+    queue->cur_lane = 0;
+    queue->cur_credit = weights[0];
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_uint32_t) ap_queue_lane_nelts(fd_queue_t *queue,
+                                             unsigned int lane)
+{
+    /* Unlocked, see enqueue_elem() and dequeue_elem() */
+    return (lane < queue->nlanes) ? apr_atomic_read32(&queue->lane_nelts[lane])
+                                  : 0;
+}
+
+AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
+                                               unsigned int lane)
+{
+    apr_time_t when = 0;
+
+    if (lane < queue->nlanes && queue_lock(queue) == APR_SUCCESS) {
+        if (queue->lane_nelts[lane]) {
+            fd_queue_elem_t *elem = APR_RING_FIRST(&queue->elts[lane]);
+            when = elem->event->queued_at;
+        }
+        queue_unlock(queue);
+    }
+    return when;
 }
 
 static APR_INLINE fd_queue_elem_t *get_spare_elem(fd_queue_t *queue)
@@ -424,7 +484,18 @@ static APR_INLINE void enqueue_elem(fd_queue_t *queue, fd_queue_elem_t *elem,
     }
     elem->event->elem = elem;
 
-    APR_RING_INSERT_TAIL(&queue->elts, elem, fd_queue_elem_t, link);
+    /* The lane of the event's class, if any */
+    elem->lane = 0;
+    if (elem->event->qclass > 0 && (unsigned int)elem->event->qclass < queue->nlanes) {
+        elem->lane = elem->event->qclass;
+    }
+    APR_RING_INSERT_TAIL(&queue->elts[elem->lane], elem, fd_queue_elem_t,
+                         link);
+    /* Read without the lock by ap_queue_lane_nelts(): atomic stores, though
+     * the lock serializes the updates
+     */
+    apr_atomic_set32(&queue->lane_nelts[elem->lane],
+                     queue->lane_nelts[elem->lane] + 1);
     queue->nelts++;
 }
 
@@ -432,9 +503,32 @@ static APR_INLINE void dequeue_elem(fd_queue_t *queue, fd_queue_elem_t *elem)
 {
     elem->event->elem = NULL;
     ap_assert(queue->nelts > 0);
+    ap_assert(queue->lane_nelts[elem->lane] > 0);
     APR_RING_REMOVE(elem, link);
     APR_RING_ELEM_INIT(elem, link);
+    apr_atomic_set32(&queue->lane_nelts[elem->lane],
+                     queue->lane_nelts[elem->lane] - 1);
     queue->nelts--;
+}
+
+/* The next element to pop (the queue is not empty): weighted round-robin
+ * among the lanes, the current one until its credit (weight) is used or it
+ * is empty, then the next non-empty one with a new credit.
+ */
+static APR_INLINE fd_queue_elem_t *next_elem(fd_queue_t *queue)
+{
+    unsigned int i;
+
+    for (i = 0; i <= queue->nlanes; i++) {
+        if (queue->lane_nelts[queue->cur_lane] && queue->cur_credit) {
+            queue->cur_credit--;
+            return APR_RING_FIRST(&queue->elts[queue->cur_lane]);
+        }
+        queue->cur_lane = (queue->cur_lane + 1) % queue->nlanes;
+        queue->cur_credit = queue->lane_weight[queue->cur_lane];
+    }
+    ap_assert(0); /* not reached with nelts > 0 */
+    return NULL;
 }
 
 /* Pushes the last available element to the queue. Also once terminated: the
@@ -469,7 +563,7 @@ static apr_status_t pop_elem(fd_queue_t *queue, fd_queue_elem_t **pelem)
 
     for (;;) {
         if (!queue_empty(queue)) {
-            *pelem = APR_RING_FIRST(&queue->elts);
+            *pelem = next_elem(queue);
             dequeue_elem(queue, *pelem);
             return APR_SUCCESS;
         }

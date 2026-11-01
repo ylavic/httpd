@@ -120,6 +120,20 @@ typedef struct ap_queue_event_t ap_queue_event_t;
 
 AP_DECLARE(apr_status_t) ap_queue_create(fd_queue_t **pqueue, int capacity,
                                          apr_pool_t *p);
+/* Use nlanes lanes (up to 8), popped by weighted round-robin with the given
+ * weights (> 0, in lanes order); an event goes to the lane of its qclass
+ * (lane 0 if out of range, sockets too). To call once, before the queue is
+ * used by other threads.
+ */
+AP_DECLARE(apr_status_t) ap_queue_set_lanes(fd_queue_t *queue,
+                                            unsigned int nlanes,
+                                            const unsigned int *weights);
+/* The number of elements in a lane (unlocked, for stats or heuristics) */
+AP_DECLARE(apr_uint32_t) ap_queue_lane_nelts(fd_queue_t *queue,
+                                             unsigned int lane);
+/* The queued_at of the oldest event in a lane, 0 if empty (locked) */
+AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
+                                               unsigned int lane);
 
 /* mpm_event API (queue of any event) */
 /* Don't wake up a waiting popper (the pusher pops the event itself) */

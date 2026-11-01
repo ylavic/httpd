@@ -152,8 +152,15 @@
 #define MAX_THREAD_LIMIT 100000
 #endif
 
+/* The admission's backstop: how many new connections can wait for a worker,
+ * per worker thread. From 16 the waiting time decides when to stop accepting,
+ * even under a flood of new connections (for requests of about a millisecond
+ * or more; below, the backstop does first and only toggles the accepting more
+ * often), while what a child holds for them stays cheap: a pool and a socket
+ * each (e.g. 400 for 25 threads).
+ */
 #ifndef DEFAULT_ASYNC_FACTOR
-#define DEFAULT_ASYNC_FACTOR 2.0
+#define DEFAULT_ASYNC_FACTOR 16.0
 #endif
 
 #ifndef MAX_SPARE_THREADS_RATIO
@@ -190,6 +197,12 @@
 
 /* Update scoreboard stats at this period */
 #define STATS_UPDATE_TIMEOUT    apr_time_from_msec(1000)
+
+/* While not accepting for the limits, re-check them at this period: a
+ * backstop against a lost wake only, the workers and the closes waking up
+ * the listener when it should accept again.
+ */
+#define ACCEPT_RECHECK_TIMEOUT  apr_time_from_sec(1)
 
 /* Prevent extra poll/wakeup calls for timeouts close in the future (queues
  * have the granularity of a second anyway).
@@ -865,12 +878,153 @@ static backlog_stats_t backlog_stats[BACKLOG_CLASSES];
  */
 static int backlog_stats_on;
 
+/* The classes are also the lanes of the workers' queue, popped by weighted
+ * round-robin with these weights, in this order: work in progress first,
+ * then the connections that were waiting for the client, then the new ones,
+ * every class keeping a share (no starvation). Only the ratios matter; not
+ * tuned yet.
+ */
+#define BACKLOG_WEIGHT_PROGRESS 4
+#define BACKLOG_WEIGHT_WAITING  2
+#define BACKLOG_WEIGHT_NEW      1
+static const unsigned int backlog_class_weights[BACKLOG_CLASSES] = {
+    BACKLOG_WEIGHT_PROGRESS, /* timer */
+    BACKLOG_WEIGHT_PROGRESS, /* continuation */
+    BACKLOG_WEIGHT_PROGRESS, /* write */
+    BACKLOG_WEIGHT_PROGRESS, /* linger */
+    BACKLOG_WEIGHT_WAITING,  /* waitio */
+    BACKLOG_WEIGHT_WAITING,  /* keepalive */
+    BACKLOG_WEIGHT_NEW       /* new */
+};
+
+/* The sojourn admission (CoDel-like): stop accepting when the waits of the
+ * new connections for a worker have stayed above the target for the
+ * interval; any wait at or below the target, or no new connection waiting,
+ * resets it. The waits are those of the new connections taken by a worker,
+ * and that of the oldest one still waiting (so blocked workers count too).
+ * The target and interval (ms) can be changed at build time.
+ */
+#ifndef AP_EVENT_ADMISSION_TARGET
+#define AP_EVENT_ADMISSION_TARGET 5
+#endif
+#ifndef AP_EVENT_ADMISSION_INTERVAL
+#define AP_EVENT_ADMISSION_INTERVAL 100
+#endif
+static const apr_time_t admission_target =
+    apr_time_from_msec(AP_EVENT_ADMISSION_TARGET);
+static const apr_time_t admission_interval =
+    apr_time_from_msec(AP_EVENT_ADMISSION_INTERVAL);
+
+/* Since when the new connections' waits are above the target, 0 when below:
+ * written without a lock by the workers (admission_sample(), for each new
+ * connection they take), read by any thread (admission_above_target()). A
+ * lost update only shifts the start of the interval by a sample (it's a
+ * heuristic); the store of a 64-bit apr_time_t is single on 64-bit
+ * platforms, but can tear on 32-bit ones (one bogus refusal or delay at
+ * worst).
+ */
+static volatile apr_time_t admission_above_since;
+
+/* Called by the workers for each new connection they take: write only on
+ * changes, the line is read by all of them. The last new connection taken
+ * resets it too (none waiting).
+ */
+static void admission_sample(apr_time_t wait, apr_time_t now)
+{
+    if (wait <= admission_target
+        || !ap_queue_lane_nelts(worker_queue, BACKLOG_NEW)) {
+        if (admission_above_since) {
+            admission_above_since = 0;
+        }
+    }
+    else if (!admission_above_since) {
+        admission_above_since = now;
+    }
+}
+
+/* What admission_above_target() finds */
+#define ADMISSION_UNDER    0
+#define ADMISSION_SOJOURN  1 /* waits above the target for the interval */
+#define ADMISSION_BACKSTOP 2 /* more waiting than the workers' backlog limit */
+
+/* Whether the new connections waiting for a worker are above the admission's
+ * limits (ADMISSION_*), for any thread: it only reads the state, which
+ * changes where it's measured (admission_sample(), the worker queue's lane)
+ * or decided (listensocks_off).
+ *
+ * The waits are above the target since the workers' samples say, or since
+ * the oldest one still waiting (the lane's head) has waited longer than the
+ * target at least, which counts the blocked workers too.
+ *
+ * Hysteresis: once refusing, accept again only when the new connections are
+ * clearly back under (no wait above half the target nor count above half
+ * the backstop, or none waiting), so that floods don't toggle the listening
+ * sockets at the rate of the workers. A minimum time off as well would cost
+ * throughput (workers idle while connections wait in the kernel) for fewer
+ * toggles than this already avoids.
+ */
+static int admission_above_target(apr_time_t now)
+{
+    apr_time_t head = ap_queue_lane_head_time(worker_queue, BACKLOG_NEW);
+    apr_uint32_t count;
+    apr_time_t since;
+
+    if (!head) {
+        return ADMISSION_UNDER; /* no new connection waiting */
+    }
+    count = ap_queue_lane_nelts(worker_queue, BACKLOG_NEW);
+    if (apr_atomic_read32(&listensocks_off)) {
+        if (now - head > admission_target / 2) {
+            return ADMISSION_SOJOURN;
+        }
+        if (count > (apr_uint32_t)workers_backlog_limit / 2) {
+            return ADMISSION_BACKSTOP;
+        }
+        return ADMISSION_UNDER;
+    }
+    if (now - head > admission_target) {
+        since = admission_above_since;
+        if (!since || since > head + admission_target) {
+            since = head + admission_target;
+        }
+        if (now - since >= admission_interval) {
+            return ADMISSION_SOJOURN;
+        }
+    }
+    if (count > (apr_uint32_t)workers_backlog_limit) {
+        return ADMISSION_BACKSTOP;
+    }
+    return ADMISSION_UNDER;
+}
+
 /* Changed by the listener only (see above) */
 static apr_uint32_t listensocks_toggles;
 static apr_time_t listensocks_off_since, listensocks_off_time;
 
 /* The backlog's connections shut down for their timeout (listener only) */
 static apr_uint32_t backlog_dropped;
+
+static apr_time_t listensocks_suspended_at; /* the last stop, for its trace */
+
+/* The durations of the accept-offs that ended in the period, by slot like
+ * the sojourns (listener only)
+ */
+static apr_uint32_t accept_off_hist[BACKLOG_HIST_SLOTS], accept_off_ended,
+                    accept_off_max;
+
+/* What made the listener accept again (with the backlog stats): the wakes
+ * asking for it (wakeup_listener_by() the ACCEPT_WAKE_* flags of who woke
+ * it up, accumulated until the listener takes them), else the timeout of its
+ * backstop re-check (RECHECK_BACKSTOP), else anything else that woke it
+ * up. Counted by the listener only.
+ */
+#define ACCEPT_WAKE_WORKER (1u << 0) /* a worker took new ones or idled */
+#define ACCEPT_WAKE_CLOSE  (1u << 1) /* a connection was closed */
+static /*atomic*/ apr_uint32_t accept_wakes;
+static apr_uint32_t resumes_woken, resumes_recheck, resumes_other;
+
+/* The re-check whose timeout the listener's poll used, if any */
+#define RECHECK_BACKSTOP 1u /* ACCEPT_RECHECK_TIMEOUT, see listener_thread() */
 
 /* Account for an entry popped from the backlog (any thread) */
 static void backlog_stats_record(int qclass, apr_time_t sojourn)
@@ -919,6 +1073,25 @@ static apr_uint32_t backlog_hist_bound(const apr_uint32_t *hist,
     return (apr_uint32_t)1 << slot;
 }
 
+/* Account for an accept-off that ended (listener) */
+static void accept_off_record(apr_time_t duration)
+{
+    apr_uint32_t us;
+    int slot = 0;
+
+    us = (duration <= 0) ? 0
+       : (duration >= APR_UINT32_MAX) ? APR_UINT32_MAX
+       : (apr_uint32_t)duration;
+    while (slot < BACKLOG_HIST_SLOTS - 1 && (us >> slot)) {
+        slot++;
+    }
+    accept_off_hist[slot]++;
+    accept_off_ended++;
+    if (us > accept_off_max) {
+        accept_off_max = us;
+    }
+}
+
 /* Log the backlog stats of the last period and reset them (listener) */
 static void backlog_stats_report(apr_time_t now)
 {
@@ -960,9 +1133,20 @@ static void backlog_stats_report(apr_time_t now)
 
     ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
                  "backlog sojourn:%s; dropped %u; accept off %u times, %"
-                 APR_TIME_T_FMT "ms", len ? buf : " none", backlog_dropped,
-                 toggles, apr_time_as_msec(off));
+                 APR_TIME_T_FMT "ms,"
+                 " resumed woken %u recheck %u other %u; accept offs ended %u: p50<%uus,max=%uus",
+                 len ? buf : " none", backlog_dropped,
+                 toggles, apr_time_as_msec(off),
+                 resumes_woken, resumes_recheck, resumes_other,
+                 accept_off_ended,
+                 (accept_off_ended
+                  ? backlog_hist_bound(accept_off_hist, accept_off_ended, 50)
+                  : 0),
+                 accept_off_max);
+    resumes_woken = resumes_recheck = resumes_other = 0;
     backlog_dropped = 0;
+    memset(accept_off_hist, 0, sizeof(accept_off_hist));
+    accept_off_ended = accept_off_max = 0;
 }
 
 static int disable_listensocks(apr_time_t now)
@@ -974,7 +1158,7 @@ static int disable_listensocks(apr_time_t now)
         return 0;
     }
     listensocks_toggles++;
-    listensocks_off_since = now;
+    listensocks_off_since = listensocks_suspended_at = now;
 
     {
         static log_ratelimit_t rl;
@@ -1005,7 +1189,10 @@ static int disable_listensocks(apr_time_t now)
     return 1;
 }
 
-static int enable_listensocks(apr_time_t now)
+/* Accept again (should_enable_listensocks()), "by" what made the listener
+ * find it out (traced)
+ */
+static int enable_listensocks(apr_time_t now, const char *by)
 {
     volatile process_score *ps;
     int i;
@@ -1018,14 +1205,17 @@ static int enable_listensocks(apr_time_t now)
         listensocks_off_time += now - listensocks_off_since;
         listensocks_off_since = 0;
     }
+    accept_off_record(now - listensocks_suspended_at);
 
     {
         static log_ratelimit_t rl;
         if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(00457)
-                         "Resume listening sockets: idlers:%i conns:%u backlog:%u "
+                         "Resume listening sockets: by:%s off:%" APR_TIME_T_FMT "us "
+                         "idlers:%i conns:%u backlog:%u "
                          "waitio:%u write:%u keepalive:%u shutdown:%u "
                          "linger:%u timers:%u suspended:%u",
+                         by, now - listensocks_suspended_at,
                          ap_queue_info_idlers_count(worker_queue_info),
                          apr_atomic_read32(&connection_count),
                          apr_atomic_read32(backlog_q->total),
@@ -1057,31 +1247,27 @@ static APR_INLINE int listensocks_disabled(void)
     return apr_atomic_read32(&listensocks_off) != 0;
 }
 
-static APR_INLINE int connections_above_limit(int *busy)
+/* Whether to stop accepting for the limits, or not to accept again yet once
+ * stopped, for any thread (read-only). now: the caller's current time if at
+ * hand, otherwise 0 (fetched if needed)
+ */
+static APR_INLINE int connections_above_limit(apr_time_t now)
 {
-    apr_int32_t i_count = ap_queue_info_idlers_count(worker_queue_info);
-    if (i_count > 0) {
-        apr_uint32_t c_count = apr_atomic_read32(&connection_count);
-        apr_uint32_t l_count = apr_atomic_read32(linger_q->total);
-        if (c_count <= l_count
-                /* Off by 'listensocks_disabled()' to avoid flip flop */
-                || c_count - l_count < (apr_uint32_t)threads_per_child +
-                                       (i_count - listensocks_disabled()) *
-                                       async_factor) {
-            return 0;
-        }
+    /* Stop accepting when the new connections have been waiting too long
+     * for a worker, whatever the reason (busy or blocked workers).
+     */
+    if (!now) {
+        now = event_time_now();
     }
-    else if (busy) {
-        *busy = 1;
-    }
-    return 1;
+    return admission_above_target(now) != ADMISSION_UNDER;
 }
 
-static APR_INLINE int should_enable_listensocks(void)
+/* Whether to accept again, for any thread (see connections_above_limit()) */
+static APR_INLINE int should_enable_listensocks(apr_time_t now)
 {
     return (listensocks_disabled()
             && !apr_atomic_read32(&dying)
-            && !connections_above_limit(NULL));
+            && !connections_above_limit(now));
 }
 
 static void close_socket_at(apr_socket_t *csd,
@@ -1121,6 +1307,25 @@ static void close_worker_sockets(void)
             close_socket(csd);
         }
     }
+}
+
+/* Wake up the listener for it to accept again, by who (ACCEPT_WAKE_*, noted
+ * for the backlog stats), the caller having found that it may
+ * (should_enable_listensocks()).
+ */
+static APR_INLINE void wakeup_listener_by(unsigned int who)
+{
+    if (backlog_stats_on) {
+        apr_uint32_t wakes = apr_atomic_read32(&accept_wakes), old;
+        while ((wakes & who) != who) {
+            old = apr_atomic_cas32(&accept_wakes, wakes | who, wakes);
+            if (old == wakes) {
+                break;
+            }
+            wakes = old;
+        }
+    }
+    apr_pollset_wakeup(event_pollset);
 }
 
 static void shutdown_listener(void)
@@ -1386,9 +1591,11 @@ static apr_status_t decrement_connection_count(void *cs_)
      */
     is_last_connection = !apr_atomic_dec32(&connection_count);
     is_dying = apr_atomic_read32(&dying);
-    if ((is_last_connection && is_dying)
-        || should_enable_listensocks()) {
+    if (is_last_connection && is_dying) {
         apr_pollset_wakeup(event_pollset);
+    }
+    else if (should_enable_listensocks(0)) {
+        wakeup_listener_by(ACCEPT_WAKE_CLOSE);
     }
     if (is_dying) {
         /* Help worker_thread_should_exit_early() */
@@ -2598,7 +2805,7 @@ static void push2worker(event_conn_state_t *cs, timer_event_t *te,
          * the situation settles down. The listener and new idling workers will
          * test for should_enable_listensocks() to recover (when suitable).
          */
-        if (connections_above_limit(NULL)) {
+        if (connections_above_limit(now)) {
             disable_listensocks(now);
             if (above_limit) {
                 *above_limit = 1;
@@ -3087,6 +3294,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
     int process_slot = ti->pslot;
     process_score *ps = ap_get_scoreboard_process(process_slot);
     apr_time_t next_stats_time = 0;
+    unsigned int recheck_timedout = 0; /* RECHECK_* that timed out last */
 
     free(ti);
 
@@ -3105,6 +3313,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         apr_time_t next_expiry = -1;
         apr_interval_time_t timeout = -1;
         int above_limit = 0, force_stats = 0;
+        unsigned int recheck; /* RECHECK_* used by the poll's timeout */
         event_conn_state_t *expired = NULL;
         struct user_wait *user_chain;
         const apr_pollfd_t *out_pfd;
@@ -3267,6 +3476,22 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         }
         update_stats(ps, now, &next_stats_time, force_stats);
 
+        /* While not accepting for the limits (connections_above_limit()),
+         * re-evaluate them in time. They clear only when a connection is
+         * closed or a worker takes new connections or idles, which wake up
+         * the listener when it should accept again (see
+         * wakeup_listener_by()), so this is a backstop against a lost
+         * wake only, not expected to decide (ACCEPT_RECHECK_TIMEOUT). A
+         * resume counts as a re-check's (backlog stats) only when that
+         * re-check's own timeout ended the poll.
+         */
+        recheck = 0;
+        if (listensocks_disabled() && !apr_atomic_read32(&dying)
+            && (timeout < 0 || timeout > ACCEPT_RECHECK_TIMEOUT)) {
+            timeout = ACCEPT_RECHECK_TIMEOUT;
+            recheck = RECHECK_BACKSTOP;
+        }
+
         /* apr_pollset_poll() might round down the timeout to
          * milliseconds, let's forcibly round up here to never
          * return before the timeout.
@@ -3278,8 +3503,32 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         }
 
         /* Unpause listening sockets before poll()ing if possible */
-        if (should_enable_listensocks()) {
-            enable_listensocks(now);
+        if (listensocks_disabled()) {
+            /* The wakes asking to accept, up to now (any later one will
+             * make the poll below return).
+             */
+            apr_uint32_t wakes = 0;
+            if (backlog_stats_on) {
+                wakes = apr_atomic_xchg32(&accept_wakes, 0);
+            }
+            if (should_enable_listensocks(now)) {
+                const char *by;
+                if (wakes) {
+                    resumes_woken++;
+                    by = (wakes == ACCEPT_WAKE_WORKER) ? "worker"
+                       : (wakes == ACCEPT_WAKE_CLOSE) ? "close"
+                       : "worker+close";
+                }
+                else if (recheck_timedout == RECHECK_BACKSTOP) {
+                    resumes_recheck++;
+                    by = "recheck";
+                }
+                else {
+                    resumes_other++;
+                    by = "other";
+                }
+                enable_listensocks(now, by);
+            }
         }
 
         ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
@@ -3296,6 +3545,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                      apr_atomic_read32(&dying));
 
         rc = apr_pollset_poll(event_pollset, timeout, &num, &out_pfd);
+        recheck_timedout = (APR_STATUS_IS_TIMEUP(rc)) ? recheck : 0;
         if (rc != APR_SUCCESS) {
             if (!APR_STATUS_IS_EINTR(rc) && !APR_STATUS_IS_TIMEUP(rc)) {
                 ap_log_error(APLOG_MARK, APLOG_CRIT, rc, ap_server_conf,
@@ -3573,7 +3823,7 @@ do_maintenance:
              * the worker_queue mutex. Shut the timed out ones down after
              * releasing it: that pushes them to a worker, which takes the
              * mutex, or clears their pool, whose cleanups must not run under
-             * it.
+             * it (e.g. decrement_connection_count() evaluates the admission).
              */
             if (apr_atomic_read32(backlog_q->total)) {
                 event_conn_state_t *bl_timed_out = NULL;
@@ -3683,8 +3933,8 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
              * connections_above_limit() back, let the listener know and poll
              * them again.
              */
-            if (should_enable_listensocks()) {
-                apr_pollset_wakeup(event_pollset);
+            if (should_enable_listensocks(0)) {
+                wakeup_listener_by(ACCEPT_WAKE_WORKER);
             }
         }
 
@@ -3737,7 +3987,24 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
         }
 
         is_idler = 0; /* event consumed */
-        backlog_stats_record(qe->qclass, event_time_now() - qe->queued_at);
+        if (backlog_stats_on || qe->qclass == BACKLOG_NEW) {
+            apr_time_t now = event_time_now();
+            if (backlog_stats_on) {
+                backlog_stats_record(qe->qclass, now - qe->queued_at);
+            }
+            if (qe->qclass == BACKLOG_NEW) {
+                admission_sample(now - qe->queued_at, now);
+
+                /* Taking the new connections is what clears the admission
+                 * (the oldest one waiting, see admission_above_target()): if
+                 * the listener can accept again, let it know now rather than
+                 * when this worker idles.
+                 */
+                if (should_enable_listensocks(now)) {
+                    wakeup_listener_by(ACCEPT_WAKE_WORKER);
+                }
+            }
+        }
         ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                      "worker thread %i/%i busy (idlers %i)",
                      thread_slot, threads_per_child,
@@ -3884,6 +4151,20 @@ static void setup_threads_runtime(void)
                      "ap_queue_create() failed");
         clean_child_exit(APEXIT_CHILDFATAL);
     }
+    /* The lanes (the backlog classes), the new connections' one needed by
+     * the admission.
+     */
+    rv = ap_queue_set_lanes(worker_queue, BACKLOG_CLASSES,
+                            backlog_class_weights);
+    if (rv != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_ALERT, rv, ap_server_conf, APLOGNO()
+                     "ap_queue_set_lanes() failed");
+        clean_child_exit(APEXIT_CHILDFATAL);
+    }
+    ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                 "admission: target %" APR_TIME_T_FMT "ms, interval %"
+                 APR_TIME_T_FMT "ms", apr_time_as_msec(admission_target),
+                 apr_time_as_msec(admission_interval));
 
     if (ap_max_mem_free != APR_ALLOCATOR_MAX_FREE_UNLIMITED) {
         /* If we want to conserve memory, let's not keep an unlimited number of
