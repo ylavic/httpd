@@ -579,6 +579,12 @@ SSLSessionCache "shmcb:/usr/local/apache/logs/ssl_gcache_data(512000)"
 <p>The <code>ssl-cache</code> mutex is used to serialize access to
 the session cache to prevent corruption.  This mutex can be configured
 using the <directive module="core">Mutex</directive> directive.</p>
+
+<p>Handshakes look up and store sessions while holding the cache's mutex:
+with dbm, memcache or redis that includes disk or network I/O, which can
+hold the connection's thread for as long as it takes. shmcb keeps the
+sessions in shared memory, so the mutex is only held for a memory copy and
+handshakes don't wait on I/O.</p>
 </usage>
 </directivesynopsis>
 
@@ -3209,6 +3215,14 @@ and the <code>sss-stapling-refresh</code> mutex is used to control refreshes
 of OCSP responses.  These mutexes can be configured using the
 <directive module="core">Mutex</directive> directive.
 </p>
+
+<p>Refreshing an expired OCSP response happens in the handshake that
+needs it: that connection's thread queries the OCSP responder, for up to
+<directive module="mod_ssl">SSLStaplingResponderTimeout</directive>, while
+holding the <code>ssl-stapling-refresh</code> mutex, which is shared by
+all the certificates. <directive module="mod_md">MDStapling</directive>
+(<module>mod_md</module>) renews the responses in the background
+instead.</p>
 
 </usage>
 </directivesynopsis>
