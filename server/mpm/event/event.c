@@ -480,7 +480,9 @@ struct event_conn_state_t {
         /** Is lingering connection flushed and shutdown? */
         linger_shutdown :1,
         /** Shorter lingering close ("short-lingering-close")? */
-        linger_short    :1;
+        linger_short    :1,
+        /** Counted out already (connection_count_out())? */
+        counted_out     :1;
     /** Since when lingering (the shutdown, or the timeout that started it) */
     apr_time_t linger_since;
 };
@@ -1718,18 +1720,19 @@ static void just_die(int sig)
 
 static int child_fatal;
 
-static apr_status_t decrement_connection_count(void *cs_)
+/* Count a connection out (once), at the final close of its socket
+ * (close_connection_at()), or else at its pool's cleanup (e.g. a connection
+ * whose pool is cleared before it's closed): a closed connection's pool can
+ * wait in the limbo (worker_poll, recycle_connection_pool()) well after the
+ * close, the count and the limits shouldn't. Lock-free (the listener may
+ * close under conn_queues.mutex), any thread, cs->c possibly NULL.
+ */
+static void connection_count_out(event_conn_state_t *cs)
 {
-    event_conn_state_t *cs = cs_;
     int is_last_connection, is_dying;
 
-    ap_log_error(APLOG_MARK, APLOG_TRACE6, 0, ap_server_conf,
-                 "connection %" CS_FMT_TO " cleaned up",
-                 CS_ARG_TO(cs));
-
-    if (cs->suspended) {
-        apr_atomic_dec32(&suspended_count);
-    }
+    AP_DEBUG_ASSERT(!cs->counted_out);
+    cs->counted_out = 1;
 
     /* Unblock the listener if it's waiting for connection_count = 0,
      * or if the listening sockets were disabled due to limits and can
@@ -1747,6 +1750,25 @@ static apr_status_t decrement_connection_count(void *cs_)
         /* Help worker_thread_should_exit_early() */
         ap_queue_interrupt_one(worker_queue);
         ring_doorbell();
+    }
+}
+
+static apr_status_t decrement_connection_count(void *cs_)
+{
+    event_conn_state_t *cs = cs_;
+
+    ap_log_error(APLOG_MARK, APLOG_TRACE6, 0, ap_server_conf,
+                 "connection %" CS_FMT_TO " cleaned up",
+                 CS_ARG_TO(cs));
+
+    /* With the suspended state (ptrans_pre_cleanup() resumes one left
+     * suspended), not with the socket
+     */
+    if (cs->suspended) {
+        apr_atomic_dec32(&suspended_count);
+    }
+    if (!cs->counted_out) {
+        connection_count_out(cs);
     }
     return APR_SUCCESS;
 }
@@ -1860,6 +1882,9 @@ static void close_connection_at(event_conn_state_t *cs,
         return;
     }
     close_socket_at(cs_sd(cs), at, line);
+    if (!cs->counted_out) {
+        connection_count_out(cs);
+    }
     recycle_connection_pool(cs->p);
 }
 #define close_connection(cs) \
@@ -4497,7 +4522,8 @@ static int worker_thread_should_exit_early(int slot)
  * or dropped). A closed connection's pool is recycled only once no slot holds
  * an epoch older than its close (its fd closed before, so no event for it can
  * be returned to a later poll); otherwise it waits in the limbo, flushed when
- * the slots move on. Only needed when the workers poll (worker_poll).
+ * the slots move on (the connection is counted out at its close already,
+ * connection_count_out()). Only needed when the workers poll (worker_poll).
  */
 static /*atomic*/ apr_uint32_t drain_epoch = 1;
 struct limbo_pool {
@@ -4519,9 +4545,8 @@ static void drain_epoch_leave(int slot)
 {
     apr_atomic_set32(&worker_slots[slot].drain_epoch, 0);
 
-    /* Leaving may let the pools in the limbo be recycled (their connections
-     * counted out, see decrement_connection_count()), so flush it now rather
-     * than at the listener's next loop. The check is racy: a pool added
+    /* Leaving may let the pools in the limbo be recycled, so flush it now
+     * rather than at the listener's next loop. The check is racy: a pool added
      * meanwhile and missed here is flushed by the next leave, or by the
      * listener's loop which flushes too.
      */
@@ -5425,7 +5450,7 @@ static void *APR_THREAD_FUNC start_threads(apr_thread_t * thd, void *dummy)
 
 static void join_workers(apr_thread_t * listener, apr_thread_t ** threads)
 {
-    int i;
+    int i, joined_all = 1;
     apr_status_t rv, thread_rv;
 
     if (listener) {
@@ -5453,12 +5478,14 @@ static void join_workers(apr_thread_t * listener, apr_thread_t ** threads)
         if (iter > 10) {
             ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(00475)
                          "the listener thread didn't stop accepting");
+            joined_all = 0;
         }
         else {
             rv = apr_thread_join(&thread_rv, listener);
             if (rv != APR_SUCCESS) {
                 ap_log_error(APLOG_MARK, APLOG_CRIT, rv, ap_server_conf, APLOGNO(00476)
                              "apr_thread_join: unable to join listener thread");
+                joined_all = 0;
             }
         }
     }
@@ -5473,8 +5500,20 @@ static void join_workers(apr_thread_t * listener, apr_thread_t ** threads)
                 ap_log_error(APLOG_MARK, APLOG_CRIT, rv, ap_server_conf, APLOGNO(00477)
                              "apr_thread_join: unable to join worker "
                              "thread %d", i);
+                joined_all = 0;
             }
         }
+    }
+
+    /* No worker holds a drain epoch anymore: recycle the pools still in the
+     * limbo (worker_poll), their connections counted out at their close
+     * already, before the child exits
+     */
+    if (joined_all && worker_slots) {
+        for (i = 0; i < threads_per_child; i++) {
+            apr_atomic_set32(&worker_slots[i].drain_epoch, 0);
+        }
+        flush_limbo();
     }
 }
 
