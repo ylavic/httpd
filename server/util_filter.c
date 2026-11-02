@@ -1066,6 +1066,16 @@ AP_DECLARE(void) ap_filter_adopt_brigade(ap_filter_t *f,
     }
 }
 
+/* The buckets whose data is the file's rather than memory: FILE buckets,
+ * and MMAP ones (a FILE bucket read with EnableMMAP), whose pages the
+ * system maps from the file and reclaims as needed.
+ */
+#if APR_HAS_MMAP
+#define BUCKET_IS_FILE_BACKED(b) (APR_BUCKET_IS_FILE(b) || APR_BUCKET_IS_MMAP(b))
+#else
+#define BUCKET_IS_FILE_BACKED(b) APR_BUCKET_IS_FILE(b)
+#endif
+
 AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
                                                      apr_bucket_brigade *bb,
                                                      apr_bucket **flush_upto)
@@ -1116,8 +1126,9 @@ AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
      *     of everything up to the last one.
      *
      *  b) The brigade contains at least flush_max_threshold bytes in memory,
-     *     that is non-file and non-opaque (length != -1) buckets: do blocking
-     *     writes of everything up the last bucket above flush_max_threshold.
+     *     that is non-file (FILE or MMAP) and non-opaque (length != -1)
+     *     buckets: do blocking writes of everything up the last bucket
+     *     above flush_max_threshold.
      *     (The point of this rule is to provide flow control, in case a
      *     handler is streaming out lots of data faster than the data can be
      *     sent to the client.)
@@ -1127,8 +1138,8 @@ AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
      *     (The point of this rule is to prevent too many FDs being kept open
      *     by pipelined requests, possibly allowing a DoS).
      *
-     * Morphing buckets (opaque and FILE) use no memory until read, so they
-     * don't account for point b) above. Both ap_filter_reinstate_brigade()
+     * Morphing buckets (opaque and FILE) use no memory until read, and MMAP
+     * buckets map the file, so they don't account for point b) above. Both ap_filter_reinstate_brigade()
      * and setaside_brigade() assume that opaque buckets have an appropriate
      * lifetime (until next EOR for instance), so they are simply setaside or
      * reinstated by moving them from/to fp->bb to/from user bb.
@@ -1163,7 +1174,7 @@ AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
         }
         else if (bucket->length) {
             bytes_in_brigade += bucket->length;
-            if (!APR_BUCKET_IS_FILE(bucket)) {
+            if (!BUCKET_IS_FILE_BACKED(bucket)) {
                 memory_bytes_in_brigade += bucket->length;
             }
         }
