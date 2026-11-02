@@ -1610,8 +1610,6 @@ static void * create_proxy_config(apr_pool_t *p, server_rec *s)
     ps->maxfwd_set = 0;
     ps->timeout = 0;
     ps->timeout_set = 0;
-    ps->badopt = bad_error;
-    ps->badopt_set = 0;
     ps->source_address = NULL;
     ps->source_address_set = 0;
     apr_pool_create_ex(&ps->pool, p, NULL, NULL);
@@ -1767,8 +1765,6 @@ static void * merge_proxy_config(apr_pool_t *p, void *basev, void *overridesv)
     ps->maxfwd_set = overrides->maxfwd_set || base->maxfwd_set;
     ps->timeout = (overrides->timeout_set == 0) ? base->timeout : overrides->timeout;
     ps->timeout_set = overrides->timeout_set || base->timeout_set;
-    ps->badopt = (overrides->badopt_set == 0) ? base->badopt : overrides->badopt;
-    ps->badopt_set = overrides->badopt_set || base->badopt_set;
     ps->proxy_status = (overrides->proxy_status_set == 0) ? base->proxy_status : overrides->proxy_status;
     ps->proxy_status_set = overrides->proxy_status_set || base->proxy_status_set;
     ps->source_address = (overrides->source_address_set == 0) ? base->source_address : overrides->source_address;
@@ -2579,27 +2575,6 @@ static const char*
 }
 
 static const char*
-    set_bad_opt(cmd_parms *parms, void *dummy, const char *arg)
-{
-    proxy_server_conf *psf =
-    ap_get_module_config(parms->server->module_config, &proxy_module);
-
-    if (strcasecmp(arg, "IsError") == 0)
-        psf->badopt = bad_error;
-    else if (strcasecmp(arg, "Ignore") == 0)
-        psf->badopt = bad_ignore;
-    else if (strcasecmp(arg, "StartBody") == 0)
-        psf->badopt = bad_body;
-    else {
-        return "ProxyBadHeader must be one of: "
-            "IsError | Ignore | StartBody";
-    }
-
-    psf->badopt_set = 1;
-    return NULL;
-}
-
-static const char*
     set_status_opt(cmd_parms *parms, void *dummy, const char *arg)
 {
     proxy_server_conf *psf =
@@ -3076,8 +3051,6 @@ static const command_rec proxy_cmds[] =
     AP_INIT_TAKE1("ProxyTimeout", set_proxy_timeout, NULL, RSRC_CONF,
      "Set the timeout (in seconds) for a proxied connection. "
      "This overrides the server timeout"),
-    AP_INIT_TAKE1("ProxyBadHeader", set_bad_opt, NULL, RSRC_CONF,
-     "How to handle bad header line in response: IsError | Ignore | StartBody"),
     AP_INIT_RAW_ARGS("BalancerMember", add_member, NULL, RSRC_CONF|ACCESS_CONF,
      "A balancer name and scheme with list of params"),
     AP_INIT_TAKE1("BalancerGrowth", set_bgrowth, NULL, RSRC_CONF,

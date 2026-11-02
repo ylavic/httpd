@@ -576,37 +576,6 @@ ProxyPass "/apps"     "http://127"
 <seealso><directive type="section" module="mod_proxy">ProxyMatch</directive></seealso>
 </directivesynopsis>
 
-<directivesynopsis>
-<name>ProxyBadHeader</name>
-<description>Determines how to handle bad header lines in a
-response</description>
-<syntax>ProxyBadHeader IsError|Ignore|StartBody</syntax>
-<default>ProxyBadHeader IsError</default>
-<contextlist><context>server config</context><context>virtual host</context>
-</contextlist>
-
-<usage>
-    <p>The <directive>ProxyBadHeader</directive> directive determines the
-    behavior of <module>mod_proxy</module> if it receives syntactically invalid
-    response header lines (<em>i.e.</em> containing no colon) from the origin
-    server. The following arguments are possible:</p>
-
-    <dl>
-    <dt><code>IsError</code></dt>
-    <dd>Abort the request and end up with a 502 (Bad Gateway) response. This is
-    the default behavior.</dd>
-
-    <dt><code>Ignore</code></dt>
-    <dd>Treat bad header lines as if they weren't sent.</dd>
-
-    <dt><code>StartBody</code></dt>
-    <dd>When receiving the first bad header line, finish reading the headers and
-    treat the remainder as body. This helps to work around buggy backend servers
-    which forget to insert an empty line between the headers and the body.</dd>
-    </dl>
-</usage>
-</directivesynopsis>
-
 <directivesynopsis type="section">
 <name>ProxyMatch</name>
 <description>Container for directives applied to regular-expression-matched

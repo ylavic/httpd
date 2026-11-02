@@ -851,33 +851,20 @@ static void process_proxy_header(request_rec *r, proxy_dir_conf *c,
     apr_table_add(r->headers_out, key, value);
 }
 
-/*
- * Note: pread_len is the length of the response that we've  mistakenly
- * read (assuming that we don't consider that an  error via
- * ProxyBadHeader StartBody). This depends on buffer actually being
- * local storage to the calling code in order for pread_len to make
- * any sense at all, since we depend on buffer still containing
- * what was read by ap_getline() upon return.
- */
 static apr_status_t ap_proxy_read_headers(request_rec *r, request_rec *rr,
                                   char *buffer, int size,
-                                  conn_rec *c, int *pread_len)
+                                  conn_rec *c)
 {
     int len;
     char *value;
-    int saw_headers = 0;
-    void *sconf = r->server->module_config;
-    proxy_server_conf *psc;
     proxy_dir_conf *dconf;
     apr_status_t rc;
     apr_bucket_brigade *tmp_bb;
 
     dconf = ap_get_module_config(r->per_dir_config, &proxy_module);
-    psc = (proxy_server_conf *) ap_get_module_config(sconf, &proxy_module);
 
     r->headers_out = apr_table_make(r->pool, 20);
     r->trailers_out = apr_table_make(r->pool, 5);
-    *pread_len = 0;
 
     /*
      * Read header lines until we get the empty separator line, a read error,
@@ -917,51 +904,11 @@ static apr_status_t ap_proxy_read_headers(request_rec *r, request_rec *rr,
         }
 
         if (!(value = strchr(buffer, ':'))) {     /* Find the colon separator */
-
-            /* We may encounter invalid headers, usually from buggy
-             * MS IIS servers, so we need to determine just how to handle
-             * them. We can either ignore them, assume that they mark the
-             * start-of-body (eg: a missing CRLF) or (the default) mark
-             * the headers as totally bogus and return a 500. The sole
-             * exception is an extra "HTTP/1.0 200, OK" line sprinkled
-             * in between the usual MIME headers, which is a favorite
-             * IIS bug.
+            /* An invalid header line (no colon), an extra status line
+             * included: the headers are bogus and give a 502.
              */
-             /* XXX: The mask check is buggy if we ever see an HTTP/1.10 */
-
-            if (!apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
-                if (psc->badopt == bad_error) {
-                    /* Nope, it wasn't even an extra HTTP header. Give up. */
-                    r->headers_out = NULL;
-                    return APR_EINVAL;
-                }
-                else if (psc->badopt == bad_body) {
-                    /* if we've already started loading headers_out, then
-                     * return what we've accumulated so far, in the hopes
-                     * that they are useful; also note that we likely pre-read
-                     * the first line of the response.
-                     */
-                    if (saw_headers) {
-                        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01098)
-                                      "Starting body due to bogus non-header "
-                                      "in headers returned by %s (%s)",
-                                      r->uri, r->method);
-                        *pread_len = len;
-                        return APR_SUCCESS;
-                    }
-                    else {
-                        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01099)
-                                      "No HTTP headers returned by %s (%s)",
-                                      r->uri, r->method);
-                        return APR_SUCCESS;
-                    }
-                }
-            }
-            /* this is the psc->badopt == bad_ignore case */
-            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01100)
-                          "Ignoring bogus HTTP header returned by %s (%s)",
-                          r->uri, r->method);
-            continue;
+            r->headers_out = NULL;
+            return APR_EINVAL;
         }
 
         *value = '\0';
@@ -980,7 +927,6 @@ static apr_status_t ap_proxy_read_headers(request_rec *r, request_rec *rr,
          * by ProxyPassReverse and family with process_proxy_header
          */
         process_proxy_header(r, dconf, buffer, value);
-        saw_headers = 1;
     }
     return APR_SUCCESS;
 }
@@ -1078,11 +1024,10 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     apr_bucket *e;
     apr_bucket_brigade *bb;
     apr_bucket_brigade *pass_bb;
-    int len, backasswards;
+    int len;
     int interim_response = 0; /* non-zero whilst interim 1xx responses
                                * are being read. */
     apr_size_t response_field_size = 0;
-    int pread_len = 0;
     apr_table_t *save_table;
     int backend_broke = 0;
     static const char *const hop_by_hop_hdrs[] =
@@ -1219,203 +1164,193 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
         /* XXX: Is this a real headers length send from remote? */
         backend->worker->s->read += len;
 
-        /* Is it an HTTP/1 response?
-         * This is buggy if we ever see an HTTP/1.10
+        /* An HTTP/1 response? This is buggy if we ever see an HTTP/1.10.
+         * Not an HTTP/1 message (an HTTP/0.9 response, which mod_proxy_http
+         * never asks for, so rather another protocol), or a status line
+         * > 8192 bytes, is an error.
          */
-        if (apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
-            major = buffer[5] - '0';
-            minor = buffer[7] - '0';
+        if (!apr_date_checkmask(buffer, "HTTP/#.# ###*")
+            || buffer[5] != '1' || len >= response_field_size - 1) {
+            return ap_proxyerror(r, HTTP_BAD_GATEWAY,
+                        apr_pstrcat(p, "Corrupt status line returned "
+                                    "by remote server: ", buffer, NULL));
+        }
+        major = buffer[5] - '0';
+        minor = buffer[7] - '0';
 
-            /* If not an HTTP/1 message or
-             * if the status line was > 8192 bytes
-             */
-            if ((major != 1) || (len >= response_field_size - 1)) {
-                return ap_proxyerror(r, HTTP_BAD_GATEWAY,
-                            apr_pstrcat(p, "Corrupt status line returned "
-                                        "by remote server: ", buffer, NULL));
-            }
-            backasswards = 0;
+        keepchar = buffer[12];
+        buffer[12] = '\0';
+        proxy_status = atoi(&buffer[9]);
+        apr_table_setn(r->notes, "proxy-status",
+                       apr_pstrdup(r->pool, &buffer[9]));
 
-            keepchar = buffer[12];
-            buffer[12] = '\0';
-            proxy_status = atoi(&buffer[9]);
-            apr_table_setn(r->notes, "proxy-status",
-                           apr_pstrdup(r->pool, &buffer[9]));
-
-            if (keepchar != '\0') {
-                buffer[12] = keepchar;
-            } else {
-                /* 2616 requires the space in Status-Line; the origin
-                 * server may have sent one but ap_rgetline will
-                 * have stripped it. */
-                buffer[12] = ' ';
-                buffer[13] = '\0';
-            }
-            proxy_status_line = apr_pstrdup(p, &buffer[9]);
-
-            /* The status out of the front is the same as the status coming in
-             * from the back, until further notice.
-             */
-            r->status = proxy_status;
-            r->status_line = proxy_status_line;
-
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
-                          "Status from backend: %d", proxy_status);
-
-            /* read the headers. */
-            /* N.B. for HTTP/1.0 clients, we have to fold line-wrapped headers*/
-            /* Also, take care with headers with multiple occurrences. */
-
-            /* First, tuck away all already existing cookies */
-            save_table = apr_table_make(r->pool, 2);
-            apr_table_do(addit_dammit, save_table, r->headers_out,
-                         "Set-Cookie", NULL);
-
-            /* shove the headers direct into r->headers_out */
-            rc = ap_proxy_read_headers(r, backend->r, buffer, response_field_size,
-                                       origin, &pread_len);
-
-            if (rc != APR_SUCCESS || r->headers_out == NULL) {
-                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01106)
-                              "bad HTTP/%d.%d header returned by %s (%s)",
-                              major, minor, r->uri, r->method);
-                backend->close = 1;
-                /*
-                 * ap_send_error relies on a headers_out to be present. we
-                 * are in a bad position here.. so force everything we send out
-                 * to have nothing to do with the incoming packet
-                 */
-                r->headers_out = apr_table_make(r->pool,1);
-                r->status = HTTP_BAD_GATEWAY;
-                r->status_line = ap_get_status_line(r->status);
-                return r->status;
-            }
-
-            /* Now, add in the just read cookies */
-            apr_table_do(addit_dammit, save_table, r->headers_out,
-                         "Set-Cookie", NULL);
-
-            /* and now load 'em all in */
-            if (!apr_is_empty_table(save_table)) {
-                apr_table_unset(r->headers_out, "Set-Cookie");
-                r->headers_out = apr_table_overlay(r->pool,
-                                                   r->headers_out,
-                                                   save_table);
-            }
-
-            /*
-             * Save a possible Transfer-Encoding header as we need it later for
-             * ap_http_filter to know where to end.
-             */
-            te = apr_table_get(r->headers_out, "Transfer-Encoding");
-
-            /* can't have both Content-Length and Transfer-Encoding */
-            if (te && apr_table_get(r->headers_out, "Content-Length")) {
-                /*
-                 * 2616 section 4.4, point 3: "if both Transfer-Encoding
-                 * and Content-Length are received, the latter MUST be
-                 * ignored";
-                 *
-                 * To help mitigate HTTP Splitting, unset Content-Length
-                 * and shut down the backend server connection
-                 * XXX: We aught to treat such a response as uncachable
-                 */
-                apr_table_unset(r->headers_out, "Content-Length");
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01107)
-                              "server %s:%d returned Transfer-Encoding"
-                              " and Content-Length",
-                              backend->hostname, backend->port);
-                backend->close = 1;
-            }
-
-            upgrade = apr_table_get(r->headers_out, "Upgrade");
-            if (proxy_status == HTTP_SWITCHING_PROTOCOLS) {
-                if (!upgrade || !req->upgrade || (strcasecmp(req->upgrade,
-                                                             upgrade) != 0)) {
-                    return ap_proxyerror(r, HTTP_BAD_GATEWAY,
-                                         apr_pstrcat(p, "Unexpected Upgrade: ",
-                                                     upgrade ? upgrade : "n/a",
-                                                     " (expecting ",
-                                                     req->upgrade ? req->upgrade
-                                                                  : "n/a", ")",
-                                                     NULL));
-                }
-                backend->close = 1;
-            }
-
-            /* strip connection listed hop-by-hop headers from response */
-            toclose = ap_proxy_clear_connection_fn(r, r->headers_out);
-            if (toclose) {
-                backend->close = 1;
-                if (toclose < 0) {
-                    return ap_proxyerror(r, HTTP_BAD_GATEWAY,
-                                         "Malformed connection header");
-                }
-            }
-
-            if ((buf = apr_table_get(r->headers_out, "Content-Type"))) {
-                ap_set_content_type(r, apr_pstrdup(p, buf));
-            }
-            if (!ap_is_HTTP_INFO(proxy_status)) {
-                ap_proxy_pre_http_request(origin, backend->r);
-            }
-
-            /* Clear hop-by-hop headers */
-            for (i=0; hop_by_hop_hdrs[i]; ++i) {
-                apr_table_unset(r->headers_out, hop_by_hop_hdrs[i]);
-            }
-
-            /* Delete warnings with wrong date */
-            r->headers_out = ap_proxy_clean_warnings(p, r->headers_out);
-
-            /* handle Via header in response */
-            if (req->sconf->viaopt != via_off
-                    && req->sconf->viaopt != via_block) {
-                const char *server_name = ap_get_server_name(r);
-                /* If USE_CANONICAL_NAME_OFF was configured for the proxy virtual host,
-                 * then the server name returned by ap_get_server_name() is the
-                 * origin server name (which does make too much sense with Via: headers)
-                 * so we use the proxy vhost's name instead.
-                 */
-                if (server_name == r->hostname)
-                    server_name = r->server->server_hostname;
-                /* create a "Via:" response header entry and merge it */
-                apr_table_addn(r->headers_out, "Via",
-                               (req->sconf->viaopt == via_full)
-                                     ? apr_psprintf(p, "%d.%d %s%s (%s)",
-                                           HTTP_VERSION_MAJOR(r->proto_num),
-                                           HTTP_VERSION_MINOR(r->proto_num),
-                                           server_name,
-                                           req->server_portstr,
-                                           AP_SERVER_BASEVERSION)
-                                     : apr_psprintf(p, "%d.%d %s%s",
-                                           HTTP_VERSION_MAJOR(r->proto_num),
-                                           HTTP_VERSION_MINOR(r->proto_num),
-                                           server_name,
-                                           req->server_portstr)
-                );
-            }
-
-            /* cancel keepalive if HTTP/1.0 or less */
-            if ((major < 1) || (minor < 1)) {
-                backend->close = 1;
-                origin->keepalive = AP_CONN_CLOSE;
-            }
-            else {
-                /*
-                 * Keep track of the number of keepalives we processed on this
-                 * connection.
-                 */
-                origin->keepalives++;
-            }
-
+        if (keepchar != '\0') {
+            buffer[12] = keepchar;
         } else {
-            /* an http/0.9 response */
-            backasswards = 1;
-            r->status = proxy_status = HTTP_OK;
+            /* 2616 requires the space in Status-Line; the origin
+             * server may have sent one but ap_rgetline will
+             * have stripped it. */
+            buffer[12] = ' ';
+            buffer[13] = '\0';
+        }
+        proxy_status_line = apr_pstrdup(p, &buffer[9]);
+
+        /* The status out of the front is the same as the status coming in
+         * from the back, until further notice.
+         */
+        r->status = proxy_status;
+        r->status_line = proxy_status_line;
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "Status from backend: %d", proxy_status);
+
+        /* read the headers. */
+        /* N.B. for HTTP/1.0 clients, we have to fold line-wrapped headers*/
+        /* Also, take care with headers with multiple occurrences. */
+
+        /* First, tuck away all already existing cookies */
+        save_table = apr_table_make(r->pool, 2);
+        apr_table_do(addit_dammit, save_table, r->headers_out,
+                     "Set-Cookie", NULL);
+
+        /* shove the headers direct into r->headers_out */
+        rc = ap_proxy_read_headers(r, backend->r, buffer, response_field_size,
+                                   origin);
+
+        if (rc != APR_SUCCESS || r->headers_out == NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01106)
+                          "bad HTTP/%d.%d header returned by %s (%s)",
+                          major, minor, r->uri, r->method);
+            backend->close = 1;
+            /*
+             * ap_send_error relies on a headers_out to be present. we
+             * are in a bad position here.. so force everything we send out
+             * to have nothing to do with the incoming packet
+             */
+            r->headers_out = apr_table_make(r->pool,1);
+            r->status = HTTP_BAD_GATEWAY;
             r->status_line = ap_get_status_line(r->status);
+            return r->status;
+        }
+
+        /* Now, add in the just read cookies */
+        apr_table_do(addit_dammit, save_table, r->headers_out,
+                     "Set-Cookie", NULL);
+
+        /* and now load 'em all in */
+        if (!apr_is_empty_table(save_table)) {
+            apr_table_unset(r->headers_out, "Set-Cookie");
+            r->headers_out = apr_table_overlay(r->pool,
+                                               r->headers_out,
+                                               save_table);
+        }
+
+        /*
+         * Save a possible Transfer-Encoding header as we need it later for
+         * ap_http_filter to know where to end.
+         */
+        te = apr_table_get(r->headers_out, "Transfer-Encoding");
+
+        /* can't have both Content-Length and Transfer-Encoding */
+        if (te && apr_table_get(r->headers_out, "Content-Length")) {
+            /*
+             * 2616 section 4.4, point 3: "if both Transfer-Encoding
+             * and Content-Length are received, the latter MUST be
+             * ignored";
+             *
+             * To help mitigate HTTP Splitting, unset Content-Length
+             * and shut down the backend server connection
+             * XXX: We aught to treat such a response as uncachable
+             */
+            apr_table_unset(r->headers_out, "Content-Length");
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01107)
+                          "server %s:%d returned Transfer-Encoding"
+                          " and Content-Length",
+                          backend->hostname, backend->port);
             backend->close = 1;
         }
+
+        upgrade = apr_table_get(r->headers_out, "Upgrade");
+        if (proxy_status == HTTP_SWITCHING_PROTOCOLS) {
+            if (!upgrade || !req->upgrade || (strcasecmp(req->upgrade,
+                                                         upgrade) != 0)) {
+                return ap_proxyerror(r, HTTP_BAD_GATEWAY,
+                                     apr_pstrcat(p, "Unexpected Upgrade: ",
+                                                 upgrade ? upgrade : "n/a",
+                                                 " (expecting ",
+                                                 req->upgrade ? req->upgrade
+                                                              : "n/a", ")",
+                                                 NULL));
+            }
+            backend->close = 1;
+        }
+
+        /* strip connection listed hop-by-hop headers from response */
+        toclose = ap_proxy_clear_connection_fn(r, r->headers_out);
+        if (toclose) {
+            backend->close = 1;
+            if (toclose < 0) {
+                return ap_proxyerror(r, HTTP_BAD_GATEWAY,
+                                     "Malformed connection header");
+            }
+        }
+
+        if ((buf = apr_table_get(r->headers_out, "Content-Type"))) {
+            ap_set_content_type(r, apr_pstrdup(p, buf));
+        }
+        if (!ap_is_HTTP_INFO(proxy_status)) {
+            ap_proxy_pre_http_request(origin, backend->r);
+        }
+
+        /* Clear hop-by-hop headers */
+        for (i=0; hop_by_hop_hdrs[i]; ++i) {
+            apr_table_unset(r->headers_out, hop_by_hop_hdrs[i]);
+        }
+
+        /* Delete warnings with wrong date */
+        r->headers_out = ap_proxy_clean_warnings(p, r->headers_out);
+
+        /* handle Via header in response */
+        if (req->sconf->viaopt != via_off
+                && req->sconf->viaopt != via_block) {
+            const char *server_name = ap_get_server_name(r);
+            /* If USE_CANONICAL_NAME_OFF was configured for the proxy virtual host,
+             * then the server name returned by ap_get_server_name() is the
+             * origin server name (which does make too much sense with Via: headers)
+             * so we use the proxy vhost's name instead.
+             */
+            if (server_name == r->hostname)
+                server_name = r->server->server_hostname;
+            /* create a "Via:" response header entry and merge it */
+            apr_table_addn(r->headers_out, "Via",
+                           (req->sconf->viaopt == via_full)
+                                 ? apr_psprintf(p, "%d.%d %s%s (%s)",
+                                       HTTP_VERSION_MAJOR(r->proto_num),
+                                       HTTP_VERSION_MINOR(r->proto_num),
+                                       server_name,
+                                       req->server_portstr,
+                                       AP_SERVER_BASEVERSION)
+                                 : apr_psprintf(p, "%d.%d %s%s",
+                                       HTTP_VERSION_MAJOR(r->proto_num),
+                                       HTTP_VERSION_MINOR(r->proto_num),
+                                       server_name,
+                                       req->server_portstr)
+            );
+        }
+
+        /* cancel keepalive if HTTP/1.0 or less */
+        if ((major < 1) || (minor < 1)) {
+            backend->close = 1;
+            origin->keepalive = AP_CONN_CLOSE;
+        }
+        else {
+            /*
+             * Keep track of the number of keepalives we processed on this
+             * connection.
+             */
+            origin->keepalives++;
+        }
+
 
         if (ap_is_HTTP_INFO(proxy_status)) {
             const char *policy = NULL;
@@ -1663,31 +1598,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
         }
 
         r->sent_bodyct = 1;
-        /*
-         * Is it an HTTP/0.9 response or did we maybe preread the 1st line of
-         * the response? If so, load the extra data. These are 2 mutually
-         * exclusive possibilities, that just happen to require very
-         * similar behavior.
-         */
-        if (backasswards || pread_len) {
-            apr_ssize_t cntr = (apr_ssize_t)pread_len;
-            if (backasswards) {
-                /*@@@FIXME:
-                 * At this point in response processing of a 0.9 response,
-                 * we don't know yet whether data is binary or not.
-                 * mod_charset_lite will get control later on, so it cannot
-                 * decide on the conversion of this buffer full of data.
-                 * However, chances are that we are not really talking to an
-                 * HTTP/0.9 server, but to some different protocol, therefore
-                 * the best guess IMHO is to always treat the buffer as "text/x":
-                 */
-                ap_xlate_proto_to_ascii(buffer, len);
-                cntr = (apr_ssize_t)len;
-            }
-            e = apr_bucket_heap_create(buffer, cntr, NULL, c->bucket_alloc);
-            APR_BRIGADE_INSERT_TAIL(bb, e);
-        }
-
         /* send body - but only if a body is expected */
         if (!r->header_only && !AP_STATUS_IS_HEADER_ONLY(proxy_status)) {
             apr_read_type_e mode;

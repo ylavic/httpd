@@ -178,11 +178,6 @@ typedef struct {
     long maxfwd;
     apr_interval_time_t timeout;
     enum {
-      bad_error,
-      bad_ignore,
-      bad_body
-    } badopt;                   /* how to deal with bad headers */
-    enum {
         status_off,
         status_on,
         status_full
@@ -198,7 +193,6 @@ typedef struct {
     unsigned int io_buffer_size_set:1;
     unsigned int maxfwd_set:1;
     unsigned int timeout_set:1;
-    unsigned int badopt_set:1;
     unsigned int proxy_status_set:1;
     unsigned int source_address_set:1;
     unsigned int bgrowth_set:1;
