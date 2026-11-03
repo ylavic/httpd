@@ -104,3 +104,17 @@ checks/async-*-check.py PREFIX WORKDIR
   handshake flight, none holding a worker).
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).
+
+checks/h1-head-check.py PREFIX WORKDIR
+  The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
+  from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
+  LimitRequestFieldSize, LimitRequestFields: line ends, NUL bytes, field
+  names and values, obs-folds, the limits at limit + 1 and + 2, empty lines
+  before the request line, HTTP/0.9, the client closing), and response heads
+  and trailers from a raw backend through mod_proxy_http
+  (ProxyHttpProtocolOptions Strict and Unsafe, the ProxyLimitResponse*
+  limits: the same rules, stray CRLFs, malformed status lines, interim
+  responses, the backend closing), each head sent whole, one byte per packet
+  and split in two at every offset (SPLITS="whole byte every"), the cause of
+  each error logged; the response heads in MODES="sync async", the request
+  heads in the first mode.
