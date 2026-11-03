@@ -183,7 +183,6 @@ static volatile int dying = 0;
 static volatile int workers_may_exit = 0;
 static volatile int start_thread_may_exit = 0;
 static volatile int listener_may_exit = 0;
-static int listener_is_wakeable = 0;        /* Pollset supports APR_POLLSET_WAKEABLE */
 static int num_listensocks = 0;
 static apr_int32_t conns_this_child;        /* MaxConnectionsPerChild, only access
                                                in listener thread */
@@ -324,7 +323,7 @@ static int TO_QUEUE_APPEND(struct timeout_queue *q, event_conn_state_t *el)
 /* Wake up the poll()ing listener for it to update its timeout */
 static APR_INLINE void wakeup_listener_timeout(void)
 {
-    if (listener_is_wakeable) {
+    if (event_pollset) {
         apr_pollset_wakeup(event_pollset);
     }
 }
@@ -630,7 +629,7 @@ static void wakeup_listener(void)
     disable_listensocks();
 
     /* Unblock the listener if it's poll()ing */
-    if (event_pollset && listener_is_wakeable) {
+    if (event_pollset) {
         apr_pollset_wakeup(event_pollset);
     }
 
@@ -869,9 +868,8 @@ static apr_status_t decrement_connection_count(void *cs_)
      * now accept new connections.
      */
     is_last_connection = !apr_atomic_dec32(&connection_count);
-    if (listener_is_wakeable
-            && ((is_last_connection && listener_may_exit)
-                || should_enable_listensocks())) {
+    if ((is_last_connection && listener_may_exit)
+        || should_enable_listensocks()) {
         apr_pollset_wakeup(event_pollset);
     }
     if (dying) {
@@ -1677,7 +1675,7 @@ static timer_event_t * event_get_timer_event(apr_time_t t,
         next_expiry = timers_next_expiry;
         if (!next_expiry || next_expiry > te->when + EVENT_FUDGE_FACTOR) {
             timers_next_expiry = te->when;
-            wakeup = listener_is_wakeable;
+            wakeup = (event_pollset != NULL);
         }
     }
     apr_thread_mutex_unlock(g_timer_skiplist_mtx);
@@ -2070,10 +2068,8 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
 #endif
 
         /* Start with an infinite poll() timeout and update it according to
-         * the next expiring timer or queue entry. If there are none, either
-         * the listener is wakeable and it can poll() indefinitely until a wake
-         * up occurs, otherwise periodic checks (maintenance, shutdown, ...)
-         * must be performed.
+         * the next expiring timer or queue entry. If there are none, the
+         * listener can poll() indefinitely until a wake up occurs.
          */
         now = apr_time_now();
         timeout = -1;
@@ -2119,14 +2115,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
             timeout = expiry > now ? expiry - now : 0;
         }
 
-        /* When non-wakeable, don't wait more than 100 ms, in any case. */
-#define NON_WAKEABLE_POLL_TIMEOUT apr_time_from_msec(100)
-        if (!listener_is_wakeable
-                && (timeout < 0
-                    || timeout > NON_WAKEABLE_POLL_TIMEOUT)) {
-            timeout = NON_WAKEABLE_POLL_TIMEOUT;
-        }
-        else if (timeout > 0) {
+        if (timeout > 0) {
             /* apr_pollset_poll() might round down the timeout to milliseconds,
              * let's forcibly round up here to never return before the timeout.
              */
@@ -2537,7 +2526,7 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
             /* A new idler may have changed connections_above_limit(),
              * let the listener know and decide.
              */
-            if (listener_is_wakeable && should_enable_listensocks()) {
+            if (should_enable_listensocks()) {
                 apr_pollset_wakeup(event_pollset);
             }
             is_idle = 1;
@@ -2740,9 +2729,10 @@ static void setup_threads_runtime(void)
         clean_child_exit(APEXIT_CHILDFATAL);
     }
 
-    /* Create the main pollset. When APR_POLLSET_WAKEABLE is asked we account
-     * for the wakeup pipe explicitely with pollset_size+1 because some pollset
-     * implementations don't do it implicitely in APR.
+    /* Create the main pollset. APR_POLLSET_WAKEABLE is required (any method
+     * implements it with APR >= 1.4), we account for the wakeup pipe
+     * explicitely with pollset_size+1 because some pollset implementations
+     * don't do it implicitely in APR.
      */
     pollset_flags = APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY |
                     APR_POLLSET_WAKEABLE | APR_POLLSET_NODEFAULT;
@@ -2750,7 +2740,6 @@ static void setup_threads_runtime(void)
         rv = apr_pollset_create_ex(&event_pollset, pollset_size + 1, pruntime,
                                    pollset_flags, good_methods[i]);
         if (rv == APR_SUCCESS) {
-            listener_is_wakeable = 1;
             break;
         }
     }
@@ -2758,14 +2747,6 @@ static void setup_threads_runtime(void)
         pollset_flags &= ~APR_POLLSET_NODEFAULT;
         rv = apr_pollset_create(&event_pollset, pollset_size + 1, pruntime,
                                 pollset_flags);
-        if (rv == APR_SUCCESS) {
-            listener_is_wakeable = 1;
-        }
-        else {
-            pollset_flags &= ~APR_POLLSET_WAKEABLE;
-            rv = apr_pollset_create(&event_pollset, pollset_size, pruntime,
-                                    pollset_flags);
-        }
     }
     if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO(03103)
@@ -2830,9 +2811,8 @@ static void *APR_THREAD_FUNC start_threads(apr_thread_t * thd, void *dummy)
     int loops, i;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(02471)
-                 "start_threads: Using %s (%swakeable)",
-                 apr_pollset_method_name(event_pollset),
-                 listener_is_wakeable ? "" : "not ");
+                 "start_threads: Using %s (wakeable)",
+                 apr_pollset_method_name(event_pollset));
 
     loops = prev_threads_created = 0;
     while (1) {
@@ -4093,7 +4073,6 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
     worker_queue_info = NULL;
     listener_os_thread = NULL;
     listensocks_disabled = 0;
-    listener_is_wakeable = 0;
 
     return OK;
 }
