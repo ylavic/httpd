@@ -62,10 +62,6 @@
 #undef APLOG_MODULE_INDEX
 #define APLOG_MODULE_INDEX AP_CORE_MODULE_INDEX
 
-#ifndef AP_ASCII_COLON
-#define AP_ASCII_COLON '\x3a'
-#endif
-
 APR_HOOK_STRUCT(
     APR_HOOK_LINK(pre_read_request)
     APR_HOOK_LINK(post_read_request)
@@ -250,8 +246,7 @@ struct ap_h1_head_parser {
     enum folding_state_e folding_state;
     apr_status_t late_rv;   /* to return once the line is read */
     line_error_e line_error;/* the cause of an APR_EINVAL */
-    unsigned int folding_col    :1,
-                 allocate       :1,
+    unsigned int allocate       :1,
                  reusable       :1,
                  seen_nospc     :1;
 
@@ -283,7 +278,7 @@ static apr_status_t ap_fgetline_core(ap_h1_head_parser_t *state,
     apr_read_type_e block;
     int fold = flags & AP_GETLINE_FOLD;
     int crlf = flags & AP_GETLINE_CRLF;
-    int do_alloc = (flags & AP_GETLINE_ALLOC) || state->allocate;
+    int do_alloc = state->allocate;
     int nospc_eol = flags & AP_GETLINE_NOSPC_EOL;
     int in_head = (state->head != NULL); /* the parser's rules */
     int seen_eol = 0;
@@ -608,17 +603,7 @@ find_folding:
             if (c != APR_ASCII_BLANK && c != APR_ASCII_TAB) {
                 /* Not a continuation line */
                 state->folding_state = NOT_FOLDING;
-                state->folding_col = 0;
                 break;
-            }
-
-            /* Found one, may be allowed after a colon char only */
-            if ((flags & AP_GETLINE_FOLD_COL) && !state->folding_col) {
-                if (!memchr(state->buf, AP_ASCII_COLON, state->len)) {
-                    rv = APR_EINVAL;
-                    goto cleanup;
-                }
-                state->folding_col = 1;
             }
 
             /* Before folding, trim trailing blanks */
@@ -675,32 +660,27 @@ cleanup:
     return rv;
 }
 
-AP_DECLARE(apr_status_t) ap_fgetline_ex(char **s, apr_size_t n,
-                                        apr_size_t *read, ap_filter_t *f,
-                                        int flags, apr_bucket_brigade *bb,
-                                        ap_getline_state_t **state_p,
-                                        apr_pool_t *p)
+/* Get a line with the state, resumed after APR_EAGAIN if reusable */
+static apr_status_t ap_fgetline_ex(char **s, apr_size_t n,
+                                   apr_size_t *read, ap_filter_t *f,
+                                   int flags, apr_bucket_brigade *bb,
+                                   ap_h1_head_parser_t *state,
+                                   apr_pool_t *p)
 {
     apr_status_t rv;
-    ap_getline_state_t *state = *state_p;
 #if APR_CHARSET_EBCDIC
     apr_size_t prev_len = 0;
 #endif
 
-    if (!state || !state->reusable) {
-        if (!state) {
-            *state_p = state = apr_pcalloc(p, sizeof(*state));
-        }
-        else {
-            /* A new line, the parser's members kept */
-            state->buf = NULL;
-            state->len = state->alloc_size = state->folding_len = 0;
-            state->folding_state = NOT_FOLDING;
-            state->late_rv = APR_SUCCESS;
-            state->line_error = LINE_OK;
-            state->folding_col = state->allocate = state->seen_nospc = 0;
-        }
-        if (*s && !(flags & AP_GETLINE_ALLOC)) {
+    if (!state->reusable) {
+        /* A new line, the parser's members kept */
+        state->buf = NULL;
+        state->len = state->alloc_size = state->folding_len = 0;
+        state->folding_state = NOT_FOLDING;
+        state->late_rv = APR_SUCCESS;
+        state->line_error = LINE_OK;
+        state->allocate = state->seen_nospc = 0;
+        if (*s) {
             state->buf = *s;
         }
         else {
@@ -742,7 +722,7 @@ static apr_status_t ap_fgetline_state(ap_h1_head_parser_t *state,
     char *s = NULL;
     apr_size_t len;
 
-    return ap_fgetline_ex(&s, n, &len, f, flags, state->bb, &state,
+    return ap_fgetline_ex(&s, n, &len, f, flags, state->bb, state,
                           state->pool);
 }
 
@@ -751,9 +731,8 @@ AP_DECLARE(apr_status_t) ap_fgetline(char **s, apr_size_t n,
                                      int flags, apr_bucket_brigade *bb,
                                      apr_pool_t *p)
 {
-    ap_getline_state_t stack_state;
-    ap_getline_state_t *state = &stack_state;
-    memset(state, 0, sizeof(*state));
+    ap_h1_head_parser_t state;
+    memset(&state, 0, sizeof(state));
 
     return ap_fgetline_ex(s, n, read, f, flags, bb, &state, p);
 }
@@ -1226,7 +1205,7 @@ AP_DECLARE(int) ap_h1_head_parse(ap_h1_head_parser_t *parser,
     int status = OK;
     int strict = (parser->opts.flags & AP_H1_HEAD_OPT_STRICT);
     apr_size_t max_size = parser->opts.limit_field + 1;
-    int flags = AP_GETLINE_ALLOC;
+    int flags = 0;
 
     *head = NULL;
     if (parser->phase == H1_HEAD_DONE) {

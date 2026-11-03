@@ -770,9 +770,7 @@
  *                         mpm_register_timeouts hooks to mpm_common.h; conn_rec->partial_request,
  *                         conn_state_t->timed_out and
  *                         AP_EXPECT_100_NONBLOCK to httpd.h;
- *                         ap_read_request_ex(), ap_fgetline_ex(),
- *                         AP_GETLINE_ALLOC, AP_GETLINE_FOLD_COL,
- *                         ap_send_interim_response_ex(),
+ *                         ap_read_request_ex(), ap_send_interim_response_ex(),
  *                         AP_SEND_INTERIM_NONBLOCK, ap_h1_head_kind_e,
  *                         AP_H1_HEAD_OPT_STRICT, AP_H1_HEAD_OPT_BACKEND,
  *                         AP_H1_HEAD_OPT_MERGE,
