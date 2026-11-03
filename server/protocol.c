@@ -1114,9 +1114,9 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
                 apr_table_setn(r->notes, "error-notes",
                                "The number of request header fields "
                                "exceeds this server's limit.");
-                ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(00563)
-                              "Number of request headers exceeds "
-                              "LimitRequestFields");
+                ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                              "number of %ss exceeds the limit of %u",
+                              parser->what, parser->opts.limit_fields);
                 goto cleanup;
             }
 
@@ -1125,17 +1125,18 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
 
                 if (!(value = strchr(field, ':'))) { /* Find ':' or */
                     status = HTTP_BAD_REQUEST;      /* abort bad request */
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00564)
-                                  "Request header field is missing ':' "
-                                  "separator: %.*s", (int)LOG_NAME_MAX_LEN,
-                                  field);
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field is missing ':' "
+                                  "separator: %.*s", parser->what,
+                                  (int)LOG_NAME_MAX_LEN, field);
                     goto cleanup;
                 }
 
                 if (value == field) {
                     status = HTTP_BAD_REQUEST;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03453)
-                                  "Request header field name was empty");
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field name is empty",
+                                  parser->what);
                     goto cleanup;
                 }
 
@@ -1143,9 +1144,10 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
 
                 if (strpbrk(field, "\t\n\v\f\r ")) {
                     status = HTTP_BAD_REQUEST;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03452)
-                                  "Request header field name presented"
-                                  " invalid whitespace");
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field name has whitespace: "
+                                  "%.*s", parser->what,
+                                  field_name_len(field), field);
                     goto cleanup;
                 }
 
@@ -1155,9 +1157,10 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
 
                 if (strpbrk(value, "\n\v\f\r")) {
                     status = HTTP_BAD_REQUEST;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03451)
-                                  "Request header field value presented"
-                                  " bad whitespace");
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field value has bad "
+                                  "whitespace: %.*s", parser->what,
+                                  field_name_len(field), field);
                     goto cleanup;
                 }
             }
@@ -1168,9 +1171,10 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
                 value = (char *)ap_scan_http_token(field);
                 if ((value == field) || *value != ':') {
                     status = HTTP_BAD_REQUEST;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(02426)
-                                  "Request header field name is malformed: "
-                                  "%.*s", (int)LOG_NAME_MAX_LEN, field);
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field name is malformed: "
+                                  "%.*s", parser->what,
+                                  field_name_len(field), field);
                     goto cleanup;
                 }
 
@@ -1187,9 +1191,10 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
                  */
                 if (*ap_scan_http_field_content(value) != '\0') {
                     status = HTTP_BAD_REQUEST;
-                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(02427)
-                                  "Request header value is malformed: "
-                                  "%.*s", (int)LOG_NAME_MAX_LEN, value);
+                    ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r,
+                                  APLOGNO() "%s field value is malformed: "
+                                  "%.*s", parser->what,
+                                  field_name_len(field), field);
                     goto cleanup;
                 }
             }
