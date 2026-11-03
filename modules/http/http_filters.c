@@ -83,6 +83,7 @@ typedef struct http_filter_ctx
         BODY_CHUNK_END_LF, /* got CR after data, expect LF */
         BODY_CHUNK_TRAILER /* trailers */
     } state;
+    ap_h1_head_parser_t *trailer_parser;
     unsigned int at_eos:1,
                  seen_data:1;
 } http_ctx_t;
@@ -263,46 +264,68 @@ static apr_status_t parse_chunk_size(http_ctx_t *ctx, const char *buffer,
     return APR_SUCCESS;
 }
 
-static apr_status_t read_chunked_trailers(http_ctx_t *ctx, ap_filter_t *f,
-                                          apr_bucket_brigade *b)
+AP_DECLARE(void) ap_h1_set_trailers_opts(request_rec *r,
+                                         const ap_h1_head_opts_t *opts)
 {
-    int rv;
-    apr_bucket *e;
+    ap_h1_head_opts_t *copy = apr_pmemdup(r->pool, opts, sizeof(*opts));
+
+    copy->kind = AP_H1_HEAD_TRAILERS;
+    ap_set_module_config(r->request_config, &http_module, copy);
+}
+
+AP_DECLARE(const ap_h1_head_opts_t *) ap_h1_get_trailers_opts(request_rec *r)
+{
+    return ap_get_module_config(r->request_config, &http_module);
+}
+
+/* Read the trailer section following the last chunk, with the
+ * options set by ap_h1_set_trailers_opts() if any, else the side's defaults:
+ * a backend's for a proxied response, the client side's otherwise. Resumes
+ * after APR_EAGAIN.
+ */
+static apr_status_t read_chunked_trailers(http_ctx_t *ctx, ap_filter_t *f,
+                                          apr_bucket_brigade *b,
+                                          apr_read_type_e block)
+{
     request_rec *r = f->r;
-    apr_table_t *trailers;
-    apr_table_t *saved_headers_in;
-    int saved_status = r->status;
+    ap_h1_head_t *head;
+    apr_bucket *e;
+    int rc;
 
-    saved_headers_in = r->headers_in;
-    trailers = apr_table_make(r->pool, 5);
-    r->status = HTTP_OK;
-    r->headers_in = trailers;
-    ap_get_mime_headers(r);
-    r->headers_in = saved_headers_in;
+    if (!ctx->trailer_parser) {
+        const ap_h1_head_opts_t *opts = ap_h1_get_trailers_opts(r);
+        ap_h1_head_opts_t defaults;
 
-    if (r->status == HTTP_OK) {
-        r->status = saved_status;
-
-        if (!apr_is_empty_table(trailers)) {
-            e = ap_bucket_headers_create(trailers, r->pool, b->bucket_alloc);
-            APR_BRIGADE_INSERT_TAIL(b, e);
+        if (!opts) {
+            ap_h1_head_opts_init(&defaults, r, AP_H1_HEAD_TRAILERS,
+                                 (r->proxyreq == PROXYREQ_RESPONSE)
+                                 ? AP_H1_HEAD_OPT_BACKEND : 0);
+            opts = &defaults;
         }
-        e = apr_bucket_eos_create(f->c->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(b, e);
-        ctx->at_eos = 1;
-        rv = APR_SUCCESS;
+        ctx->trailer_parser = ap_h1_head_parser_create(r->pool, r, opts);
     }
-    else {
-        const char *error_notes = apr_table_get(r->notes,
-                                                "error-notes");
+
+    rc = ap_h1_head_parse(ctx->trailer_parser, f->next, block, &head);
+    if (rc == AGAIN) {
+        return APR_EAGAIN;
+    }
+    if (rc != OK) {
+        const char *error_notes = apr_table_get(r->notes, "error-notes");
         ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(02656)
                       "Error while reading HTTP trailer: %i%s%s",
-                      r->status, error_notes ? ": " : "",
+                      rc, error_notes ? ": " : "",
                       error_notes ? error_notes : "");
-        rv = APR_EINVAL;
+        return APR_EINVAL;
     }
 
-    return rv;
+    if (!apr_is_empty_table(head->headers)) {
+        e = ap_bucket_headers_create(head->headers, r->pool, b->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(b, e);
+    }
+    e = apr_bucket_eos_create(f->c->bucket_alloc);
+    APR_BRIGADE_INSERT_TAIL(b, e);
+    ctx->at_eos = 1;
+    return APR_SUCCESS;
 }
 
 typedef struct h1_in_ctx_t
@@ -618,7 +641,7 @@ apr_status_t ap_h1_body_in_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
             if (ctx->state == BODY_CHUNK_TRAILER) {
                 /* Treat UNSET as DISABLE - trailers aren't merged by default */
-                return read_chunked_trailers(ctx, f, b);
+                return read_chunked_trailers(ctx, f, b, block);
             }
 
             break;
@@ -708,23 +731,10 @@ apr_status_t ap_h1_body_in_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
             break;
         }
-        case BODY_CHUNK_TRAILER: {
+        case BODY_CHUNK_TRAILER:
+            /* Resume after APR_EAGAIN */
+            return read_chunked_trailers(ctx, f, b, block);
 
-            rv = ap_get_brigade(f->next, b, mode, block, readbytes);
-
-            /* for timeout */
-            if (block == APR_NONBLOCK_READ
-                    && ((rv == APR_SUCCESS && APR_BRIGADE_EMPTY(b))
-                            || (APR_STATUS_IS_EAGAIN(rv)))) {
-                return APR_EAGAIN;
-            }
-
-            if (rv != APR_SUCCESS) {
-                return rv;
-            }
-
-            break;
-        }
         default: {
             /* Should not happen */
             ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, f->r, APLOGNO(02901)

@@ -218,7 +218,8 @@ AP_DECLARE(void) ap_h1_head_opts_init_(ap_h1_head_opts_t *opts,
 /**
  * Create a parser for an HTTP/1 head.
  * @param p The pool of the parser and of the head it parses
- * @param r The request the logs are about (the client's for a backend)
+ * @param r The request the logs are about: for a backend's response head, the
+ *          client's request; for its trailers, the proxied response's
  * @param opts The options, copied
  * @return The parser
  */
@@ -240,6 +241,24 @@ AP_DECLARE(void) ap_h1_head_parser_reset(ap_h1_head_parser_t *parser);
  * @param parser The parser
  */
 AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_h1_head_parser_t *parser);
+
+/**
+ * Set the options of the parser reading r's chunked trailers (HTTP1_BODY_IN),
+ * on the client side or for a proxied response (r->proxyreq ==
+ * PROXYREQ_RESPONSE); without them, the side's defaults
+ * (ap_h1_head_opts_init()) apply.
+ * @param r The request (the backend's for a proxied response)
+ * @param opts The options, copied (kind AP_H1_HEAD_TRAILERS)
+ */
+AP_DECLARE(void) ap_h1_set_trailers_opts(request_rec *r,
+                                         const ap_h1_head_opts_t *opts);
+
+/**
+ * Get the options set by ap_h1_set_trailers_opts(), if any.
+ * @param r The request
+ * @return The options, or NULL
+ */
+AP_DECLARE(const ap_h1_head_opts_t *) ap_h1_get_trailers_opts(request_rec *r);
 
 /**
  * Read the mime-encoded headers.
