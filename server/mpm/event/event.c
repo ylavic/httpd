@@ -350,7 +350,8 @@ struct event_conn_state_t {
         ap_queue_event_t qe;
         struct timeout_queue *q;
     } bse;
-    /** the next one in the listener's timed out backlog connections */
+    /** the next one in the listener's timed out connections (backlog,
+     *  shutdown or linger queue) */
     event_conn_state_t *bl_timed_out_next;
 
     /*
@@ -2425,13 +2426,16 @@ static void process_lingering_close(event_conn_state_t *cs)
 
 /* Call shutdown_connection() for the elements of 'q' that timed out, or
  * for all if 'shrink' is set. The backlog connections are only removed from
- * the worker_queue and chained to *bl_timed_out, for the caller to shut them
- * down once it released the worker_queue's lock.
+ * the worker_queue and chained to *timed_out, for the caller to shut them
+ * down once it released the worker_queue's lock. Likewise for the others when
+ * timed_out is not NULL, only removed from the pollset, for the caller to
+ * shut them down once it released timeout_mutex (closing a connection runs
+ * its pool cleanups).
  * Pre-condition: timeout_mutex must already be locked
  */
 static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                                              apr_time_t now, int shrink,
-                                             event_conn_state_t **bl_timed_out)
+                                             event_conn_state_t **timed_out)
 {
     unsigned int count = 0;
     struct timeout_queue *q;
@@ -2475,15 +2479,21 @@ static unsigned int process_timeout_queue_ex(struct timeout_queue *queue,
                  */
                 ap_assert(cs_qe(cs)->cb_baton == cs);
                 ap_assert(cs->q == cs->sc->bl_q || cs->q == backlog_linger_q);
-                ap_assert(bl_timed_out != NULL);
+                ap_assert(timed_out != NULL);
                 ap_queue_info_idlers_inc(worker_queue_info);
                 ap_queue_kill_event_locked(worker_queue, cs_qe(cs));
-                cs->bl_timed_out_next = *bl_timed_out;
-                *bl_timed_out = cs;
+                cs->bl_timed_out_next = *timed_out;
+                *timed_out = cs;
             }
             else if (pollset_del(cs, 1)) {
                 /* Removed from the pollset and timeout queue. */
-                shutdown_connection(cs, now, 0);
+                if (timed_out) {
+                    cs->bl_timed_out_next = *timed_out;
+                    *timed_out = cs;
+                }
+                else {
+                    shutdown_connection(cs, now, 0);
+                }
             }
             else {
                 /* Can't go anywhere, kill (and log). */
@@ -2542,6 +2552,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
         apr_time_t next_expiry = -1;
         apr_interval_time_t timeout = -1;
         int above_limit = 0;
+        event_conn_state_t *expired = NULL;
         socket_callback_baton_t *user_chain;
         const apr_pollfd_t *out_pfd;
         apr_time_t now, poll_time;
@@ -2906,14 +2917,17 @@ do_maintenance:
             /* Process shutdown_q first because the expired entries from the
              * other queues will go there and don't need to be checked twice
              * (nor do we want to potentially kill them before the shutdown).
+             * The expired shutting down and lingering connections are closed
+             * after releasing timeout_mutex (their pool cleanups must not run
+             * under it).
              */
-            process_timeout_queue(shutdown_q, now);
+            (void)process_timeout_queue_ex(shutdown_q, now, 0, &expired);
 
             process_timeout_queue(waitio_q, now);
             process_timeout_queue(write_completion_q, now);
             process_timeout_queue(keepalive_q, now);
 
-            process_timeout_queue(linger_q, now);
+            (void)process_timeout_queue_ex(linger_q, now, 0, &expired);
 
             /* Connections in backlog race with the workers (dequeuing) under
              * the worker_queue mutex. Shut the timed out ones down after
@@ -2938,6 +2952,13 @@ do_maintenance:
 
             next_expiry = queues_next_expiry;
             apr_thread_mutex_unlock(timeout_mutex);
+
+            while (expired) {
+                event_conn_state_t *cs = expired;
+                expired = cs->bl_timed_out_next;
+                cs->bl_timed_out_next = NULL;
+                shutdown_connection(cs, now, 0);
+            }
 
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "queues maintained: next timeout=%" APR_TIME_T_FMT,
