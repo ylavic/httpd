@@ -137,6 +137,7 @@ typedef struct {
     apr_size_t limit_field;         /**< field line length, obs-folds joined,
                                      *   its line end excluded */
     unsigned int limit_fields;      /**< number of headers, 0 for no limit */
+    int module_index;               /**< the module logging the errors */
 } ap_h1_head_opts_t;
 
 /** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */
@@ -155,7 +156,7 @@ typedef struct ap_getline_state ap_getline_state_t;
 /**
  * Initialize the options of an HTTP/1 head parser with the client side's
  * defaults: HttpProtocolOptions (Strict or Unsafe) and the LimitRequest* of
- * r's server, merging the headers.
+ * r's server, merging the headers. The module logging the errors is mod_http.
  * @param opts The options to initialize
  * @param r The request whose server's configuration applies
  */

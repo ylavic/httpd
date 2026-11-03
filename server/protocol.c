@@ -213,6 +213,13 @@ AP_DECLARE(apr_time_t) ap_rationalize_mtime(request_rec *r, apr_time_t mtime)
  *
  *        If no LF is detected on the last line due to a dropped connection
  *        or a full buffer, that's considered an error.
+ *
+ * Reading an HTTP/1 head (the parser's state), the rules are checked as the
+ * bytes come, failing at once (APR_EINVAL, the cause in state->line_error):
+ * no NUL byte, no whitespace before the first field line, no blank
+ * continuation line; an obs-fold counts in the line's length as the SP that
+ * replaces it. And the continuation lines are looked for in the next line
+ * read (not peeked at), whose start is then kept in bb for the next call.
  */
 enum folding_state_e {
     NOT_FOLDING = 0,
@@ -220,6 +227,13 @@ enum folding_state_e {
     FOLDING_READ,
     FOLDING_DONE,
 };
+typedef enum {
+    LINE_OK = 0,
+    LINE_NOT_CRLF,          /* not ended by CRLF (AP_GETLINE_CRLF) */
+    LINE_NUL,               /* a NUL byte */
+    LINE_BLANK_FOLD,        /* a blank continuation line */
+    LINE_LEADING_BLANK,     /* a continuation line with no line before */
+} line_error_e;
 struct ap_getline_state {
     char *buf;
     apr_size_t len;
@@ -228,6 +242,7 @@ struct ap_getline_state {
     apr_size_t folding_len;
     enum folding_state_e folding_state;
     apr_status_t late_rv;   /* to return once the line is read */
+    line_error_e line_error;/* the cause of an APR_EINVAL */
     unsigned int folding_col    :1,
                  allocate       :1,
                  reusable       :1,
@@ -241,6 +256,9 @@ struct ap_getline_state {
     ap_h1_head_opts_t opts;
     apr_bucket_brigade *bb;
     ap_h1_head_t *head;
+    int loglevel;           /* of the errors' causes */
+    const char *what;       /* "request header"... */
+    const char *what_line;  /* "request header line"... */
     unsigned int fields_read;
 };
 static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
@@ -249,12 +267,13 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
                                      apr_pool_t *p,
                                      int rec)
 {
-    apr_status_t rv;
+    apr_status_t rv = APR_SUCCESS;
     apr_read_type_e block;
     int fold = flags & AP_GETLINE_FOLD;
     int crlf = flags & AP_GETLINE_CRLF;
     int do_alloc = (flags & AP_GETLINE_ALLOC) || state->allocate;
     int nospc_eol = flags & AP_GETLINE_NOSPC_EOL;
+    int in_head = (state->head != NULL); /* the parser's rules */
     int seen_eol = 0;
     apr_bucket *e;
 
@@ -273,8 +292,13 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
         goto find_folding;
     }
     do {
-        apr_brigade_cleanup(bb);
-        rv = ap_get_brigade(f, bb, AP_MODE_GETLINE, block, 0);
+        /* In a head, bb may hold this line's start already (read when
+         * looking for a continuation line)
+         */
+        if (!in_head || APR_BRIGADE_EMPTY(bb)) {
+            apr_brigade_cleanup(bb);
+            rv = ap_get_brigade(f, bb, AP_MODE_GETLINE, block, 0);
+        }
         if (rv != APR_SUCCESS) {
             goto cleanup;
         }
@@ -295,7 +319,7 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
              e = APR_BUCKET_NEXT(e))
         {
             const char *str;
-            apr_size_t len;
+            apr_size_t len, read_len;
 
             /* APR_EOF on EOS (CRLF is missing) */
             if (APR_BUCKET_IS_EOS(e)) {
@@ -306,6 +330,23 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
             rv = apr_bucket_read(e, &str, &len, APR_BLOCK_READ);
             if (rv != APR_SUCCESS) {
                 goto cleanup;
+            }
+
+            if (in_head && len > 0) {
+                /* PR#43039: no NUL byte */
+                if (memchr(str, '\0', len)) {
+                    state->line_error = LINE_NUL;
+                    rv = APR_EINVAL;
+                    goto cleanup;
+                }
+                /* RFC 9112 2.2: nothing to continue on a first line */
+                if (fold && state->len == 0
+                    && state->folding_state == NOT_FOLDING
+                    && (str[0] == APR_ASCII_BLANK || str[0] == APR_ASCII_TAB)) {
+                    state->line_error = LINE_LEADING_BLANK;
+                    rv = APR_EINVAL;
+                    goto cleanup;
+                }
             }
 
             /* If folding, trim leading blanks */
@@ -323,6 +364,12 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
                 len -= i;
 
                 /* Fail if the line is composed of blanks only */
+                if (in_head && len > 0 && (str[0] == APR_ASCII_CR
+                                           || str[0] == APR_ASCII_LF)) {
+                    state->line_error = LINE_BLANK_FOLD;
+                    rv = APR_EINVAL;
+                    goto cleanup;
+                }
                 if ((len > 0 && str[0] == APR_ASCII_LF)
                      || (len > 1 && str[0] == APR_ASCII_CR
                                  && str[1] == APR_ASCII_LF)) {
@@ -337,10 +384,17 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
                 continue;
             }
 
-            /* Would this exceed the limit?  If so, we'll die. */
-            if (state->len + state->folding_len + len >= state->max_size) {
-                apr_size_t read_len = state->len + state->folding_len;
-
+            /* Would this exceed the limit?  If so, we'll die. In a head, an
+             * obs-fold counts as the SP replacing it.
+             */
+            if (in_head) {
+                read_len = state->len
+                           + (state->folding_state == FOLDING_READ);
+            }
+            else {
+                read_len = state->len + state->folding_len;
+            }
+            if (read_len + len >= state->max_size) {
                 /* Before we die, let's fill the buffer up to its limit (i.e.
                  * fall through with the remaining length, if any), setting
                  * seen_eol on LF to stop the outer loop appropriately; we may
@@ -432,6 +486,7 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
             memcpy(state->buf + state->len, str, len);
             state->len += len;
         }
+        apr_brigade_cleanup(bb);
 
         /* If we got a full line of input, stop reading */
         if (state->len && state->buf[state->len - 1] == APR_ASCII_LF) {
@@ -445,6 +500,7 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
     }
     if (state->folding_state == FOLDING_READ) {
         /* Folding is blank only */
+        state->line_error = LINE_BLANK_FOLD;
         rv = APR_EINVAL;
         goto cleanup;
     }
@@ -463,6 +519,7 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
             state->len--;
         }
         else if (crlf) {
+            state->line_error = LINE_NOT_CRLF;
             rv = APR_EINVAL;
             goto cleanup;
         }
@@ -486,9 +543,17 @@ find_folding:
             apr_size_t len;
             char c = 0;
 
-            /* We only care about the first byte. */
+            /* We only care about the first byte: in a head, of the next
+             * line read (kept in bb for the next call or the recursion),
+             * otherwise peeked at.
+             */
             apr_brigade_cleanup(bb);
-            rv = ap_get_brigade(f, bb, AP_MODE_SPECULATIVE, block, 1);
+            if (in_head) {
+                rv = ap_get_brigade(f, bb, AP_MODE_GETLINE, block, 0);
+            }
+            else {
+                rv = ap_get_brigade(f, bb, AP_MODE_SPECULATIVE, block, 1);
+            }
             if (rv != APR_SUCCESS) {
                 goto cleanup;
             }
@@ -589,7 +654,10 @@ cleanup:
             state->len = len;
         }
     }
-    apr_brigade_cleanup(bb);
+    if (!in_head || rv != APR_SUCCESS) {
+        /* In a head, the next line's start is kept */
+        apr_brigade_cleanup(bb);
+    }
     return rv;
 }
 
@@ -615,6 +683,7 @@ AP_DECLARE(apr_status_t) ap_fgetline_ex(char **s, apr_size_t n,
             state->len = state->alloc_size = state->folding_len = 0;
             state->folding_state = NOT_FOLDING;
             state->late_rv = APR_SUCCESS;
+            state->line_error = LINE_OK;
             state->folding_col = state->allocate = state->seen_nospc = 0;
         }
         if (*s && !(flags & AP_GETLINE_ALLOC)) {
@@ -903,6 +972,46 @@ static int table_do_fn_check_lengths(void *parser_, const char *key,
     return 0;
 }
 
+/* Log under the module given in the options */
+#define H1_LOG_MARK __FILE__, __LINE__, parser->opts.module_index
+
+/* The cause of the line's error rv */
+static void h1_head_line_error(ap_getline_state_t *parser, apr_status_t rv)
+{
+    request_rec *r = parser->r;
+
+    if (rv == APR_ENOSPC) {
+        apr_table_setn(r->notes, "error-notes",
+                       "Size of a request header field exceeds server limit.");
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                      "%s field longer than the limit of %" APR_SIZE_T_FMT
+                      " bytes: %.*s", parser->what, parser->opts.limit_field,
+                      field_name_len(parser->buf), parser->buf);
+        return;
+    }
+    switch (parser->line_error) {
+    case LINE_NOT_CRLF:
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                      "%s not ended by CRLF", parser->what_line);
+        break;
+    case LINE_NUL:
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                      "NUL byte in a %s", parser->what_line);
+        break;
+    case LINE_BLANK_FOLD:
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                      "%s field continued by a blank line: %.*s",
+                      parser->what, field_name_len(parser->buf), parser->buf);
+        break;
+    case LINE_LEADING_BLANK:
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                      "whitespace before the first %s field", parser->what);
+        break;
+    default:
+        break;
+    }
+}
+
 AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
                                                           request_rec *r,
                                                           const ap_h1_head_opts_t *opts)
@@ -912,6 +1021,9 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
     parser->pool = p;
     parser->r = r;
     parser->opts = *opts;
+    parser->loglevel = APLOG_DEBUG;
+    parser->what = "request header";
+    parser->what_line = "request header line";
     parser->head = apr_pcalloc(p, sizeof(*parser->head));
     parser->head->headers = apr_table_make(p, 20);
     return parser;
@@ -927,7 +1039,7 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
     int status = OK;
     int strict = (parser->opts.flags & AP_H1_HEAD_OPT_STRICT);
     apr_size_t max_size = parser->opts.limit_field + 1;
-    int flags = AP_GETLINE_ALLOC | AP_GETLINE_FOLD_COL;
+    int flags = AP_GETLINE_ALLOC | AP_GETLINE_FOLD;
 
     *head = NULL;
     if (strict) {
@@ -968,17 +1080,7 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
              * finding the end-of-line.  This is only going to happen if it
              * exceeds the configured limit for a field size.
              */
-            if (rv == APR_ENOSPC) {
-                apr_table_setn(r->notes, "error-notes",
-                               "Size of a request header field "
-                               "exceeds server limit.");
-                ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(00561)
-                              "Request header exceeds LimitRequestFieldSize%s"
-                              "%.*s",
-                              (field && *field) ? ": " : "",
-                              (field) ? field_name_len(field) : 0,
-                              (field) ? field : "");
-            }
+            h1_head_line_error(parser, rv);
             goto cleanup;
         }
 
@@ -1129,6 +1231,7 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb
 
     /* A header section with the client side's rules, merged */
     ap_h1_head_opts_init(&opts, r);
+    opts.module_index = APLOG_MODULE_INDEX;
     parser = ap_h1_head_parser_create(r->pool, r, &opts);
     rc = ap_get_mime_headers_ex(parser, r->proto_input_filters, APR_BLOCK_READ,
                                 &head);

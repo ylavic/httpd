@@ -1862,4 +1862,5 @@ AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
     }
     opts->limit_field = r->server->limit_req_fieldsize;
     opts->limit_fields = r->server->limit_req_fields;
+    opts->module_index = APLOG_MODULE_INDEX;
 }
