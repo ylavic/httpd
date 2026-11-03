@@ -2201,6 +2201,7 @@ typedef struct h1_request_ctx {
     ap_getline_state_t *getline_state;
     apr_bucket_brigade *tmp_bb;
     int num_blank_lines;
+    ap_getline_state_t *parser; /* the headers' */
 } h1_request_ctx;
 
 static apr_status_t read_request_line(h1_request_ctx *ctx,
@@ -2265,7 +2266,9 @@ apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
     h1_request_ctx *ctx = f->ctx;
     apr_status_t rv = APR_SUCCESS;
     int http_status = HTTP_OK;
+    ap_h1_head_t *head;
     apr_bucket *e;
+    int rc;
 
     /* just get out of the way for things we don't want to handle. */
     if (mode != AP_MODE_READBYTES && mode != AP_MODE_GETLINE) {
@@ -2331,28 +2334,30 @@ apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
             break;
 
         case REQ_HEADERS:
-            rv = ap_get_mime_headers_ex(r, f->next, block, ctx->tmp_bb,
-                                        &ctx->getline_state);
-            apr_brigade_cleanup(ctx->tmp_bb);
+            if (!ctx->parser) {
+                ap_h1_head_opts_t opts;
 
-            if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
-                ap_log_rerror(APLOG_MARK, APLOG_TRACE6, rv, r,
+                ap_h1_head_opts_init(&opts, r);
+                ctx->parser = ap_h1_head_parser_create(r->pool, r, &opts);
+            }
+            rc = ap_get_mime_headers_ex(ctx->parser, f->next, block, &head);
+
+            if (rc == AGAIN) {
+                ap_log_rerror(APLOG_MARK, APLOG_TRACE6, 0, r,
                               "reading request headers");
+                rv = APR_EAGAIN;
                 goto cleanup;
             }
-            if (rv != APR_SUCCESS || r->status != HTTP_OK) {
-                http_status = (r->status == HTTP_OK
-                               ? HTTP_INTERNAL_SERVER_ERROR
-                               : r->status);
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO(00567)
+            if (rc != OK) {
+                http_status = rc;
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00567)
                               "request failed: error reading the headers (%i)",
                               http_status);
-                r->status = HTTP_OK;
                 goto cleanup;
             }
 
             e = ap_bucket_request_createn(ctx->method, ctx->uri,
-                                          ctx->protocol, r->headers_in,
+                                          ctx->protocol, head->headers,
                                           r->pool, r->connection->bucket_alloc);
             APR_BRIGADE_INSERT_TAIL(bb, e);
 

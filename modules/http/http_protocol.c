@@ -1848,3 +1848,18 @@ AP_DECLARE(int) ap_h1_tokenize_request_line(
     }
     return 1;
 }
+
+AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
+                                      request_rec *r)
+{
+    core_server_config *conf =
+        ap_get_core_module_config(r->server->module_config);
+
+    memset(opts, 0, sizeof(*opts));
+    opts->flags = AP_H1_HEAD_OPT_MERGE;
+    if (conf->http_conformance != AP_HTTP_CONFORMANCE_UNSAFE) {
+        opts->flags |= AP_H1_HEAD_OPT_STRICT;
+    }
+    opts->limit_field = r->server->limit_req_fieldsize;
+    opts->limit_fields = r->server->limit_req_fields;
+}

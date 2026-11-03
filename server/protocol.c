@@ -228,12 +228,20 @@ struct ap_getline_state {
     apr_size_t folding_len;
     enum folding_state_e folding_state;
     apr_status_t late_rv;   /* to return once the line is read */
-    int fields_read;        /* ap_get_mime_headers_ex()'s count, kept
-                             * across the lines */
     unsigned int folding_col    :1,
                  allocate       :1,
                  reusable       :1,
                  seen_nospc     :1;
+
+    /* The HTTP/1 head parser's (ap_get_mime_headers_ex()), kept across the
+     * lines
+     */
+    apr_pool_t *pool;
+    request_rec *r;
+    ap_h1_head_opts_t opts;
+    apr_bucket_brigade *bb;
+    ap_h1_head_t *head;
+    unsigned int fields_read;
 };
 static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
                                      ap_filter_t *f, int flags,
@@ -602,9 +610,12 @@ AP_DECLARE(apr_status_t) ap_fgetline_ex(char **s, apr_size_t n,
             *state_p = state = apr_pcalloc(p, sizeof(*state));
         }
         else {
-            int fields_read = state->fields_read;
-            memset(state, 0, sizeof(*state));
-            state->fields_read = fields_read;
+            /* A new line, the parser's members kept */
+            state->buf = NULL;
+            state->len = state->alloc_size = state->folding_len = 0;
+            state->folding_state = NOT_FOLDING;
+            state->late_rv = APR_SUCCESS;
+            state->folding_col = state->allocate = state->seen_nospc = 0;
         }
         if (*s && !(flags & AP_GETLINE_ALLOC)) {
             state->buf = *s;
@@ -639,6 +650,19 @@ AP_DECLARE(apr_status_t) ap_fgetline_ex(char **s, apr_size_t n,
     return rv;
 }
 
+/* ap_fgetline_ex() for the parser: the line in state->buf and state->len,
+ * read with the parser's brigade and allocated in its pool
+ */
+static apr_status_t ap_fgetline_state(ap_getline_state_t *state,
+                                      ap_filter_t *f, apr_size_t n, int flags)
+{
+    char *s = NULL;
+    apr_size_t len;
+
+    return ap_fgetline_ex(&s, n, &len, f, flags, state->bb, &state,
+                          state->pool);
+}
+
 AP_DECLARE(apr_status_t) ap_fgetline(char **s, apr_size_t n,
                                      apr_size_t *read, ap_filter_t *f,
                                      int flags, apr_bucket_brigade *bb,
@@ -646,8 +670,7 @@ AP_DECLARE(apr_status_t) ap_fgetline(char **s, apr_size_t n,
 {
     ap_getline_state_t stack_state;
     ap_getline_state_t *state = &stack_state;
-    state->reusable = 0;
-    state->fields_read = 0; /* kept by ap_fgetline_ex() */
+    memset(state, 0, sizeof(*state));
 
     return ap_fgetline_ex(s, n, read, f, flags, bb, &state, p);
 }
@@ -864,14 +887,14 @@ AP_DECLARE(int) ap_check_request_header(request_rec *r)
     return 1;
 }
 
-static int table_do_fn_check_lengths(void *r_, const char *key,
+static int table_do_fn_check_lengths(void *parser_, const char *key,
                                      const char *value)
 {
-    request_rec *r = r_;
-    if (value == NULL || r->server->limit_req_fieldsize >= strlen(value) )
+    ap_getline_state_t *parser = parser_;
+    request_rec *r = parser->r;
+    if (value == NULL || parser->opts.limit_field >= strlen(value) )
         return 1;
 
-    r->status = HTTP_BAD_REQUEST;
     apr_table_setn(r->notes, "error-notes",
                    "Size of a request header field exceeds server limit.");
     ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(00560) "Request "
@@ -880,23 +903,41 @@ static int table_do_fn_check_lengths(void *r_, const char *key,
     return 0;
 }
 
-AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
-                                                ap_filter_t *f,
-                                                apr_read_type_e block,
-                                                apr_bucket_brigade *bb,
-                                                ap_getline_state_t **state_p)
+AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
+                                                          request_rec *r,
+                                                          const ap_h1_head_opts_t *opts)
 {
+    ap_getline_state_t *parser = apr_pcalloc(p, sizeof(*parser));
+
+    parser->pool = p;
+    parser->r = r;
+    parser->opts = *opts;
+    parser->head = apr_pcalloc(p, sizeof(*parser->head));
+    parser->head->headers = apr_table_make(p, 20);
+    return parser;
+}
+
+AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
+                                       ap_filter_t *f,
+                                       apr_read_type_e block,
+                                       ap_h1_head_t **head)
+{
+    request_rec *r = parser->r;
     apr_status_t rv = APR_SUCCESS;
-    core_server_config *conf = ap_get_core_module_config(r->server->module_config);
-    int strict = (conf->http_conformance != AP_HTTP_CONFORMANCE_UNSAFE);
-    apr_size_t max_size = r->server->limit_req_fieldsize + 1;
+    int status = OK;
+    int strict = (parser->opts.flags & AP_H1_HEAD_OPT_STRICT);
+    apr_size_t max_size = parser->opts.limit_field + 1;
     int flags = AP_GETLINE_ALLOC | AP_GETLINE_FOLD_COL;
 
+    *head = NULL;
     if (strict) {
         flags |= AP_GETLINE_CRLF;
     }
     if (block == APR_NONBLOCK_READ) {
         flags |= AP_GETLINE_NONBLOCK;
+    }
+    if (!parser->bb) {
+        parser->bb = apr_brigade_create(parser->pool, f->c->bucket_alloc);
     }
 
     /*
@@ -904,21 +945,23 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
      * the connection closes (EOF), reach the server limit, or we timeout.
      */
     while(1) {
-        char *field = NULL;
-        apr_size_t len = 0;
+        char *field;
+        apr_size_t len;
 
         /* max_size + 2 for CRLF */
-        rv = ap_fgetline_ex(&field, max_size + 2, &len, f, flags, bb,
-                            state_p, r->pool);
+        rv = ap_fgetline_state(parser, f, max_size + 2, flags);
+        field = parser->buf;
+        len = parser->len;
         if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
+            status = AGAIN;
             goto cleanup;
         }
         if (rv != APR_SUCCESS) {
             if (APR_STATUS_IS_TIMEUP(rv)) {
-                r->status = HTTP_REQUEST_TIME_OUT;
+                status = HTTP_REQUEST_TIME_OUT;
             }
             else {
-                r->status = HTTP_BAD_REQUEST;
+                status = HTTP_BAD_REQUEST;
             }
 
             /* ap_fgetline returns APR_ENOSPC if it fills up the buffer before
@@ -960,20 +1003,18 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
              * concatenated.
              */
 
-            /* Counted in the state, which a non-blocking read keeps
+            /* Counted in the parser, which a non-blocking read keeps
              * across the calls (EAGAIN)
              */
-            if (r->server->limit_req_fields
-                    && (++(*state_p)->fields_read
-                        > r->server->limit_req_fields)) {
-                r->status = HTTP_BAD_REQUEST;
+            if (parser->opts.limit_fields
+                    && (++parser->fields_read > parser->opts.limit_fields)) {
+                status = HTTP_BAD_REQUEST;
                 apr_table_setn(r->notes, "error-notes",
                                "The number of request header fields "
                                "exceeds this server's limit.");
                 ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(00563)
                               "Number of request headers exceeds "
                               "LimitRequestFields");
-                rv = APR_ENOSPC;
                 goto cleanup;
             }
 
@@ -981,31 +1022,28 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
                 /* Not Strict ('Unsafe' mode), using the legacy parser */
 
                 if (!(value = strchr(field, ':'))) { /* Find ':' or */
-                    r->status = HTTP_BAD_REQUEST;   /* abort bad request */
+                    status = HTTP_BAD_REQUEST;      /* abort bad request */
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00564)
                                   "Request header field is missing ':' "
                                   "separator: %.*s", (int)LOG_NAME_MAX_LEN,
                                   field);
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
 
                 if (value == field) {
-                    r->status = HTTP_BAD_REQUEST;
+                    status = HTTP_BAD_REQUEST;
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03453)
                                   "Request header field name was empty");
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
 
                 *value++ = '\0'; /* NUL-terminate at colon */
 
                 if (strpbrk(field, "\t\n\v\f\r ")) {
-                    r->status = HTTP_BAD_REQUEST;
+                    status = HTTP_BAD_REQUEST;
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03452)
                                   "Request header field name presented"
                                   " invalid whitespace");
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
 
@@ -1014,11 +1052,10 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
                 }
 
                 if (strpbrk(value, "\n\v\f\r")) {
-                    r->status = HTTP_BAD_REQUEST;
+                    status = HTTP_BAD_REQUEST;
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03451)
                                   "Request header field value presented"
                                   " bad whitespace");
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
             }
@@ -1028,11 +1065,10 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
                 /* Ensure valid token chars before ':' per RFC 7230 3.2.4 */
                 value = (char *)ap_scan_http_token(field);
                 if ((value == field) || *value != ':') {
-                    r->status = HTTP_BAD_REQUEST;
+                    status = HTTP_BAD_REQUEST;
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(02426)
                                   "Request header field name is malformed: "
                                   "%.*s", (int)LOG_NAME_MAX_LEN, field);
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
 
@@ -1048,41 +1084,64 @@ AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
                  * for specific header handler logic later in the cycle
                  */
                 if (*ap_scan_http_field_content(value) != '\0') {
-                    r->status = HTTP_BAD_REQUEST;
+                    status = HTTP_BAD_REQUEST;
                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(02427)
                                   "Request header value is malformed: "
                                   "%.*s", (int)LOG_NAME_MAX_LEN, value);
-                    rv = APR_EINVAL;
                     goto cleanup;
                 }
             }
 
-            apr_table_addn(r->headers_in, field, value);
+            apr_table_addn(parser->head->headers, field, value);
 
-            /* This field header is now stored in headers_in,
+            /* This field header is now stored in the head's headers,
              * resume processing of the current input line.
              */
         }
     }
 
-    /* Combine multiple message-header fields with the same
-     * field-name, following RFC 2616, 4.2.
-     */
-    apr_table_compress(r->headers_in, APR_OVERLAP_TABLES_MERGE);
+    if (parser->opts.flags & AP_H1_HEAD_OPT_MERGE) {
+        /* Combine multiple message-header fields with the same
+         * field-name, following RFC 2616, 4.2.
+         */
+        apr_table_compress(parser->head->headers, APR_OVERLAP_TABLES_MERGE);
 
-    /* enforce LimitRequestFieldSize for merged headers */
-    apr_table_do(table_do_fn_check_lengths, r, r->headers_in, NULL);
+        /* enforce LimitRequestFieldSize for merged headers */
+        if (!apr_table_do(table_do_fn_check_lengths, parser,
+                          parser->head->headers, NULL)) {
+            status = HTTP_BAD_REQUEST;
+            goto cleanup;
+        }
+    }
+    *head = parser->head;
 
 cleanup:
-    apr_brigade_cleanup(bb);
-    return rv;
+    apr_brigade_cleanup(parser->bb);
+    return status;
 }
 
 AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb)
 {
-    ap_getline_state_t *state = NULL;
-    (void)ap_get_mime_headers_ex(r, r->proto_input_filters, APR_BLOCK_READ,
-                                 bb, &state);
+    ap_h1_head_opts_t opts;
+    ap_getline_state_t *parser;
+    ap_h1_head_t *head;
+    int rc;
+
+    /* A header section with the client side's rules, merged */
+    ap_h1_head_opts_init(&opts, r);
+    parser = ap_h1_head_parser_create(r->pool, r, &opts);
+    rc = ap_get_mime_headers_ex(parser, r->proto_input_filters, APR_BLOCK_READ,
+                                &head);
+    if (rc != OK) {
+        r->status = rc;
+        return;
+    }
+    /* Copied into the caller's r->headers_in, the table itself since
+     * callers may hold it, merged: apr_table_overlap() adds the headers then
+     * compresses the whole table with APR_OVERLAP_TABLES_MERGE, as reading
+     * the headers into it does
+     */
+    apr_table_overlap(r->headers_in, head->headers, APR_OVERLAP_TABLES_MERGE);
 }
 
 AP_DECLARE(void) ap_get_mime_headers(request_rec *r)

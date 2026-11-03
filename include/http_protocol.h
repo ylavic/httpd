@@ -118,11 +118,60 @@ AP_DECLARE(int) ap_parse_request_line(request_rec *r);
  */
 AP_DECLARE(int) ap_check_request_header(request_rec *r);
 
+/** RFC 9112's rules: CRLF line ends, token field names and field-content
+ * values; otherwise (Unsafe) bare LF line ends, field names without
+ * whitespace and field values without LF, VT, FF nor CR are accepted
+ */
+#define AP_H1_HEAD_OPT_STRICT  (1u << 0)
+/** Merge the headers of the same name (RFC 9110 5.3) once the head is read,
+ * and check the merged values against limit_field
+ */
+#define AP_H1_HEAD_OPT_MERGE   (1u << 2)
+
 /**
- * Reentrant state for ap_fgetline_ex() and ap_get_mime_headers_ex()
+ * The options of an HTTP/1 head parser. As with ap_fgetline(), a line may
+ * be longer than its limit by one byte, or by two if it ends with a bare LF.
+ */
+typedef struct {
+    unsigned int flags;             /**< AP_H1_HEAD_OPT_* */
+    apr_size_t limit_field;         /**< field line length, obs-folds joined,
+                                     *   its line end excluded */
+    unsigned int limit_fields;      /**< number of headers, 0 for no limit */
+} ap_h1_head_opts_t;
+
+/** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */
+typedef struct {
+    apr_table_t *headers;           /**< in the order received, not merged
+                                     *   unless AP_H1_HEAD_OPT_MERGE */
+} ap_h1_head_t;
+
+/**
+ * Reentrant state for ap_fgetline_ex(), and the HTTP/1 head parser of
+ * ap_get_mime_headers_ex()
  */
 struct ap_getline_state; /* opaque */
 typedef struct ap_getline_state ap_getline_state_t;
+
+/**
+ * Initialize the options of an HTTP/1 head parser with the client side's
+ * defaults: HttpProtocolOptions (Strict or Unsafe) and the LimitRequest* of
+ * r's server, merging the headers.
+ * @param opts The options to initialize
+ * @param r The request whose server's configuration applies
+ */
+AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
+                                      request_rec *r);
+
+/**
+ * Create a parser for an HTTP/1 head.
+ * @param p The pool of the parser and of the head it parses
+ * @param r The request the logs are about
+ * @param opts The options, copied
+ * @return The parser
+ */
+AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
+                                                          request_rec *r,
+                                                          const ap_h1_head_opts_t *opts);
 
 /**
  * Read the mime-encoded headers.
@@ -140,23 +189,22 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
                                           apr_bucket_brigade *bb);
 
 /**
- * Reentrant version of ap_get_mime_headers() reading from an input
- * filter in blocking or non-blocking mode.
- * @param r The current request
+ * Read and parse an HTTP/1 head from an input filter, as far as the input
+ * goes, in blocking or non-blocking mode.
+ * @param parser The parser (ap_h1_head_parser_create())
  * @param f Input filter to read from
  * @param block  How the operations should be performed
  *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
- * @param bb temp brigade
- * @param state_p State of the parsing, must point to NULL on the first
- *        call for a header (or to a state used by ap_fgetline_ex() only);
- *        kept on output (not reset to NULL), the next call resumes after
- *        APR_EAGAIN; it counts the fields read for LimitRequestFields
+ * @param head Set to the head on OK, to NULL otherwise
+ * @return OK: the head is complete (and its input consumed);
+ *         AGAIN: non-blocking and more input is needed: call again once f's
+ *         connection is readable, the state is kept;
+ *         or an HTTP status: HTTP_BAD_REQUEST or HTTP_REQUEST_TIME_OUT
  */
-AP_DECLARE(apr_status_t) ap_get_mime_headers_ex(request_rec *r,
-                                                ap_filter_t *f,
-                                                apr_read_type_e block,
-                                                apr_bucket_brigade *bb,
-                                                ap_getline_state_t **state_p);
+AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
+                                       ap_filter_t *f,
+                                       apr_read_type_e block,
+                                       ap_h1_head_t **head);
 
 /**
  * Run post_read_request hook and validate.
