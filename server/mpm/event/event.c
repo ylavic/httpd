@@ -7396,7 +7396,7 @@ static void *APR_THREAD_FUNC start_threads(apr_thread_t * thd, void *dummy)
     int loops, i;
 
     ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(02471)
-                 "start_threads: Using %s (wakeable)",
+                 "start_threads: Using %s",
                  apr_pollset_method_name(event_pollset));
 
     loops = prev_threads_created = 0;
@@ -8491,7 +8491,7 @@ static int event_run(apr_pool_t * _pconf, apr_pool_t * plog, server_rec * s)
                  num_buckets, num_cpus, max_client_conns, clients_per_child,
                  (unsigned int)clients_share, elastic_threads ? "on" : "off",
 #ifdef EVENT_WORKER_POLL
-                 "on"   /* where the pollset method allows (children) */
+                 "on"   /* unless the workers' pollset can't be created */
 #else
                  "off"
 #endif
@@ -9192,13 +9192,15 @@ static int event_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
 
     /* sigh, want this only the second time around */
     if (retained->mpm->module_loads == 2) {
+        /* The pollset the children need (see start_threads()) */
         apr_pollset_t *tmp = NULL;
-        rv = apr_pollset_create(&tmp, 1, plog,
-                                APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY);
+        rv = pollset_create_good(&tmp, 1, plog,
+                                 APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY |
+                                 APR_POLLSET_WAKEABLE | APR_POLLSET_NODEFAULT);
         if (rv != APR_SUCCESS) {
             ap_log_error(APLOG_MARK, APLOG_CRIT, rv, NULL, APLOGNO(00495)
-                         "Couldn't create a Thread Safe Pollset. "
-                         "Is it supported on your platform?"
+                         "Couldn't create a thread safe and wakeable pollset "
+                         "with port, kqueue or epoll. "
                          "Also check system or user limits!");
             return HTTP_INTERNAL_SERVER_ERROR;
         }
