@@ -212,6 +212,9 @@
 #define LINGER_READ_TIMEOUT     apr_time_from_sec(SECONDS_TO_LINGER)
 #define LINGER_READS_PER_PASS   4
 
+/* Shrink linger_q at this period (min) while the connections are full */
+#define QUEUES_SHRINK_TIMEOUT   apr_time_from_msec(500)
+
 /* Update scoreboard stats at this period */
 #define STATS_UPDATE_TIMEOUT    apr_time_from_msec(1000)
 
@@ -1310,8 +1313,10 @@ static apr_time_t listensocks_off_since, listensocks_off_time;
 static apr_time_t share_off_since, share_off_time;
 static apr_time_t fair_share_stopped; /* when it last stopped for the share */
 
-/* The backlog's connections shut down for their timeout (listener only) */
-static apr_uint32_t backlog_dropped;
+/* The backlog's connections shut down for their timeout, the lingering ones
+ * closed by shrink_timeout_queue() (listener only)
+ */
+static apr_uint32_t backlog_dropped, linger_shrinked;
 
 static apr_time_t listensocks_suspended_at; /* the last stop, for its trace */
 
@@ -1473,14 +1478,15 @@ static void backlog_stats_report(apr_time_t now)
     share_toggles = 0;
 
     ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
-                 "backlog sojourn:%s; dropped %u; accept off %u times, %"
+                 "backlog sojourn:%s; dropped %u; linger shrinked %u;"
+                 " accept off %u times, %"
                  APR_TIME_T_FMT "ms, backstop %u,"
                  " share %u times %" APR_TIME_T_FMT "ms,"
                  " resumed woken %u recheck %u share %u other %u;"
                  " drain polls=%u csd=%u user=%u dropped=%u"
                  " misses=%u promotions=%u; wait timeouts queued=%u"
                  " skiplist=%u; accept offs ended %u: p50<%uus,max=%uus",
-                 len ? buf : " none", backlog_dropped,
+                 len ? buf : " none", backlog_dropped, linger_shrinked,
                  toggles, apr_time_as_msec(off),
                  apr_atomic_xchg32(&admission_backstops, 0),
                  share_n, apr_time_as_msec(share_off),
@@ -1499,7 +1505,7 @@ static void backlog_stats_report(apr_time_t now)
                   : 0),
                  accept_off_max);
     resumes_woken = resumes_recheck = resumes_share = resumes_other = 0;
-    backlog_dropped = 0;
+    backlog_dropped = linger_shrinked = 0;
     memset(accept_off_hist, 0, sizeof(accept_off_hist));
     accept_off_ended = accept_off_max = 0;
 }
@@ -4972,6 +4978,7 @@ static void process_lingering_close(event_conn_state_t *cs)
     }
     if ((rv != APR_SUCCESS && !APR_STATUS_IS_EAGAIN(rv))
         || linger_expired(cs, event_time_now())
+        || connections_full() /* short of connections */
         || !pollset_add(cs, CONN_SENSE_WANT_READ, linger_q, NULL)) {
         close_connection(cs);
     }
@@ -5065,16 +5072,31 @@ static APR_INLINE void process_timeout_queue(struct timeout_queue *queue,
     (void)process_timeout_queue_ex(queue, now, 0, NULL);
 }
 
-/* When all workers are busy or dying, kill'em all \m/ */
+/* When the connections are full, kill'em all \m/ (chained to *timed_out
+ * for the caller to shut them down, see process_timeout_queue_ex())
+ */
 static APR_INLINE void shrink_timeout_queue(struct timeout_queue *queue,
-                                            apr_time_t now)
+                                            apr_time_t now,
+                                            event_conn_state_t **timed_out)
 {
-    unsigned int count = process_timeout_queue_ex(queue, now, 1, NULL);
+    unsigned int count = process_timeout_queue_ex(queue, now, 1, timed_out);
+    linger_shrinked += count;
     if (count) {
         ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
-                     "All workers are %s, %s queue shrinked (%u done, %u left)",
-                     apr_atomic_read32(&dying) ? "dying" : "busy", queue->name,
-                     count, apr_atomic_read32(queue->total));
+                     "Connections full, %s queue shrinked (%u done, %u left)",
+                     queue->name, count, apr_atomic_read32(queue->total));
+    }
+}
+
+/* Shut down the connections chained by process_timeout_queue_ex() */
+static void shutdown_timed_out(event_conn_state_t *timed_out, apr_time_t now,
+                               int in_backlog)
+{
+    while (timed_out) {
+        event_conn_state_t *cs = timed_out;
+        timed_out = cs->bl_timed_out_next;
+        cs->bl_timed_out_next = NULL;
+        shutdown_connection(cs, now, in_backlog);
     }
 }
 
@@ -5127,7 +5149,7 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
     proc_info *ti = dummy;
     int process_slot = ti->pslot;
     process_score *ps = ap_get_scoreboard_process(process_slot);
-    apr_time_t next_stats_time = 0;
+    apr_time_t next_stats_time = 0, next_shrink_time = 0;
     unsigned int recheck_timedout = 0; /* RECHECK_* that timed out last */
 
     free(ti);
@@ -5786,7 +5808,16 @@ do_maintenance:
             process_timeout_queue(write_completion_q, now);
             process_timeout_queue(keepalive_q, now);
 
-            (void)process_timeout_queue_ex(linger_q, now, 0, &expired);
+            /* The linger queue is shrinked while the connections are full,
+             * at most every QUEUES_SHRINK_TIMEOUT.
+             */
+            if (next_shrink_time <= now && connections_full()) {
+                shrink_timeout_queue(linger_q, now, &expired);
+                next_shrink_time = now + QUEUES_SHRINK_TIMEOUT;
+            }
+            else {
+                (void)process_timeout_queue_ex(linger_q, now, 0, &expired);
+            }
 
             /* Connections in backlog race with the workers (dequeuing) under
              * the worker_queue mutex. Shut the timed out ones down after
@@ -5801,27 +5832,27 @@ do_maintenance:
                 (void)process_timeout_queue_ex(backlog_q, now, 0, &bl_timed_out);
                 ap_queue_unlock(worker_queue);
 
-                while (bl_timed_out) {
-                    event_conn_state_t *cs = bl_timed_out;
-                    bl_timed_out = cs->bl_timed_out_next;
-                    cs->bl_timed_out_next = NULL;
-                    shutdown_connection(cs, now, 1);
-                }
+                shutdown_timed_out(bl_timed_out, now, 1);
             }
 
             next_expiry = conn_queues.next_expiry;
             apr_thread_mutex_unlock(conn_queues.mutex);
 
-            while (expired) {
-                event_conn_state_t *cs = expired;
-                expired = cs->bl_timed_out_next;
-                cs->bl_timed_out_next = NULL;
-                shutdown_connection(cs, now, 0);
-            }
+            shutdown_timed_out(expired, now, 0);
 
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          "queues maintained: next timeout=%" APR_TIME_T_FMT,
                          next_expiry ? next_expiry - now : -1);
+        }
+        else if (next_shrink_time <= now
+                 && apr_atomic_read32(linger_q->total)
+                 && connections_full()) {
+            apr_thread_mutex_lock(conn_queues.mutex);
+            shrink_timeout_queue(linger_q, now, &expired);
+            apr_thread_mutex_unlock(conn_queues.mutex);
+            next_shrink_time = now + QUEUES_SHRINK_TIMEOUT;
+
+            shutdown_timed_out(expired, now, 0);
         }
     } /* listener main loop */
 
