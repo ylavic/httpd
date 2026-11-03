@@ -2656,6 +2656,9 @@ static void setup_threads_runtime(void)
     ap_listen_rec *lr;
     apr_pool_t *pskip = NULL;
     int max_recycled_pools = -1, i;
+    /* The pollset methods event uses: they hold any number of descriptors and
+     * support APR_POLLSET_THREADSAFE (event is built only where one exists).
+     */
     const int good_methods[] = { APR_POLLSET_KQUEUE,
                                  APR_POLLSET_PORT,
                                  APR_POLLSET_EPOLL };
@@ -2729,10 +2732,10 @@ static void setup_threads_runtime(void)
         clean_child_exit(APEXIT_CHILDFATAL);
     }
 
-    /* Create the main pollset. APR_POLLSET_WAKEABLE is required (any method
-     * implements it with APR >= 1.4), we account for the wakeup pipe
-     * explicitely with pollset_size+1 because some pollset implementations
-     * don't do it implicitely in APR.
+    /* Create the main pollset with a good method. APR_POLLSET_WAKEABLE is
+     * required (any method implements it with APR >= 1.4), we account for
+     * the wakeup pipe explicitely with pollset_size+1 because some pollset
+     * implementations don't do it implicitely in APR.
      */
     pollset_flags = APR_POLLSET_THREADSAFE | APR_POLLSET_NOCOPY |
                     APR_POLLSET_WAKEABLE | APR_POLLSET_NODEFAULT;
@@ -2742,11 +2745,6 @@ static void setup_threads_runtime(void)
         if (rv == APR_SUCCESS) {
             break;
         }
-    }
-    if (rv != APR_SUCCESS) {
-        pollset_flags &= ~APR_POLLSET_NODEFAULT;
-        rv = apr_pollset_create(&event_pollset, pollset_size + 1, pruntime,
-                                pollset_flags);
     }
     if (rv != APR_SUCCESS) {
         ap_log_error(APLOG_MARK, APLOG_ERR, rv, ap_server_conf, APLOGNO(03103)
