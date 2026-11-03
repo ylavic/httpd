@@ -41,11 +41,11 @@ class TCPFaker:
         self._socket.close()
 
     def _make_response(self, data):
-        return """HTTP/1.1 200 OK
-Content-Type: text/html
-Content-Length: 5
-
-Hello""".encode()
+        return (b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html\r\n"
+                b"Content-Length: 5\r\n"
+                b"\r\n"
+                b"Hello")
     
     def _process(self):
         _read_buffer = 8192 if sys.platform == "win32" else 4096

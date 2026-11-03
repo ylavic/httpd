@@ -49,8 +49,6 @@ static int proxy_http_can_suspend(request_rec *r, proxy_dir_conf *dconf)
 static int (*ap_proxy_clear_connection_fn)(request_rec *r, apr_table_t *headers) =
         NULL;
 
-static apr_status_t ap_proxygetline(apr_bucket_brigade *bb, char *s, int n,
-                                    request_rec *r, int flags, int *read);
 
 static const char *get_url_scheme(const char **url, int *is_ssl)
 {
@@ -340,15 +338,16 @@ typedef struct {
     /* The request's sending state (stream_reqbody()) */
     apr_off_t bytes_streamed;
 
-    /* The response head(s), pre-read without blocking by
-     * proxy_http_response_preread() and then served to the parsing by
-     * ap_proxygetline().
+    /* The response heads, read (without blocking when async) by
+     * proxy_http_response_read_heads() with ap_h1_head_parse(), then
+     * processed in order by ap_proxy_http_process_response().
      */
-    apr_array_header_t *head_lines;
-    int head_next;
-    int head_final_idx; /* where the final head's lines start */
-    ap_getline_state_t *head_state;
-    apr_bucket_brigade *head_bb;
+    ap_h1_head_parser_t *head_parser;
+    apr_array_header_t *heads;  /* ap_h1_head_t *, as read */
+    int head_next;              /* the next one to process */
+    int head_interims;          /* the interim ones read */
+    int head_rc;                /* the parsing's DONE or error, if failed */
+    ap_h1_head_t *head_failed;  /* the head failed, as parsed (if any) */
 
     /* The state of the steps run by proxy_http_process(), including a
      * connect in progress (proxy_http_connect())
@@ -368,11 +367,7 @@ typedef struct {
                  backend_broke          :1,
                  request_timed_out         :1, /* the wait for the client did */
                  request_eos               :1,
-                 head_in_headers        :1,
-                 head_interim           :1,
-                 head_continue          :1,
-                 head_stray             :1,
-                 head_final             :1, /* the final head is pre-read */
+                 head_final             :1, /* the final head is read */
                  do_100_continue        :1,
                  prefetch_nonblocking   :1,
                  force10                :1,
@@ -401,21 +396,6 @@ static proxy_http_rctx_t *proxy_http_rctx(request_rec *r)
     }
     return rctx;
 }
-
-/* The current attempt of a request, if any */
-static proxy_http_req_t *proxy_http_req(request_rec *r)
-{
-    proxy_http_rctx_t *rctx = ap_get_module_config(r->request_config,
-                                                   &proxy_http_module);
-    return rctx ? rctx->req : NULL;
-}
-
-/* A response head line pre-read by proxy_http_response_preread() */
-typedef struct {
-    char *line;
-    apr_size_t len;
-    apr_status_t rv;
-} proxy_head_line_t;
 
 static void proxy_http_async_finish(proxy_http_req_t *req, int status);
 
@@ -485,7 +465,8 @@ static void proxy_http_async_finish(proxy_http_req_t *req, int status)
     ap_proxy_handler_done(r, status);
 }
 
-static int proxy_http_response_preread(proxy_http_req_t *req);
+static int proxy_http_response_read_heads(proxy_http_req_t *req,
+                                          int nonblocking);
 static int proxy_http_response_suspend(proxy_http_req_t *req);
 
 /* Poll sock synchronously for up to ProxyAsyncDelay (when > 0) before waiting
@@ -539,7 +520,7 @@ static void proxy_http_response_head_continuation(request_rec *r,
     if (rv == APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                       "proxy %s: response ready (async)", req->proto);
-        if (proxy_http_response_preread(req) == SUSPENDED) {
+        if (proxy_http_response_read_heads(req, 1) == SUSPENDED) {
             return; /* waiting for the rest of the head */
         }
         status = ap_proxy_http_process_response(req);
@@ -581,15 +562,15 @@ static void proxy_http_response_head_continuation(request_rec *r,
 }
 
 /* Wait for the backend's response without holding the thread: read its head
- * without blocking (proxy_http_response_preread(), which waits for the rest
- * as needed), so that anything the filters already hold is read before any
+ * without blocking (proxy_http_response_read_heads(), which waits for the
+ * rest as needed), so that anything the filters already hold is read before any
  * poll. Returns OK if the response can be read now, or SUSPENDED if it's
  * waited for asynchronously (proxy_http_response_head_continuation() is
  * called then).
  */
 static int proxy_http_response_head_wait(proxy_http_req_t *req)
 {
-    return proxy_http_response_preread(req);
+    return proxy_http_response_read_heads(req, 1);
 }
 
 /* Wait until the backend is readable (ap_proxy_wait()), then read its
@@ -634,123 +615,95 @@ static apr_interval_time_t proxy_http_request_read_timeout(request_rec *r)
     return ap_get_connection_timeout(r->connection, r->server);
 }
 
-/* The status code of a status line, 0 if it doesn't look like one */
-static int proxy_head_status(const char *line)
-{
-    if (!apr_date_checkmask(line, "HTTP/#.# ###*")) {
-        return 0;
-    }
-    return (line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0');
-}
-
-/* Pre-read the backend's response head(s) without blocking (ap_fgetline_ex()
- * with AP_GETLINE_NONBLOCK, keeping the parsing state in req).
- * ap_proxygetline() then serves these lines to the parsing in
- * ap_proxy_http_process_response(), which therefore doesn't block. The status
- * line is read as is, and the header lines are folded as
- * ap_proxy_read_headers() would fold them; interim (1xx) heads are included.
- * Returns OK once the head is read (an error is kept for the parsing to
- * report), or SUSPENDED if waiting for the backend
- * (proxy_http_response_head_continuation() is called then).
+/*
+ * Limit the number of interim responses we sent back to the client. Otherwise
+ * we suffer from a memory build up. Besides there is NO sense in sending back
+ * an unlimited number of interim responses to the client. Thus if we cross
+ * this limit send back a 502 (Bad Gateway).
  */
-static int proxy_http_response_preread(proxy_http_req_t *req)
+#ifndef AP_MAX_INTERIM_RESPONSES
+#define AP_MAX_INTERIM_RESPONSES 10
+#endif
+
+/* Read the backend's response heads with ap_h1_head_parse() (the rules and
+ * limits of ap_proxy_h1_head_opts()), keeping them in req for
+ * ap_proxy_http_process_response(). Nonblocking (waiting for the rest as
+ * needed): up to the final head, a 100 Continue for our Expect (the body is
+ * sent first, then the reading goes on), a 101 (the upgraded protocol
+ * follows) or AP_MAX_INTERIM_RESPONSES interim heads; blocking: the next
+ * head only (each interim head is processed when it comes). A failure is
+ * kept for the processing to report. Returns OK, or SUSPENDED if waiting for
+ * the backend (proxy_http_response_head_continuation() is called then).
+ */
+static int proxy_http_response_read_heads(proxy_http_req_t *req,
+                                          int nonblocking)
 {
-    proxy_conn_rec *backend = req->backend;
-    conn_rec *origin = req->origin;
-    apr_size_t size = HUGE_STRING_LEN;
-    int nonblock = AP_GETLINE_NONBLOCK;
+    apr_read_type_e block = (nonblocking) ? APR_NONBLOCK_READ
+                                          : APR_BLOCK_READ;
 
-    if (req->head_final) {
-        /* Pre-read already (and the body sent before its processing, see
-         * send_continue_body_before_final()), what follows is its body.
-         */
-        return OK;
-    }
-    if (backend->worker->s->response_field_size_set) {
-        size = backend->worker->s->response_field_size;
-    }
-    if (!req->head_lines) {
-        req->head_lines = apr_array_make(req->p, 20, sizeof(proxy_head_line_t));
-        req->head_bb = apr_brigade_create(req->p, origin->bucket_alloc);
+    if (!req->head_parser) {
+        ap_h1_head_opts_t opts;
+
+        ap_proxy_h1_head_opts(&opts, req->r, req->worker, AP_H1_HEAD_RESPONSE);
+        req->head_parser = ap_h1_head_parser_create(req->p, req->r, &opts);
+        req->heads = apr_array_make(req->p, 2, sizeof(ap_h1_head_t *));
     }
 
-    for (;;) {
-        proxy_head_line_t *hl;
-        char *line = NULL;
-        apr_size_t len = 0;
-        apr_status_t rv;
-        int flags = (req->head_in_headers ? AP_GETLINE_FOLD_COL : 0);
+    while (!req->head_final && !req->head_rc) {
+        ap_h1_head_t *head;
+        int rc;
 
-        rv = ap_fgetline_ex(&line, size, &len, origin->input_filters,
-                            flags | nonblock, req->head_bb,
-                            &req->head_state, req->p);
-        apr_brigade_cleanup(req->head_bb);
-        if (APR_STATUS_IS_EAGAIN(rv)) {
-            int rc = proxy_http_response_suspend(req);
+        rc = ap_h1_head_parse(req->head_parser, req->origin->input_filters,
+                              block, &head);
+        if (rc == AGAIN) {
+            rc = proxy_http_response_suspend(req);
             if (rc == SUSPENDED) {
                 return SUSPENDED;
             }
             if (rc != OK) {
-                nonblock = 0; /* can't wait: block (the parsing state is kept) */
+                block = APR_BLOCK_READ; /* can't wait: block (the parsing
+                                         * state is kept) */
             }
             continue;
         }
-
-        hl = apr_array_push(req->head_lines);
-        hl->line = line ? line : "";
-        hl->len = line ? len : 0;
-        hl->rv = rv;
-        if (rv != APR_SUCCESS || req->head_lines->nelts > 1000) {
-            /* Leave it to the parsing to report: it reads (and fails) as
-             * usual.
-             */
-            return OK;
+        if (rc != OK) {
+            req->head_rc = rc;
+            req->head_failed = head;
+            break;
         }
 
-        if (!req->head_in_headers) {
-            int status;
-            if (hl->len == 0 && !req->head_stray) {
-                /* Skip one potential stray CRLF, as
-                 * ap_proxy_http_process_response() does.
-                 */
-                req->head_stray = 1;
-                continue;
-            }
-            status = proxy_head_status(hl->line);
-            if (!status) {
-                /* Not an HTTP response (no head): an error, which the
-                 * parsing reports (502).
-                 */
-                return OK;
-            }
-            if (status == 101) {
-                /* An upgrade: stop pre-reading */
-                return OK;
-            }
-            req->head_interim = (status >= 100 && status < 200);
-            req->head_continue = (status == 100);
-            req->head_in_headers = 1;
-            if (!req->head_interim) {
-                req->head_final_idx = req->head_lines->nelts - 1;
-            }
-        }
-        else if (hl->len == 0) {
-            /* End of a head: another one follows an interim response, but
-             * after a 100 Continue for our Expect only once the body is sent
-             * (then pre-read again).
-             */
-            if (req->head_interim) {
-                req->head_in_headers = 0;
-                req->head_stray = 0;
-                if (req->head_continue && req->do_100_continue) {
-                    return OK;
-                }
-                continue;
-            }
+        APR_ARRAY_PUSH(req->heads, ap_h1_head_t *) = head;
+        if (head->u.rsp.status >= 200) {
             req->head_final = 1;
-            return OK;
+            break;
+        }
+        ap_h1_head_parser_reset(req->head_parser);
+        if (!nonblocking
+            || head->u.rsp.status == HTTP_SWITCHING_PROTOCOLS
+            || (head->u.rsp.status == HTTP_CONTINUE && req->do_100_continue)
+            || ++req->head_interims >= AP_MAX_INTERIM_RESPONSES) {
+            break;
         }
     }
+    return OK;
+}
+
+/* The next response head to process, read now (blocking) if not read yet
+ * (proxy_http_response_read_heads()). Returns OK with *head, or the
+ * parsing's DONE or error with *head as parsed (or NULL).
+ */
+static int proxy_http_response_next_head(proxy_http_req_t *req,
+                                         ap_h1_head_t **head)
+{
+    if (!req->heads || req->head_next >= req->heads->nelts) {
+        proxy_http_response_read_heads(req, 0);
+    }
+    if (req->head_next < req->heads->nelts) {
+        *head = APR_ARRAY_IDX(req->heads, req->head_next++, ap_h1_head_t *);
+        return OK;
+    }
+    *head = req->head_failed;
+    return (req->head_rc) ? req->head_rc : HTTP_INTERNAL_SERVER_ERROR;
 }
 
 static void proxy_http_request_forward_continuation(request_rec *r,
@@ -1467,45 +1420,37 @@ static int send_continue_body(proxy_http_req_t *req)
 /* With 100-continue pending, the backend may answer a final response instead
  * of the 100 Continue and keep the connection, reading (and discarding) the
  * body (RFC 9110 10.1.1), which must then be sent for the connection to be
- * reused, before the response is processed. When that final head is pre-read
- * (proxy_http_response_preread()) and the client doesn't wait for a 100 itself
+ * reused, before the response is processed. When that final head is read
+ * (proxy_http_response_read_heads()) and the client doesn't wait for a 100 itself
  * (its body is read then), send the body without blocking first, then the
  * processing has nothing more to send (it sends the body itself otherwise, see
  * ap_proxy_http_process_response()). Returns OK, SUSPENDED
  * (proxy_http_request_forward_continuation() continues, then
  * proxy_http_request_sent()) or an error.
  */
+/* apr_table_do() callback: 0 (stop) on a "Connection: close" */
+static int connection_not_close(void *r, const char *key, const char *val)
+{
+    return !ap_find_token(((request_rec *)r)->pool, val, "close");
+}
+
 static int send_continue_body_before_final(proxy_http_req_t *req)
 {
     request_rec *r = req->r;
-    const proxy_head_line_t *hl;
-    int i, keepalive = 0;
+    const ap_h1_head_t *head;
+    int keepalive = 0;
 
     if (!req->do_100_continue || !req->head_final || r->expecting_100) {
         return OK;
     }
 
     /* Does the backend keep the connection: HTTP/1.1+ without
-     * "Connection: close" (the head ends with its empty line)?
+     * "Connection: close"?
      */
-    hl = &APR_ARRAY_IDX(req->head_lines, req->head_final_idx,
-                        proxy_head_line_t);
-    if (apr_date_checkmask(hl->line, "HTTP/#.# ###*")
-        && hl->line[5] == '1' && hl->line[7] >= '1') {
-        keepalive = 1;
-        for (i = req->head_final_idx + 1; i < req->head_lines->nelts; i++) {
-            const char *val;
-
-            hl = &APR_ARRAY_IDX(req->head_lines, i, proxy_head_line_t);
-            if (strncasecmp(hl->line, "Connection:", 11) != 0) {
-                continue;
-            }
-            val = hl->line + 11;
-            if (ap_find_token(r->pool, val, "close")) {
-                keepalive = 0;
-                break;
-            }
-        }
+    head = APR_ARRAY_IDX(req->heads, req->heads->nelts - 1, ap_h1_head_t *);
+    if (head->proto_num >= HTTP_VERSION(1, 1)) {
+        keepalive = apr_table_do(connection_not_close, r, head->headers,
+                                 "Connection", NULL);
     }
     if (!keepalive) {
         /* Not sent: ap_proxy_http_process_response() then closes the
@@ -1661,138 +1606,34 @@ static void process_proxy_header(request_rec *r, proxy_dir_conf *c,
     apr_table_add(r->headers_out, key, value);
 }
 
-static apr_status_t ap_proxy_read_headers(request_rec *r, request_rec *rr,
-                                  char *buffer, int size,
-                                  conn_rec *c)
+/* Add the headers of a response head to r->headers_out, through
+ * process_proxy_header() (canonical dates, ProxyPassReverse and family),
+ * duplicates kept.
+ */
+static void proxy_http_response_headers(request_rec *r, proxy_dir_conf *dconf,
+                                        const ap_h1_head_t *head)
 {
-    int len;
-    char *value;
-    proxy_dir_conf *dconf;
-    apr_status_t rc;
-    apr_bucket_brigade *tmp_bb;
-
-    dconf = ap_get_module_config(r->per_dir_config, &proxy_module);
+    const apr_array_header_t *arr = apr_table_elts(head->headers);
+    const apr_table_entry_t *elts = (const apr_table_entry_t *)arr->elts;
+    int i;
 
     r->headers_out = apr_table_make(r->pool, 20);
     r->trailers_out = apr_table_make(r->pool, 5);
 
-    /*
-     * Read header lines until we get the empty separator line, a read error,
-     * the connection closes (EOF), or we timeout.
-     */
     ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
                   "Headers received from backend:");
-
-    tmp_bb = apr_brigade_create(r->pool, c->bucket_alloc);
-    while (1) {
-        const int flags = AP_GETLINE_FOLD_COL;
-        rc = ap_proxygetline(tmp_bb, buffer, size, rr, flags, &len);
-        if (rc != APR_SUCCESS) {
-            if (APR_STATUS_IS_ENOSPC(rc)) {
-                int trunc = (len > 128 ? 128 : len) / 2;
-                ap_log_rerror(APLOG_MARK, APLOG_WARNING, rc, r, APLOGNO(10124)
-                        "header size is over the limit allowed by "
-                        "ResponseFieldSize (%d bytes). "
-                        "Bad response header: '%.*s[...]%s'",
-                        size, trunc, buffer, buffer + len - trunc);
-            }
-            else {
-                ap_log_rerror(APLOG_MARK, APLOG_WARNING, rc, r, APLOGNO(10404) 
-                              "Error reading headers from backend");
-            }
-            r->headers_out = NULL;
-            return rc;
-        }
-
-        if (len <= 0) {
-            break;
-        }
-        else {
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "%s", buffer);
-        }
-
-        if (!(value = strchr(buffer, ':'))) {     /* Find the colon separator */
-            /* An invalid header line (no colon), an extra status line
-             * included: the headers are bogus and give a 502.
-             */
-            r->headers_out = NULL;
-            return APR_EINVAL;
-        }
-
-        *value = '\0';
-        ++value;
-        /* XXX: RFC2068 defines only SP and HT as whitespace, this test is
-         * wrong... and so are many others probably.
-         */
-        while (apr_isspace(*value))
-            ++value;            /* Skip to start of value   */
-
-        /* should strip trailing whitespace as well */
-        ap_cstr_stripws(value);
-
-        /* make sure we add so as not to destroy duplicated headers
-         * Modify headers requiring canonicalisation and/or affected
-         * by ProxyPassReverse and family with process_proxy_header
-         */
-        process_proxy_header(r, dconf, buffer, value);
+    for (i = 0; i < arr->nelts; i++) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "%s: %s",
+                      elts[i].key, elts[i].val);
+        process_proxy_header(r, dconf, elts[i].key, elts[i].val);
     }
-    return APR_SUCCESS;
 }
-
-
 
 static int addit_dammit(void *v, const char *key, const char *val)
 {
     apr_table_addn(v, key, val);
     return 1;
 }
-
-static apr_status_t ap_proxygetline(apr_bucket_brigade *bb, char *s, int n,
-                                    request_rec *r, int flags, int *read)
-{
-    proxy_http_req_t *req;
-    apr_status_t rv;
-    apr_size_t len;
-
-    /* Serve the lines pre-read without blocking
-     * (proxy_http_response_preread()), as ap_rgetline() would have read them.
-     */
-    req = proxy_http_req(r);
-    if (req && req->head_lines && req->head_next < req->head_lines->nelts) {
-        proxy_head_line_t *hl = &APR_ARRAY_IDX(req->head_lines, req->head_next,
-                                               proxy_head_line_t);
-        req->head_next++;
-        len = hl->len;
-        if (len >= (apr_size_t)n) {
-            len = n - 1;
-        }
-        memcpy(s, hl->line, len);
-        s[len] = '\0';
-        rv = hl->rv;
-    }
-    else {
-        rv = ap_rgetline(&s, n, &len, r, flags, bb);
-    }
-    apr_brigade_cleanup(bb);
-
-    if (rv == APR_SUCCESS || APR_STATUS_IS_ENOSPC(rv)) {
-        *read = (int)len;
-    } else {
-        *read = -1;
-    }
-
-    return rv;
-}
-
-/*
- * Limit the number of interim responses we sent back to the client. Otherwise
- * we suffer from a memory build up. Besides there is NO sense in sending back
- * an unlimited number of interim responses to the client. Thus if we cross
- * this limit send back a 502 (Bad Gateway).
- */
-#ifndef AP_MAX_INTERIM_RESPONSES
-#define AP_MAX_INTERIM_RESPONSES 10
-#endif
 
 static int add_trailers(void *data, const char *key, const char *val)
 {
@@ -2157,18 +1998,14 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     int do_100_continue;
     int status;
 
-    char *buffer;
-    char fixed_buffer[HUGE_STRING_LEN];
     const char *buf;
-    char keepchar;
     apr_bucket *e;
     apr_bucket_brigade *bb;
     apr_bucket_brigade *pass_bb;
-    int len;
     int interim_response = 0; /* non-zero whilst interim 1xx responses
                                * are being read. */
-    apr_size_t response_field_size = 0;
     apr_table_t *save_table;
+    ap_h1_head_opts_t trailers_opts;
     static const char *const hop_by_hop_hdrs[] =
         {"Keep-Alive", "Proxy-Authenticate", "TE", "Trailer", "Upgrade", NULL};
     int i;
@@ -2192,20 +2029,6 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
     bb = apr_brigade_create(p, c->bucket_alloc);
     pass_bb = apr_brigade_create(p, c->bucket_alloc);
 
-    /* Only use dynamically sized buffer if user specifies ResponseFieldSize */
-    if(backend->worker->s->response_field_size_set) {
-        response_field_size = backend->worker->s->response_field_size;
-
-        if (response_field_size != HUGE_STRING_LEN)
-            buffer = apr_pcalloc(p, response_field_size);
-        else
-            buffer = fixed_buffer;
-    }
-    else {
-        response_field_size = HUGE_STRING_LEN;
-        buffer = fixed_buffer;
-    }
-
     /* Setup for 100-Continue timeout if appropriate */
     if (do_100_continue && worker->s->ping_timeout_set) {
         apr_socket_timeout_get(backend->sock, &old_timeout);
@@ -2224,35 +2047,33 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
      */
 
     backend->r = make_fake_req(origin, r);
-    /* So that ap_proxygetline() can serve the pre-read head lines, if any */
-    ap_set_module_config(backend->r->request_config, &proxy_http_module,
-                         proxy_http_rctx(r));
     /* In case anyone needs to know, this is a fake request that is really a
      * response.
      */
     backend->r->proxyreq = PROXYREQ_RESPONSE;
+    /* A chunked body's trailers are read with the response heads' rules */
+    ap_proxy_h1_head_opts(&trailers_opts, r, worker, AP_H1_HEAD_TRAILERS);
+    ap_h1_set_trailers_opts(backend->r, &trailers_opts);
     apr_table_setn(r->notes, "proxy-source-port", apr_psprintf(r->pool, "%hu",
                    origin->local_addr->port));
     do {
-        apr_status_t rc;
+        ap_h1_head_t *head;
         const char *upgrade = NULL;
         int major = 0, minor = 0;
         int toclose = 0;
+        int rc;
 
         apr_brigade_cleanup(bb);
 
-        rc = ap_proxygetline(backend->tmp_bb, buffer, response_field_size,
-                             backend->r, 0, &len);
-        if (len == 0) {
-            /* handle one potential stray CRLF */
-            rc = ap_proxygetline(backend->tmp_bb, buffer, response_field_size,
-                                 backend->r, 0, &len);
-        }
-        if (len <= 0) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r, APLOGNO(01102)
+        rc = proxy_http_response_next_head(req, &head);
+        if (rc == DONE || rc == HTTP_GATEWAY_TIME_OUT) {
+            /* Closed, failed or timed out before or within the head */
+            apr_status_t rv = ap_h1_head_parser_status(req->head_parser);
+
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01102)
                           "error reading status line from remote "
                           "server %s:%d", backend->hostname, backend->port);
-            if (APR_STATUS_IS_TIMEUP(rc)) {
+            if (rc == HTTP_GATEWAY_TIME_OUT) {
                 apr_table_setn(r->notes, "proxy_timedout", "1");
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01103) "read timeout");
                 if (do_100_continue) {
@@ -2276,8 +2097,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
              * connection which times out; instead handle as
              * we normally would handle timeouts
              */
-            if (r->proxyreq == PROXYREQ_REVERSE && c->keepalives &&
-                !APR_STATUS_IS_TIMEUP(rc)) {
+            if (r->proxyreq == PROXYREQ_REVERSE && c->keepalives) {
 
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01104)
                               "Closing connection to client because"
@@ -2317,39 +2137,45 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
             return ap_proxyerror(r, HTTP_BAD_GATEWAY,
                                  "Error reading from remote server");
         }
-        /* XXX: Is this a real headers length send from remote? */
-        backend->worker->s->read += len;
-
-        /* An HTTP/1 response? This is buggy if we ever see an HTTP/1.10.
-         * Not an HTTP/1 message (an HTTP/0.9 response, which mod_proxy_http
-         * never asks for, so rather another protocol), or a status line
-         * > 8192 bytes, is an error.
-         */
-        if (!apr_date_checkmask(buffer, "HTTP/#.# ###*")
-            || buffer[5] != '1' || len >= response_field_size - 1) {
+        if (rc != OK && (!head || !head->u.rsp.status)) {
+            /* Not an HTTP/1 status line (an HTTP/0.9 response, which
+             * mod_proxy_http never asks for, so rather another protocol),
+             * or one too long or malformed (the parsing logged why).
+             */
+            backend->close = 1;
             return ap_proxyerror(r, HTTP_BAD_GATEWAY,
                         apr_pstrcat(p, "Corrupt status line returned "
-                                    "by remote server: ", buffer, NULL));
+                                    "by remote server: ",
+                                    (head) ? head->start_line : "", NULL));
         }
-        major = buffer[5] - '0';
-        minor = buffer[7] - '0';
+        if (rc != OK) {
+            /* The headers are invalid (the parsing logged why) */
+            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01106)
+                          "bad HTTP/%d.%d header returned by %s (%s)",
+                          HTTP_VERSION_MAJOR(head->proto_num),
+                          HTTP_VERSION_MINOR(head->proto_num),
+                          r->uri, r->method);
+            backend->close = 1;
+            /*
+             * ap_send_error relies on a headers_out to be present. we
+             * are in a bad position here.. so force everything we send out
+             * to have nothing to do with the incoming packet
+             */
+            r->headers_out = apr_table_make(r->pool,1);
+            r->status = HTTP_BAD_GATEWAY;
+            r->status_line = ap_get_status_line(r->status);
+            return r->status;
+        }
+        backend->worker->s->read += head->length;
 
-        keepchar = buffer[12];
-        buffer[12] = '\0';
-        proxy_status = atoi(&buffer[9]);
+        major = HTTP_VERSION_MAJOR(head->proto_num);
+        minor = HTTP_VERSION_MINOR(head->proto_num);
+        proxy_status = head->u.rsp.status;
         apr_table_setn(r->notes, "proxy-status",
-                       apr_pstrdup(r->pool, &buffer[9]));
-
-        if (keepchar != '\0') {
-            buffer[12] = keepchar;
-        } else {
-            /* 2616 requires the space in Status-Line; the origin
-             * server may have sent one but ap_rgetline will
-             * have stripped it. */
-            buffer[12] = ' ';
-            buffer[13] = '\0';
-        }
-        proxy_status_line = apr_pstrdup(p, &buffer[9]);
+                       apr_psprintf(r->pool, "%03d", proxy_status));
+        /* 2616 requires the space in Status-Line, even without a reason */
+        proxy_status_line = apr_psprintf(p, "%03d %s", proxy_status,
+                                         head->u.rsp.reason);
 
         /* The status out of the front is the same as the status coming in
          * from the back, until further notice.
@@ -2370,24 +2196,7 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
                      "Set-Cookie", NULL);
 
         /* shove the headers direct into r->headers_out */
-        rc = ap_proxy_read_headers(r, backend->r, buffer, response_field_size,
-                                   origin);
-
-        if (rc != APR_SUCCESS || r->headers_out == NULL) {
-            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(01106)
-                          "bad HTTP/%d.%d header returned by %s (%s)",
-                          major, minor, r->uri, r->method);
-            backend->close = 1;
-            /*
-             * ap_send_error relies on a headers_out to be present. we
-             * are in a bad position here.. so force everything we send out
-             * to have nothing to do with the incoming packet
-             */
-            r->headers_out = apr_table_make(r->pool,1);
-            r->status = HTTP_BAD_GATEWAY;
-            r->status_line = ap_get_status_line(r->status);
-            return r->status;
-        }
+        proxy_http_response_headers(r, dconf, head);
 
         /* Now, add in the just read cookies */
         apr_table_do(addit_dammit, save_table, r->headers_out,
@@ -2755,8 +2564,8 @@ int ap_proxy_http_process_response(proxy_http_req_t *req)
             continue;
         }
 
-        /* Moved the fixups of Date headers and those affected by
-         * ProxyPassReverse/etc from here to ap_proxy_read_headers
+        /* The fixups of Date headers and those affected by
+         * ProxyPassReverse/etc are in proxy_http_response_headers()
          */
 
         /* PR 41646: get HEAD right with ProxyErrorOverride */

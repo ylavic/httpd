@@ -97,7 +97,8 @@ class TestProxyResponse:
         assert r.response["status"] == 502
 
         env.httpd_error_log.ignore_recent(
-            lognos=["AH01106", "AH10404"]
+            lognos=["AH01106", "AH10404"],
+            matches=[r'.*\[proxy_http:warn\].*']
         )
 
     # checks X-Forwarded headers
