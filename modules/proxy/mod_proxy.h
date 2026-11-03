@@ -252,6 +252,18 @@ typedef struct {
     apr_interval_time_t async_idle_timeout;
     unsigned int async_delay_set:1;
     unsigned int async_idle_timeout_set:1;
+
+    /* The backends' HTTP/1 heads (ProxyHttpProtocolOptions,
+     * ProxyLimitResponse*), see ap_proxy_h1_head_opts()
+     */
+    apr_size_t limit_response_line;
+    apr_size_t limit_response_fieldsize;
+    unsigned int limit_response_fields;
+    unsigned int http_unsafe:1;
+    unsigned int http_unsafe_set:1;
+    unsigned int limit_response_line_set:1;
+    unsigned int limit_response_fieldsize_set:1;
+    unsigned int limit_response_fields_set:1;
 } proxy_dir_conf;
 
 /* if we interpolate env vars per-request, we'll need a per-request
@@ -489,7 +501,8 @@ typedef struct {
     apr_size_t      io_buffer_size;
     apr_size_t      elected;    /* Number of times the worker was elected */
     apr_size_t      busy;       /* busyness factor */
-    apr_size_t      response_field_size; /* Size of proxy response buffer in bytes. */
+    apr_size_t      response_field_size; /* limitresponsefieldsize= (or
+                                          * responsefieldsize=) */
     apr_port_t      port;
     apr_off_t       transferred;/* Number of bytes transferred to remote */
     apr_off_t       read;       /* Number of bytes read from remote */
@@ -514,6 +527,12 @@ typedef struct {
     apr_int32_t      address_ttl;    /* backend address' TTL (seconds) */
     apr_uint32_t     address_expiry; /* backend address' next expiry time */
     int              sock_proto;     /* The protocol to use to create the socket */
+    apr_size_t       limit_response_line;   /* limitresponseline= */
+    unsigned int     limit_response_fields; /* limitresponsefields= */
+    unsigned int     http_unsafe:1;         /* httpprotocoloptions=unsafe */
+    unsigned int     http_unsafe_set:1;
+    unsigned int     limit_response_line_set:1;
+    unsigned int     limit_response_fields_set:1;
 } proxy_worker_shared;
 
 #define ALIGNED_PROXY_WORKER_SHARED_SIZE (APR_ALIGN_DEFAULT(sizeof(proxy_worker_shared)))
@@ -747,6 +766,30 @@ PROXY_DECLARE(int) ap_proxy_checkproxyblock(request_rec *r, proxy_server_conf *c
 
 
 PROXY_DECLARE(int) ap_proxy_pre_http_request(conn_rec *c, request_rec *r);
+
+/**
+ * Initialize the options of an HTTP/1 head parser for a backend's response
+ * head or trailers (ap_h1_head_parse()): ProxyHttpProtocolOptions and
+ * ProxyLimitResponse* of r's directory, each overridden by the worker's key
+ * if set, else the client side's defaults (Strict, 8190, 8190, 100); errors
+ * logged under module_index.
+ * @param opts         the options to initialize
+ * @param r            the client's request
+ * @param worker       the worker of the backend
+ * @param kind         AP_H1_HEAD_RESPONSE or AP_H1_HEAD_TRAILERS
+ * @param module_index the module logging the errors: the module calling the
+ *                     ap_proxy_h1_head_opts() macro (APLOG_MODULE_INDEX), or
+ *                     the index given by code acting for another module
+ */
+PROXY_DECLARE(void) ap_proxy_h1_head_opts_(ap_h1_head_opts_t *opts,
+                                           request_rec *r,
+                                           proxy_worker *worker,
+                                           ap_h1_head_kind_e kind,
+                                           int module_index);
+
+/** ap_proxy_h1_head_opts_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_proxy_h1_head_opts(opts, r, worker, kind) \
+    ap_proxy_h1_head_opts_(opts, r, worker, kind, APLOG_MODULE_INDEX)
 /* DEPRECATED (will be replaced with ap_proxy_connect_backend */
 PROXY_DECLARE(int) ap_proxy_connect_to_backend(apr_socket_t **, const char *, apr_sockaddr_t *, const char *, proxy_server_conf *, request_rec *);
 /* DEPRECATED (will be replaced with ap_proxy_check_connection */

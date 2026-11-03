@@ -883,6 +883,44 @@ PROXY_DECLARE(int) ap_proxy_pre_http_request(conn_rec *c, request_rec *r)
     return OK;
 }
 
+PROXY_DECLARE(void) ap_proxy_h1_head_opts_(ap_h1_head_opts_t *opts,
+                                           request_rec *r,
+                                           proxy_worker *worker,
+                                           ap_h1_head_kind_e kind,
+                                           int module_index)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+    const proxy_worker_shared *s = worker->s;
+    int unsafe;
+
+    ap_h1_head_opts_init_(opts, r, kind, AP_H1_HEAD_OPT_BACKEND,
+                          module_index);
+
+    unsafe = (s->http_unsafe_set) ? s->http_unsafe : dconf->http_unsafe;
+    if (unsafe) {
+        opts->flags &= ~AP_H1_HEAD_OPT_STRICT;
+    }
+    if (s->limit_response_line_set) {
+        opts->limit_start_line = s->limit_response_line;
+    }
+    else if (dconf->limit_response_line_set) {
+        opts->limit_start_line = dconf->limit_response_line;
+    }
+    if (s->response_field_size_set) {
+        opts->limit_field = s->response_field_size;
+    }
+    else if (dconf->limit_response_fieldsize_set) {
+        opts->limit_field = dconf->limit_response_fieldsize;
+    }
+    if (s->limit_response_fields_set) {
+        opts->limit_fields = s->limit_response_fields;
+    }
+    else if (dconf->limit_response_fields_set) {
+        opts->limit_fields = dconf->limit_response_fields;
+    }
+}
+
 PROXY_DECLARE(const char *) ap_proxy_location_reverse_map(request_rec *r,
                               proxy_dir_conf *conf, const char *url)
 {

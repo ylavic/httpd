@@ -350,13 +350,45 @@ static const char *set_worker_param(apr_pool_t *p,
                                 (int)sizeof(worker->s->upgrade));
         }
     }
-    else if (!strcasecmp(key, "responsefieldsize")) {
+    else if (!strcasecmp(key, "limitresponsefieldsize")
+             || !strcasecmp(key, "responsefieldsize")) {
         long s = atol(val);
         if (s < 0) {
-            return "ResponseFieldSize must be greater than 0 bytes, or 0 for system default.";
+            return apr_psprintf(p, "%s must be a non-negative number of "
+                                "bytes (0 for the directory's limit)", key);
         }
-        worker->s->response_field_size = (s ? s : HUGE_STRING_LEN);
-        worker->s->response_field_size_set = 1;
+        worker->s->response_field_size = s;
+        worker->s->response_field_size_set = (s != 0);
+    }
+    else if (!strcasecmp(key, "limitresponseline")) {
+        long s = atol(val);
+        if (s < 0) {
+            return "limitresponseline must be a non-negative number of bytes "
+                   "(0 for the directory's limit)";
+        }
+        worker->s->limit_response_line = s;
+        worker->s->limit_response_line_set = (s != 0);
+    }
+    else if (!strcasecmp(key, "limitresponsefields")) {
+        long s = atol(val);
+        if (s < 0) {
+            return "limitresponsefields must be a non-negative number "
+                   "(0 for no limit)";
+        }
+        worker->s->limit_response_fields = s;
+        worker->s->limit_response_fields_set = 1;
+    }
+    else if (!strcasecmp(key, "httpprotocoloptions")) {
+        if (!strcasecmp(val, "Strict")) {
+            worker->s->http_unsafe = 0;
+        }
+        else if (!strcasecmp(val, "Unsafe")) {
+            worker->s->http_unsafe = 1;
+        }
+        else {
+            return "httpprotocoloptions must be Strict or Unsafe";
+        }
+        worker->s->http_unsafe_set = 1;
     }
     else if (!strcasecmp(key, "multipathtcp")) {
 #ifdef IPPROTO_MPTCP
@@ -1987,6 +2019,25 @@ static void *merge_proxy_dir_config(apr_pool_t *p, void *basev, void *addv)
     new->async_idle_timeout_set = add->async_idle_timeout_set
                                   || base->async_idle_timeout_set;
 
+    new->http_unsafe = (add->http_unsafe_set) ? add->http_unsafe
+                                              : base->http_unsafe;
+    new->http_unsafe_set = add->http_unsafe_set || base->http_unsafe_set;
+    new->limit_response_line = (add->limit_response_line_set)
+                               ? add->limit_response_line
+                               : base->limit_response_line;
+    new->limit_response_line_set = add->limit_response_line_set
+                                   || base->limit_response_line_set;
+    new->limit_response_fieldsize = (add->limit_response_fieldsize_set)
+                                    ? add->limit_response_fieldsize
+                                    : base->limit_response_fieldsize;
+    new->limit_response_fieldsize_set = add->limit_response_fieldsize_set
+                                        || base->limit_response_fieldsize_set;
+    new->limit_response_fields = (add->limit_response_fields_set)
+                                 ? add->limit_response_fields
+                                 : base->limit_response_fields;
+    new->limit_response_fields_set = add->limit_response_fields_set
+                                     || base->limit_response_fields_set;
+
     return new;
 }
 
@@ -2586,6 +2637,56 @@ static const char *
 }
 
 static const char *
+    set_proxy_http_protocol_options(cmd_parms *parms, void *dconf,
+                                    const char *arg)
+{
+    proxy_dir_conf *conf = dconf;
+    if (!strcasecmp(arg, "Strict")) {
+        conf->http_unsafe = 0;
+    }
+    else if (!strcasecmp(arg, "Unsafe")) {
+        conf->http_unsafe = 1;
+    }
+    else {
+        return "ProxyHttpProtocolOptions must be Strict or Unsafe";
+    }
+    conf->http_unsafe_set = 1;
+    return NULL;
+}
+
+/* ProxyLimitResponseLine, ProxyLimitResponseFieldSize and
+ * ProxyLimitResponseFields (cmd->info: which), non-negative integers as
+ * their LimitRequest* counterparts
+ */
+static const char *
+    set_proxy_limit_response(cmd_parms *parms, void *dconf, const char *arg)
+{
+    proxy_dir_conf *conf = dconf;
+    const char *which = parms->info;
+    char *end;
+    apr_int64_t lim;
+
+    lim = apr_strtoi64(arg, &end, 10);
+    if (*end || end == arg || lim < 0 || lim > APR_INT32_MAX) {
+        return apr_pstrcat(parms->temp_pool, parms->cmd->name, " \"", arg,
+                           "\" must be a non-negative integer", NULL);
+    }
+    if (!strcmp(which, "line")) {
+        conf->limit_response_line = (apr_size_t)lim;
+        conf->limit_response_line_set = 1;
+    }
+    else if (!strcmp(which, "fieldsize")) {
+        conf->limit_response_fieldsize = (apr_size_t)lim;
+        conf->limit_response_fieldsize_set = 1;
+    }
+    else {
+        conf->limit_response_fields = (unsigned int)lim;
+        conf->limit_response_fields_set = 1;
+    }
+    return NULL;
+}
+
+static const char *
     set_proxy_async_idle(cmd_parms *parms, void *dconf, const char *arg)
 {
     proxy_dir_conf *conf = dconf;
@@ -3181,6 +3282,21 @@ static const command_rec proxy_cmds[] =
      "Amount of time to poll before going asynchronous"),
     AP_INIT_TAKE1("ProxyAsyncIdleTimeout", set_proxy_async_idle, NULL, RSRC_CONF|ACCESS_CONF,
      "Timeout for asynchronous inactivity, ProxyTimeout by default"),
+    AP_INIT_TAKE1("ProxyHttpProtocolOptions", set_proxy_http_protocol_options,
+     NULL, RSRC_CONF|ACCESS_CONF,
+     "'Strict' (default) or 'Unsafe': the rules of the backends' HTTP/1 "
+     "response heads, as HttpProtocolOptions' for the requests"),
+    AP_INIT_TAKE1("ProxyLimitResponseLine", set_proxy_limit_response,
+     "line", RSRC_CONF|ACCESS_CONF,
+     "Limit on the backends' HTTP/1 status line length (8190 by default)"),
+    AP_INIT_TAKE1("ProxyLimitResponseFieldSize", set_proxy_limit_response,
+     "fieldsize", RSRC_CONF|ACCESS_CONF,
+     "Limit on the backends' HTTP/1 response header field length (8190 by "
+     "default)"),
+    AP_INIT_TAKE1("ProxyLimitResponseFields", set_proxy_limit_response,
+     "fields", RSRC_CONF|ACCESS_CONF,
+     "Limit on the number of the backends' HTTP/1 response headers "
+     "(100 by default, 0 for no limit)"),
     {NULL}
 };
 
