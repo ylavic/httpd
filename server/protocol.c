@@ -241,7 +241,7 @@ typedef enum {
     H1_HEAD_DONE,           /* the head is complete */
     H1_HEAD_FAILED          /* failed or ended (status), final */
 } h1_head_phase_e;
-struct ap_getline_state {
+struct ap_h1_head_parser {
     char *buf;
     apr_size_t len;
     apr_size_t max_size;
@@ -255,7 +255,7 @@ struct ap_getline_state {
                  reusable       :1,
                  seen_nospc     :1;
 
-    /* The HTTP/1 head parser's (ap_get_mime_headers_ex()), kept across the
+    /* The HTTP/1 head parser's (ap_h1_head_parse()), kept across the
      * lines
      */
     apr_pool_t *pool;
@@ -273,7 +273,7 @@ struct ap_getline_state {
     unsigned int blank_lines;
     unsigned int fields_read;
 };
-static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
+static apr_status_t ap_fgetline_core(ap_h1_head_parser_t *state,
                                      ap_filter_t *f, int flags,
                                      apr_bucket_brigade *bb,
                                      apr_pool_t *p,
@@ -736,7 +736,7 @@ AP_DECLARE(apr_status_t) ap_fgetline_ex(char **s, apr_size_t n,
 /* ap_fgetline_ex() for the parser: the line in state->buf and state->len,
  * read with the parser's brigade and allocated in its pool
  */
-static apr_status_t ap_fgetline_state(ap_getline_state_t *state,
+static apr_status_t ap_fgetline_state(ap_h1_head_parser_t *state,
                                       ap_filter_t *f, apr_size_t n, int flags)
 {
     char *s = NULL;
@@ -973,7 +973,7 @@ AP_DECLARE(int) ap_check_request_header(request_rec *r)
 static int table_do_fn_check_lengths(void *parser_, const char *key,
                                      const char *value)
 {
-    ap_getline_state_t *parser = parser_;
+    ap_h1_head_parser_t *parser = parser_;
     request_rec *r = parser->r;
     if (value == NULL || parser->opts.limit_field >= strlen(value) )
         return 1;
@@ -990,7 +990,7 @@ static int table_do_fn_check_lengths(void *parser_, const char *key,
 #define H1_LOG_MARK __FILE__, __LINE__, parser->opts.module_index
 
 /* The error-notes of the client side's error response */
-static void h1_head_notes(ap_getline_state_t *parser, const char *notes)
+static void h1_head_notes(ap_h1_head_parser_t *parser, const char *notes)
 {
     if (!(parser->opts.flags & AP_H1_HEAD_OPT_BACKEND)) {
         apr_table_setn(parser->r->notes, "error-notes", notes);
@@ -1000,7 +1000,7 @@ static void h1_head_notes(ap_getline_state_t *parser, const char *notes)
 /* Reading a line failed with rv: log the cause, and give the status, or DONE
  * if the input ended or failed (but a timeout) before the start line
  */
-static int h1_head_read_error(ap_getline_state_t *parser, apr_status_t rv)
+static int h1_head_read_error(ap_h1_head_parser_t *parser, apr_status_t rv)
 {
     request_rec *r = parser->r;
     const char *what_line = (parser->phase == H1_HEAD_START)
@@ -1086,7 +1086,7 @@ static int h1_head_proto_num(const char *protocol)
 }
 
 /* Parse the start line, of len bytes */
-static int h1_head_start_line(ap_getline_state_t *parser, const char *line,
+static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
                               apr_size_t len)
 {
     ap_h1_head_t *head = parser->head;
@@ -1141,11 +1141,11 @@ static int h1_head_start_line(ap_getline_state_t *parser, const char *line,
     return OK;
 }
 
-AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
-                                                          request_rec *r,
-                                                          const ap_h1_head_opts_t *opts)
+AP_DECLARE(ap_h1_head_parser_t *) ap_h1_head_parser_create(apr_pool_t *p,
+                                                           request_rec *r,
+                                                           const ap_h1_head_opts_t *opts)
 {
-    ap_getline_state_t *parser = apr_pcalloc(p, sizeof(*parser));
+    ap_h1_head_parser_t *parser = apr_pcalloc(p, sizeof(*parser));
 
     parser->pool = p;
     parser->r = r;
@@ -1180,7 +1180,7 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
     return parser;
 }
 
-AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser)
+AP_DECLARE(void) ap_h1_head_parser_reset(ap_h1_head_parser_t *parser)
 {
     parser->head = apr_pcalloc(parser->pool, sizeof(*parser->head));
     parser->head->headers = apr_table_make(parser->pool, 20);
@@ -1199,15 +1199,15 @@ AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser)
     parser->reusable = 0; /* a new line */
 }
 
-AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_getline_state_t *parser)
+AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_h1_head_parser_t *parser)
 {
     return parser->rv;
 }
 
-AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
-                                       ap_filter_t *f,
-                                       apr_read_type_e block,
-                                       ap_h1_head_t **head)
+AP_DECLARE(int) ap_h1_head_parse(ap_h1_head_parser_t *parser,
+                                 ap_filter_t *f,
+                                 apr_read_type_e block,
+                                 ap_h1_head_t **head)
 {
     request_rec *r = parser->r;
     apr_status_t rv = APR_SUCCESS;
@@ -1459,15 +1459,15 @@ failed:
 AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb)
 {
     ap_h1_head_opts_t opts;
-    ap_getline_state_t *parser;
+    ap_h1_head_parser_t *parser;
     ap_h1_head_t *head;
     int rc;
 
     /* A header section with the client side's rules, merged */
     ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_HEADERS, 0);
     parser = ap_h1_head_parser_create(r->pool, r, &opts);
-    rc = ap_get_mime_headers_ex(parser, r->proto_input_filters, APR_BLOCK_READ,
-                                &head);
+    rc = ap_h1_head_parse(parser, r->proto_input_filters, APR_BLOCK_READ,
+                          &head);
     if (rc != OK) {
         r->status = (rc == DONE) ? HTTP_BAD_REQUEST : rc;
         return;

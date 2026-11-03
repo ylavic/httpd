@@ -184,12 +184,11 @@ typedef struct {
     } u;
 } ap_h1_head_t;
 
-/**
- * Reentrant state for ap_fgetline_ex(), and the HTTP/1 head parser of
- * ap_get_mime_headers_ex()
- */
-struct ap_getline_state; /* opaque */
-typedef struct ap_getline_state ap_getline_state_t;
+/** An HTTP/1 head parser (opaque) */
+typedef struct ap_h1_head_parser ap_h1_head_parser_t;
+
+/** Reentrant state for ap_fgetline_ex(), the parser's */
+typedef struct ap_h1_head_parser ap_getline_state_t;
 
 /**
  * Initialize the options of an HTTP/1 head parser with a side's defaults:
@@ -223,9 +222,9 @@ AP_DECLARE(void) ap_h1_head_opts_init_(ap_h1_head_opts_t *opts,
  * @param opts The options, copied
  * @return The parser
  */
-AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
-                                                          request_rec *r,
-                                                          const ap_h1_head_opts_t *opts);
+AP_DECLARE(ap_h1_head_parser_t *) ap_h1_head_parser_create(apr_pool_t *p,
+                                                           request_rec *r,
+                                                           const ap_h1_head_opts_t *opts);
 
 /**
  * Prepare a parser for the next head (e.g. the final response after an
@@ -233,15 +232,14 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
  * head allocated in its pool. The heads returned before stay valid.
  * @param parser The parser
  */
-AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser);
+AP_DECLARE(void) ap_h1_head_parser_reset(ap_h1_head_parser_t *parser);
 
 /**
- * The apr_status_t behind the last DONE or error of
- * ap_get_mime_headers_ex(): a read error, APR_EOF, APR_ENOSPC for a limit,
- * or APR_EINVAL.
+ * The apr_status_t behind the last DONE or error of ap_h1_head_parse():
+ * a read error, APR_EOF, APR_ENOSPC for a limit, or APR_EINVAL.
  * @param parser The parser
  */
-AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_getline_state_t *parser);
+AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_h1_head_parser_t *parser);
 
 /**
  * Read the mime-encoded headers.
@@ -281,10 +279,10 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
  *         underlying apr_status_t of DONE and errors.
  * @remark DONE and errors are final (until ap_h1_head_parser_reset()).
  */
-AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
-                                       ap_filter_t *f,
-                                       apr_read_type_e block,
-                                       ap_h1_head_t **head);
+AP_DECLARE(int) ap_h1_head_parse(ap_h1_head_parser_t *parser,
+                                 ap_filter_t *f,
+                                 apr_read_type_e block,
+                                 ap_h1_head_t **head);
 
 /**
  * Run post_read_request hook and validate.

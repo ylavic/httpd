@@ -2191,7 +2191,7 @@ typedef struct h1_request_ctx {
     } state;
 
     request_rec *r;
-    ap_getline_state_t *parser;
+    ap_h1_head_parser_t *parser;
 } h1_request_ctx;
 
 apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
@@ -2229,7 +2229,7 @@ apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
          * DEFAULT_LIMIT_BLANK_LINES) because browsers have to tack a CRLF
          * on to the end of POSTs to support old CERN webservers.
          */
-        rc = ap_get_mime_headers_ex(ctx->parser, f->next, block, &head);
+        rc = ap_h1_head_parse(ctx->parser, f->next, block, &head);
         if (rc == AGAIN) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE6, 0, r,
                           "reading request head");
