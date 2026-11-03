@@ -1123,7 +1123,6 @@ static apr_pool_t *pruntime;    /* Pool for MPM threads stuff */
 static pid_t ap_my_pid;         /* Linux getpid() doesn't work except in main
                                    thread. Use this instead */
 static pid_t parent_pid;
-static apr_os_thread_t *listener_os_thread;
 
 static int ap_child_slot;       /* Current child process slot in scoreboard */
 
@@ -1140,14 +1139,6 @@ static APR_INLINE void workers_live_dec(void)
     apr_atomic_dec32(&workers_live);
     apr_atomic_dec32(&ap_scoreboard_image->parent[ap_child_slot].workers_live);
 }
-
-/* The LISTENER_SIGNAL signal will be sent from the main thread to the
- * listener thread to wake it up for graceful termination (what a child
- * process from an old generation does when the admin does "apachectl
- * graceful").  This signal will be blocked in all threads of a child
- * process except for the listener thread.
- */
-#define LISTENER_SIGNAL     SIGHUP
 
 /* What each worker publishes for the other threads, written by the worker
  * only, in a cache line of its own (worker_slots[threads_max], aligned on a
@@ -1932,25 +1923,6 @@ static void shutdown_listener(void)
     if (worker_queue_info) {
         ap_queue_info_term(worker_queue_info);
     }
-
-    if (!listener_os_thread) {
-        /* XXX there is an obscure path that this doesn't handle perfectly:
-         *     right after listener thread is created but before
-         *     listener_os_thread is set, the first worker thread hits an
-         *     error and starts graceful termination
-         */
-        return;
-    }
-    /*
-     * we should just be able to "kill(ap_my_pid, LISTENER_SIGNAL)" on all
-     * platforms and wake up the listener thread since it is the only thread
-     * with SIGHUP unblocked, but that doesn't work on Linux
-     */
-#ifdef HAVE_PTHREAD_KILL
-    pthread_kill(*listener_os_thread, LISTENER_SIGNAL);
-#else
-    kill(ap_my_pid, LISTENER_SIGNAL);
-#endif
 }
 
 #define ST_INIT              0
@@ -5580,12 +5552,6 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
     init_serf(apr_thread_pool_get(thd));
 #endif
 
-    /* Unblock the signal used to wake this thread up, and set a handler for
-     * it.
-     */
-    apr_signal(LISTENER_SIGNAL, dummy_signal_handler);
-    unblock_signal(LISTENER_SIGNAL);
-
     for (;;) {
         apr_int32_t num = 0;
         apr_time_t next_expiry = -1;
@@ -7172,7 +7138,6 @@ static void create_listener_thread(thread_starter * ts)
         /* let the parent decide how bad this really is */
         clean_child_exit(APEXIT_CHILDSICK);
     }
-    apr_os_thread_get(&listener_os_thread, ts->listener);
 }
 
 static void setup_threads_runtime(void)
