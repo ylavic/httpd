@@ -2219,7 +2219,7 @@ apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
         f->ctx = ctx = apr_pcalloc(r->pool, sizeof(*ctx));
         ctx->r = r;
         ctx->state = REQ_HEAD;
-        ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_REQUEST);
+        ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_REQUEST, 0);
         ctx->parser = ap_h1_head_parser_create(r->pool, r, &opts);
     }
 

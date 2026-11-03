@@ -121,6 +121,7 @@ AP_DECLARE(int) ap_check_request_header(request_rec *r);
 /** What an HTTP/1 head parser parses */
 typedef enum {
     AP_H1_HEAD_REQUEST = 0, /**< A request-line, then a header section */
+    AP_H1_HEAD_RESPONSE,    /**< A status-line, then a header section */
     AP_H1_HEAD_HEADERS,     /**< A header section without start line */
     AP_H1_HEAD_TRAILERS     /**< A trailer section (chunked trailers) */
 } ap_h1_head_kind_e;
@@ -131,6 +132,11 @@ typedef enum {
  * whitespace and field values without LF, VT, FF nor CR are accepted
  */
 #define AP_H1_HEAD_OPT_STRICT  (1u << 0)
+/** The head comes from a backend: errors are HTTP_BAD_GATEWAY or
+ * HTTP_GATEWAY_TIME_OUT, their causes logged at APLOG_WARNING (APLOG_DEBUG
+ * otherwise)
+ */
+#define AP_H1_HEAD_OPT_BACKEND (1u << 1)
 /** Merge the headers of the same name (RFC 9110 5.3) once the head is read,
  * and check the merged values against limit_field
  */
@@ -143,8 +149,8 @@ typedef enum {
 typedef struct {
     ap_h1_head_kind_e kind;         /**< what the parser parses */
     unsigned int flags;             /**< AP_H1_HEAD_OPT_* */
-    apr_size_t limit_start_line;    /**< request-line length, its line end
-                                     *   excluded */
+    apr_size_t limit_start_line;    /**< request-line or status-line length,
+                                     *   its line end excluded */
     apr_size_t limit_field;         /**< field line length, obs-folds joined,
                                      *   its line end excluded */
     unsigned int limit_fields;      /**< number of headers, 0 for no limit */
@@ -171,6 +177,10 @@ typedef struct {
             const char *method;
             const char *uri;
         } req;                      /**< REQUEST */
+        struct {
+            int status;
+            const char *reason;     /**< the reason phrase, or "" */
+        } rsp;                      /**< RESPONSE */
     } u;
 } ap_h1_head_t;
 
@@ -182,21 +192,34 @@ struct ap_getline_state; /* opaque */
 typedef struct ap_getline_state ap_getline_state_t;
 
 /**
- * Initialize the options of an HTTP/1 head parser with the client side's
- * defaults: HttpProtocolOptions (Strict or Unsafe) and the LimitRequest* of
- * r's server, merging the headers. The module logging the errors is mod_http.
+ * Initialize the options of an HTTP/1 head parser with a side's defaults:
+ * for the client side, HttpProtocolOptions (Strict or Unsafe) and the
+ * LimitRequest* of r's server, merging the headers; for a backend
+ * (AP_H1_HEAD_OPT_BACKEND in flags), Strict and the client side's default
+ * limits.
  * @param opts The options to initialize
  * @param r The request whose server's configuration applies
  * @param kind What is parsed
+ * @param flags AP_H1_HEAD_OPT_BACKEND or 0
+ * @param module_index The module logging the errors: the module calling
+ *        the ap_h1_head_opts_init() macro (APLOG_MODULE_INDEX, which is
+ *        APLOG_NO_MODULE outside a module, as for logging), or the index
+ *        given by code acting for another module
  */
-AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
-                                      request_rec *r,
-                                      ap_h1_head_kind_e kind);
+AP_DECLARE(void) ap_h1_head_opts_init_(ap_h1_head_opts_t *opts,
+                                       request_rec *r,
+                                       ap_h1_head_kind_e kind,
+                                       unsigned int flags,
+                                       int module_index);
+
+/** ap_h1_head_opts_init_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_h1_head_opts_init(opts, r, kind, flags) \
+    ap_h1_head_opts_init_(opts, r, kind, flags, APLOG_MODULE_INDEX)
 
 /**
  * Create a parser for an HTTP/1 head.
  * @param p The pool of the parser and of the head it parses
- * @param r The request the logs are about
+ * @param r The request the logs are about (the client's for a backend)
  * @param opts The options, copied
  * @return The parser
  */
@@ -205,9 +228,9 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
                                                           const ap_h1_head_opts_t *opts);
 
 /**
- * Prepare a parser for the next head, also after DONE or an error: its
- * state is reset and a new head allocated in its pool. The heads returned
- * before stay valid.
+ * Prepare a parser for the next head (e.g. the final response after an
+ * interim one), also after DONE or an error: its state is reset and a new
+ * head allocated in its pool. The heads returned before stay valid.
  * @param parser The parser
  */
 AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser);
@@ -244,16 +267,17 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
  * @param block  How the operations should be performed
  *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
  * @param head Set to the head on OK; on an error, to the head as parsed so
- *        far once its start line is complete (u.req.method unset if the
- *        start line is invalid), otherwise to NULL
+ *        far once its start line is complete (u.req.method or
+ *        u.rsp.status unset if the start line is invalid), otherwise to NULL
  * @return OK: the head is complete (and its input consumed);
  *         AGAIN: non-blocking and more input is needed: call again once f's
  *         connection is readable, the state is kept;
  *         DONE: the input ended or failed (but timeouts) before the start
  *         line was complete (a closed connection, not a malformed head);
- *         or an HTTP status, its cause logged: HTTP_BAD_REQUEST,
- *         HTTP_REQUEST_URI_TOO_LARGE (request-line) or
- *         HTTP_REQUEST_TIME_OUT. ap_h1_head_parser_status() gives the
+ *         or an HTTP status, its cause logged: for the client side
+ *         HTTP_BAD_REQUEST, HTTP_REQUEST_URI_TOO_LARGE (request-line) or
+ *         HTTP_REQUEST_TIME_OUT, for a backend HTTP_BAD_GATEWAY or
+ *         HTTP_GATEWAY_TIME_OUT. ap_h1_head_parser_status() gives the
  *         underlying apr_status_t of DONE and errors.
  * @remark DONE and errors are final (until ap_h1_head_parser_reset()).
  */

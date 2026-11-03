@@ -27,6 +27,7 @@
 #include "apr_lib.h"
 #include "apr_signal.h"
 #include "apr_strmatch.h"
+#include "apr_date.h"
 
 #define APR_WANT_STDIO          /* for sscanf */
 #define APR_WANT_STRFUNC
@@ -266,8 +267,8 @@ struct ap_getline_state {
     int status;             /* once failed: DONE or an HTTP status */
     apr_status_t rv;        /* the apr_status_t behind it */
     int loglevel;           /* of the errors' causes */
-    const char *what_start; /* "request line" */
-    const char *what;       /* "request header", "request trailer" */
+    const char *what_start; /* "request line", "status line" */
+    const char *what;       /* "request header", "response trailer"... */
     const char *what_line;  /* "request header line"... */
     unsigned int blank_lines;
     unsigned int fields_read;
@@ -988,6 +989,14 @@ static int table_do_fn_check_lengths(void *parser_, const char *key,
 /* Log under the module given in the options */
 #define H1_LOG_MARK __FILE__, __LINE__, parser->opts.module_index
 
+/* The error-notes of the client side's error response */
+static void h1_head_notes(ap_getline_state_t *parser, const char *notes)
+{
+    if (!(parser->opts.flags & AP_H1_HEAD_OPT_BACKEND)) {
+        apr_table_setn(parser->r->notes, "error-notes", notes);
+    }
+}
+
 /* Reading a line failed with rv: log the cause, and give the status, or DONE
  * if the input ended or failed (but a timeout) before the start line
  */
@@ -1004,10 +1013,12 @@ static int h1_head_read_error(ap_getline_state_t *parser, apr_status_t rv)
                           "%s longer than the limit of %" APR_SIZE_T_FMT
                           " bytes", parser->what_start,
                           parser->opts.limit_start_line);
-            return HTTP_REQUEST_URI_TOO_LARGE;
+            return (parser->opts.kind == AP_H1_HEAD_REQUEST)
+                   ? HTTP_REQUEST_URI_TOO_LARGE
+                   : HTTP_BAD_REQUEST;
         }
-        apr_table_setn(r->notes, "error-notes",
-                       "Size of a request header field exceeds server limit.");
+        h1_head_notes(parser, "Size of a request header field exceeds "
+                              "server limit.");
         ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
                       "%s field longer than the limit of %" APR_SIZE_T_FMT
                       " bytes: %.*s", parser->what, parser->opts.limit_field,
@@ -1074,23 +1085,59 @@ static int h1_head_proto_num(const char *protocol)
     return HTTP_VERSION(0, 9);
 }
 
-/* Parse the start line */
-static int h1_head_start_line(ap_getline_state_t *parser, const char *line)
+/* Parse the start line, of len bytes */
+static int h1_head_start_line(ap_getline_state_t *parser, const char *line,
+                              apr_size_t len)
 {
     ap_h1_head_t *head = parser->head;
-    const char *method, *uri, *protocol;
 
     head->start_line = line;
 
-    /* The request line, its errors logged */
-    if (!ap_h1_tokenize_request_line(parser->r, line,
-                                     &method, &uri, &protocol)) {
-        return HTTP_BAD_REQUEST;
+    if (parser->opts.kind == AP_H1_HEAD_REQUEST) {
+        const char *method, *uri, *protocol;
+
+        /* The request line, its errors logged */
+        if (!ap_h1_tokenize_request_line(parser->r, line,
+                                         &method, &uri, &protocol)) {
+            return HTTP_BAD_REQUEST;
+        }
+        head->u.req.method = method;
+        head->u.req.uri = uri;
+        head->protocol = protocol;
+        head->proto_num = h1_head_proto_num(protocol);
     }
-    head->u.req.method = method;
-    head->u.req.uri = uri;
-    head->protocol = protocol;
-    head->proto_num = h1_head_proto_num(protocol);
+    else {
+        const char *reason = "";
+        int status = 0;
+
+        /* RFC 9112 4: HTTP/1.x, SP, 3DIGIT, then SP and the reason phrase
+         * if any (tolerated without), with no control characters but HTAB.
+         */
+        if (len >= 12
+            && apr_date_checkmask(line, "HTTP/#.# ###*")
+            && line[5] == '1' && (len == 12 || line[12] == ' ')) {
+            status = (line[9] - '0') * 100 + (line[10] - '0') * 10
+                     + (line[11] - '0');
+            for (reason = line + 12; *reason; reason++) {
+                const unsigned char c = *reason;
+                if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                    status = 0;
+                    break;
+                }
+            }
+            reason = (len > 13) ? line + 13 : "";
+        }
+        if (status < 100) {
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, parser->r,
+                          APLOGNO() "malformed status line: %.*s",
+                          (int)((len > 128) ? 128 : len), line);
+            return HTTP_BAD_REQUEST;
+        }
+        head->protocol = apr_pstrmemdup(parser->pool, line, 8);
+        head->proto_num = HTTP_VERSION(line[5] - '0', line[7] - '0');
+        head->u.rsp.status = status;
+        head->u.rsp.reason = reason;
+    }
     return OK;
 }
 
@@ -1103,16 +1150,31 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
     parser->pool = p;
     parser->r = r;
     parser->opts = *opts;
-    parser->loglevel = APLOG_DEBUG;
-    parser->what_start = "request line";
-    if (opts->kind == AP_H1_HEAD_REQUEST
-        || opts->kind == AP_H1_HEAD_HEADERS) {
+    parser->loglevel = ((opts->flags & AP_H1_HEAD_OPT_BACKEND) ? APLOG_WARNING
+                                                               : APLOG_DEBUG);
+    switch (opts->kind) {
+    case AP_H1_HEAD_REQUEST:
+    case AP_H1_HEAD_HEADERS: /* no start line */
+        parser->what_start = "request line";
         parser->what = "request header";
         parser->what_line = "request header line";
-    }
-    else {
-        parser->what = "request trailer";
-        parser->what_line = "request trailer line";
+        break;
+    case AP_H1_HEAD_RESPONSE:
+        parser->what_start = "status line";
+        parser->what = "response header";
+        parser->what_line = "response header line";
+        break;
+    default:
+        parser->what_start = "status line"; /* none */
+        if (opts->flags & AP_H1_HEAD_OPT_BACKEND) {
+            parser->what = "response trailer";
+            parser->what_line = "response trailer line";
+        }
+        else {
+            parser->what = "request trailer";
+            parser->what_line = "request trailer line";
+        }
+        break;
     }
     ap_h1_head_parser_reset(parser);
     return parser;
@@ -1199,11 +1261,12 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
             }
             continue;
         }
-        status = h1_head_start_line(parser, line);
+        status = h1_head_start_line(parser, line, len);
         if (status != OK) {
             goto cleanup;
         }
-        if (!*parser->head->protocol) {
+        if (parser->opts.kind == AP_H1_HEAD_REQUEST
+            && !*parser->head->protocol) {
             /* HTTP/0.9: no header section */
             goto done;
         }
@@ -1254,9 +1317,8 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
             if (parser->opts.limit_fields
                     && (++parser->fields_read > parser->opts.limit_fields)) {
                 status = HTTP_BAD_REQUEST;
-                apr_table_setn(r->notes, "error-notes",
-                               "The number of request header fields "
-                               "exceeds this server's limit.");
+                h1_head_notes(parser, "The number of request header fields "
+                                      "exceeds this server's limit.");
                 ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
                               "number of %ss exceeds the limit of %u",
                               parser->what, parser->opts.limit_fields);
@@ -1379,6 +1441,10 @@ read_error:
 cleanup:
     /* Failed or ended, final */
     apr_brigade_cleanup(parser->bb);
+    if ((parser->opts.flags & AP_H1_HEAD_OPT_BACKEND) && status != DONE) {
+        status = ((status == HTTP_REQUEST_TIME_OUT) ? HTTP_GATEWAY_TIME_OUT
+                                                    : HTTP_BAD_GATEWAY);
+    }
     parser->phase = H1_HEAD_FAILED;
     parser->status = status;
     parser->rv = (rv != APR_SUCCESS) ? rv : APR_EINVAL;
@@ -1398,8 +1464,7 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb
     int rc;
 
     /* A header section with the client side's rules, merged */
-    ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_HEADERS);
-    opts.module_index = APLOG_MODULE_INDEX;
+    ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_HEADERS, 0);
     parser = ap_h1_head_parser_create(r->pool, r, &opts);
     rc = ap_get_mime_headers_ex(parser, r->proto_input_filters, APR_BLOCK_READ,
                                 &head);
