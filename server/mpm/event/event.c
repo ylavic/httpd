@@ -1374,7 +1374,7 @@ static apr_time_t fair_share_stopped; /* when it last stopped for the share */
 /* The backlog's connections shut down for their timeout, the lingering ones
  * closed by shrink_timeout_queue() (listener only)
  */
-static apr_uint32_t backlog_dropped, linger_shrinked;
+static apr_uint32_t backlog_dropped, linger_shrunk;
 
 static apr_time_t listensocks_suspended_at; /* the last stop, for its trace */
 
@@ -1536,7 +1536,7 @@ static void backlog_stats_report(apr_time_t now)
     share_toggles = 0;
 
     ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, ap_server_conf,
-                 "backlog sojourn:%s; dropped %u; linger shrinked %u;"
+                 "backlog sojourn:%s; dropped %u; linger shrunk %u;"
                  " accept off %u times, %"
                  APR_TIME_T_FMT "ms, backstop %u,"
                  " share %u times %" APR_TIME_T_FMT "ms,"
@@ -1544,7 +1544,7 @@ static void backlog_stats_report(apr_time_t now)
                  " drain polls=%u csd=%u user=%u dropped=%u"
                  " misses=%u promotions=%u; wait timeouts queued=%u"
                  " skiplist=%u; accept offs ended %u: p50<%uus,max=%uus",
-                 len ? buf : " none", backlog_dropped, linger_shrinked,
+                 len ? buf : " none", backlog_dropped, linger_shrunk,
                  toggles, apr_time_as_msec(off),
                  apr_atomic_xchg32(&admission_backstops, 0),
                  share_n, apr_time_as_msec(share_off),
@@ -1563,7 +1563,7 @@ static void backlog_stats_report(apr_time_t now)
                   : 0),
                  accept_off_max);
     resumes_woken = resumes_recheck = resumes_share = resumes_other = 0;
-    backlog_dropped = linger_shrinked = 0;
+    backlog_dropped = linger_shrunk = 0;
     memset(accept_off_hist, 0, sizeof(accept_off_hist));
     accept_off_ended = accept_off_max = 0;
 }
@@ -5129,10 +5129,10 @@ static APR_INLINE void shrink_timeout_queue(struct timeout_queue *queue,
                                             event_conn_state_t **timed_out)
 {
     unsigned int count = process_timeout_queue_ex(queue, now, 1, timed_out);
-    linger_shrinked += count;
+    linger_shrunk += count;
     if (count) {
         ap_log_error(APLOG_MARK, APLOG_TRACE5, 0, ap_server_conf,
-                     "Connections full, %s queue shrinked (%u done, %u left)",
+                     "Connections full, %s queue shrunk (%u done, %u left)",
                      queue->name, count, apr_atomic_read32(queue->total));
     }
 }
@@ -6219,7 +6219,7 @@ do_maintenance:
             process_timeout_queue(write_completion_q, now);
             process_timeout_queue(keepalive_q, now);
 
-            /* The linger queue is shrinked while the connections are full,
+            /* The linger queue is shrunk while the connections are full,
              * at most every QUEUES_SHRINK_TIMEOUT.
              */
             if (next_shrink_time <= now && connections_full()) {
