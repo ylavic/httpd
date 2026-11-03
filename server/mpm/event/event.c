@@ -200,6 +200,65 @@ static apr_thread_mutex_t *timeout_mutex;
 
 module AP_MODULE_DECLARE_DATA mpm_event_module;
 
+/* Rate limiting of the log lines that can fire per event (see the sites
+ * using it): at most one line per second per call site and child at the
+ * site's level, the next one preceded by how many were suppressed since;
+ * every line at trace7. The state of a site is written by the listener only
+ * (shared 0, plain variables) or by any thread (atomics).
+ */
+typedef struct {
+    apr_uint32_t sec;        /* the second of the last line logged (+1) */
+    apr_uint32_t suppressed; /* lines not logged since */
+} log_ratelimit_t;
+
+static int log_ratelimit(log_ratelimit_t *rl, int level, int shared,
+                         const server_rec *s, const conn_rec *c,
+                         const char *file, int line, int module_index)
+{
+    apr_uint32_t sec, last, suppressed;
+
+    if (c ? !APLOG_C_IS_LEVEL(c, level) : !APLOG_IS_LEVEL(s, level)) {
+        return 0;
+    }
+    if (c ? APLOG_C_IS_LEVEL(c, APLOG_TRACE7) : APLOG_IS_LEVEL(s, APLOG_TRACE7)) {
+        return 1;
+    }
+    sec = (apr_uint32_t)apr_time_sec(apr_time_now()) + 1;
+    if (!shared) {
+        last = rl->sec;
+        if (last == sec) {
+            rl->suppressed++;
+            return 0;
+        }
+        rl->sec = sec;
+        suppressed = rl->suppressed;
+        rl->suppressed = 0;
+    }
+    else {
+        last = apr_atomic_read32(&rl->sec);
+        if (last == sec || apr_atomic_cas32(&rl->sec, sec, last) != last) {
+            apr_atomic_inc32(&rl->suppressed);
+            return 0;
+        }
+        suppressed = apr_atomic_xchg32(&rl->suppressed, 0);
+    }
+    if (suppressed) {
+        if (c) {
+            ap_log_cerror_(file, line, module_index, level, 0, c,
+                           "%u lines like the next one suppressed in %us",
+                           suppressed, sec - last);
+        }
+        else {
+            ap_log_error_(file, line, module_index, level, 0, s,
+                          "%u lines like the next one suppressed in %us",
+                          suppressed, sec - last);
+        }
+    }
+    return 1;
+}
+#define LOG_RATELIMIT(rl, level, shared, s, c) \
+    log_ratelimit(rl, level, shared, s, c, APLOG_MARK)
+
 /* forward declare */
 struct event_srv_cfg_s;
 typedef struct event_srv_cfg_s event_srv_cfg;
@@ -535,15 +594,20 @@ static void enable_listensocks(void)
             || apr_atomic_cas32(&listensocks_disabled, 0, 1) != 1) {
         return;
     }
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(00457)
-                 "Accepting new connections again: "
-                 "%u active conns (%u lingering/%u clogged/%u suspended), "
-                 "%u idle workers",
-                 apr_atomic_read32(&connection_count),
-                 apr_atomic_read32(&lingering_count),
-                 apr_atomic_read32(&clogged_count),
-                 apr_atomic_read32(&suspended_count),
-                 ap_queue_info_num_idlers(worker_queue_info));
+    {
+        static log_ratelimit_t rl;
+        if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf, APLOGNO(00457)
+                         "Accepting new connections again: "
+                         "%u active conns (%u lingering/%u clogged/%u suspended), "
+                         "%u idle workers",
+                         apr_atomic_read32(&connection_count),
+                         apr_atomic_read32(&lingering_count),
+                         apr_atomic_read32(&clogged_count),
+                         apr_atomic_read32(&suspended_count),
+                         ap_queue_info_num_idlers(worker_queue_info));
+        }
+    }
     for (i = 0; i < num_listensocks; i++)
         apr_pollset_add(event_pollset, &listener_pollfd[i]);
     /*
@@ -1204,10 +1268,15 @@ static void process_socket(apr_thread_t *thd, apr_pool_t * p, apr_socket_t * soc
                          && cs->pub.state != CONN_STATE_ASYNC_WAITIO
                          && cs->pub.state != CONN_STATE_WRITE_COMPLETION
                          && cs->pub.state != CONN_STATE_SUSPENDED)) {
-            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO(10111)
-                          "process_socket: connection processing returned %i "
-                          "(%sstate %i): closing",
-                          rc, rc ? "" : "unexpected ", (int)cs->pub.state);
+            {
+                static log_ratelimit_t rl;
+                if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 1, NULL, c)) {
+                    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO(10111)
+                                  "process_socket: connection processing returned %i "
+                                  "(%sstate %i): closing",
+                                  rc, rc ? "" : "unexpected ", (int)cs->pub.state);
+                }
+            }
             cs->pub.state = CONN_STATE_LINGER;
         }
         else if (c->aborted) {
@@ -2241,19 +2310,29 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                 /* A Listener Socket is ready for an accept() */
                 if (workers_were_busy) {
                     disable_listensocks();
-                    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
-                                 APLOGNO(03268)
-                                 "All workers busy, not accepting new conns "
-                                 "in this process");
+                    {
+                        static log_ratelimit_t rl;
+                        if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
+                            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
+                                         APLOGNO(03268)
+                                         "All workers busy, not accepting new conns "
+                                         "in this process");
+                        }
+                    }
                 }
                 else if (connections_above_limit(&workers_were_busy)) {
                     disable_listensocks();
-                    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
-                                 APLOGNO(03269)
-                                 "Too many open connections (%u, idlers %u), "
-                                 "not accepting new conns in this process",
-                                 apr_atomic_read32(&connection_count),
-                                 ap_queue_info_num_idlers(worker_queue_info));
+                    {
+                        static log_ratelimit_t rl;
+                        if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
+                            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
+                                         APLOGNO(03269)
+                                         "Too many open connections (%u, idlers %u), "
+                                         "not accepting new conns in this process",
+                                         apr_atomic_read32(&connection_count),
+                                         ap_queue_info_num_idlers(worker_queue_info));
+                        }
+                    }
                 }
                 else if (!listener_may_exit) {
                     void *csd = NULL;
@@ -2303,8 +2382,13 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t * thd, void *dummy)
                         signal_threads(ST_GRACEFUL);
                     }
                     else if (ap_accept_error_is_nonfatal(rc)) { 
-                        ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, ap_server_conf, 
-                                     "accept() on client socket failed");
+                        {
+                            static log_ratelimit_t rl;
+                            if (LOG_RATELIMIT(&rl, APLOG_DEBUG, 0, ap_server_conf, NULL)) {
+                                ap_log_error(APLOG_MARK, APLOG_DEBUG, rc, ap_server_conf, 
+                                             "accept() on client socket failed");
+                            }
+                        }
                     }
 
                     if (csd != NULL) {
