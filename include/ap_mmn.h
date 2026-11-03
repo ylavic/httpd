@@ -773,10 +773,12 @@
  *                         ap_read_request_ex(), ap_get_mime_headers_ex(),
  *                         ap_fgetline_ex(), AP_GETLINE_ALLOC,
  *                         AP_GETLINE_FOLD_COL, ap_send_interim_response_ex(),
- *                         AP_SEND_INTERIM_NONBLOCK, AP_H1_HEAD_OPT_STRICT,
- *                         AP_H1_HEAD_OPT_MERGE, ap_h1_head_opts_t,
- *                         ap_h1_head_t, ap_h1_head_opts_init() and
- *                         ap_h1_head_parser_create() to http_protocol.h;
+ *                         AP_SEND_INTERIM_NONBLOCK, ap_h1_head_kind_e,
+ *                         AP_H1_HEAD_OPT_STRICT, AP_H1_HEAD_OPT_MERGE,
+ *                         ap_h1_head_opts_t, ap_h1_head_t,
+ *                         ap_h1_head_opts_init(), ap_h1_head_parser_create(),
+ *                         ap_h1_head_parser_reset() and
+ *                         ap_h1_head_parser_status() to http_protocol.h;
  *                         process_score->shutdown, ->backlog and
  *                         ->workers_live to scoreboard.h;
  *                         AP_SHUTDOWN_CONN_* to http_connection.h;

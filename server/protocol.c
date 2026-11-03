@@ -234,6 +234,12 @@ typedef enum {
     LINE_BLANK_FOLD,        /* a blank continuation line */
     LINE_LEADING_BLANK,     /* a continuation line with no line before */
 } line_error_e;
+typedef enum {
+    H1_HEAD_START = 0,      /* the start line, after the empty lines skipped */
+    H1_HEAD_FIELDS,         /* the header (or trailer) section */
+    H1_HEAD_DONE,           /* the head is complete */
+    H1_HEAD_FAILED          /* failed or ended (status), final */
+} h1_head_phase_e;
 struct ap_getline_state {
     char *buf;
     apr_size_t len;
@@ -256,9 +262,14 @@ struct ap_getline_state {
     ap_h1_head_opts_t opts;
     apr_bucket_brigade *bb;
     ap_h1_head_t *head;
+    h1_head_phase_e phase;
+    int status;             /* once failed: DONE or an HTTP status */
+    apr_status_t rv;        /* the apr_status_t behind it */
     int loglevel;           /* of the errors' causes */
-    const char *what;       /* "request header"... */
+    const char *what_start; /* "request line" */
+    const char *what;       /* "request header", "request trailer" */
     const char *what_line;  /* "request header line"... */
+    unsigned int blank_lines;
     unsigned int fields_read;
 };
 static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
@@ -333,6 +344,8 @@ static apr_status_t ap_fgetline_core(ap_getline_state_t *state,
             }
 
             if (in_head && len > 0) {
+                state->head->length += len;
+
                 /* PR#43039: no NUL byte */
                 if (memchr(str, '\0', len)) {
                     state->line_error = LINE_NUL;
@@ -975,41 +988,110 @@ static int table_do_fn_check_lengths(void *parser_, const char *key,
 /* Log under the module given in the options */
 #define H1_LOG_MARK __FILE__, __LINE__, parser->opts.module_index
 
-/* The cause of the line's error rv */
-static void h1_head_line_error(ap_getline_state_t *parser, apr_status_t rv)
+/* Reading a line failed with rv: log the cause, and give the status, or DONE
+ * if the input ended or failed (but a timeout) before the start line
+ */
+static int h1_head_read_error(ap_getline_state_t *parser, apr_status_t rv)
 {
     request_rec *r = parser->r;
+    const char *what_line = (parser->phase == H1_HEAD_START)
+                            ? parser->what_start
+                            : parser->what_line;
 
     if (rv == APR_ENOSPC) {
+        if (parser->phase == H1_HEAD_START) {
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                          "%s longer than the limit of %" APR_SIZE_T_FMT
+                          " bytes", parser->what_start,
+                          parser->opts.limit_start_line);
+            return HTTP_REQUEST_URI_TOO_LARGE;
+        }
         apr_table_setn(r->notes, "error-notes",
                        "Size of a request header field exceeds server limit.");
         ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
                       "%s field longer than the limit of %" APR_SIZE_T_FMT
                       " bytes: %.*s", parser->what, parser->opts.limit_field,
                       field_name_len(parser->buf), parser->buf);
-        return;
+        return HTTP_BAD_REQUEST;
     }
-    switch (parser->line_error) {
-    case LINE_NOT_CRLF:
-        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
-                      "%s not ended by CRLF", parser->what_line);
-        break;
-    case LINE_NUL:
-        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
-                      "NUL byte in a %s", parser->what_line);
-        break;
-    case LINE_BLANK_FOLD:
-        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
-                      "%s field continued by a blank line: %.*s",
-                      parser->what, field_name_len(parser->buf), parser->buf);
-        break;
-    case LINE_LEADING_BLANK:
-        ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
-                      "whitespace before the first %s field", parser->what);
-        break;
-    default:
-        break;
+    if (APR_STATUS_IS_EINVAL(rv) && parser->line_error != LINE_OK) {
+        switch (parser->line_error) {
+        case LINE_NOT_CRLF:
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                          "%s not ended by CRLF", what_line);
+            break;
+        case LINE_NUL:
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                          "NUL byte in a %s", what_line);
+            break;
+        case LINE_BLANK_FOLD:
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                          "%s field continued by a blank line: %.*s",
+                          parser->what, field_name_len(parser->buf),
+                          parser->buf);
+            break;
+        case LINE_LEADING_BLANK:
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                          "whitespace before the first %s field",
+                          parser->what);
+            break;
+        default:
+            break;
+        }
+        return HTTP_BAD_REQUEST;
     }
+    if (APR_STATUS_IS_TIMEUP(rv)) {
+        ap_log_rerror(H1_LOG_MARK, parser->loglevel, rv, r, APLOGNO()
+                      "timeout reading the %s",
+                      (parser->phase == H1_HEAD_START) ? parser->what_start
+                                                       : parser->what);
+        return HTTP_REQUEST_TIME_OUT;
+    }
+    if (parser->phase == H1_HEAD_START) {
+        /* No head: a closed connection, for the caller to tell */
+        ap_log_rerror(H1_LOG_MARK, APLOG_TRACE3, rv, r,
+                      "reading the %s failed", parser->what_start);
+        return DONE;
+    }
+    ap_log_rerror(H1_LOG_MARK, parser->loglevel, rv, r, APLOGNO()
+                  "%s section %s", parser->what,
+                  APR_STATUS_IS_EOF(rv) ? "ended before the empty line"
+                                        : "failed to read");
+    return HTTP_BAD_REQUEST;
+}
+
+/* The number of a request's protocol, as r_assign_protocol() gives
+ * r->proto_num: HTTP/x.y (case-insensitive, x not 0), else HTTP/0.9
+ */
+static int h1_head_proto_num(const char *protocol)
+{
+    if (ap_cstr_casecmpn(protocol, "HTTP/", 5) == 0
+        && apr_isdigit(protocol[5]) && protocol[5] != '0'
+        && protocol[6] == '.' && apr_isdigit(protocol[7])
+        && !protocol[8]) {
+        return HTTP_VERSION(protocol[5] - '0', protocol[7] - '0');
+    }
+    return HTTP_VERSION(0, 9);
+}
+
+/* Parse the start line */
+static int h1_head_start_line(ap_getline_state_t *parser, const char *line)
+{
+    ap_h1_head_t *head = parser->head;
+    const char *method, *uri, *protocol;
+
+    head->start_line = line;
+
+    /* The request line, its errors logged */
+    if (!ap_h1_tokenize_request_line(parser->r, line,
+                                     &method, &uri, &protocol)) {
+        return HTTP_BAD_REQUEST;
+    }
+    head->u.req.method = method;
+    head->u.req.uri = uri;
+    head->protocol = protocol;
+    head->proto_num = h1_head_proto_num(protocol);
+    return OK;
 }
 
 AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
@@ -1022,11 +1104,42 @@ AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
     parser->r = r;
     parser->opts = *opts;
     parser->loglevel = APLOG_DEBUG;
-    parser->what = "request header";
-    parser->what_line = "request header line";
-    parser->head = apr_pcalloc(p, sizeof(*parser->head));
-    parser->head->headers = apr_table_make(p, 20);
+    parser->what_start = "request line";
+    if (opts->kind == AP_H1_HEAD_REQUEST
+        || opts->kind == AP_H1_HEAD_HEADERS) {
+        parser->what = "request header";
+        parser->what_line = "request header line";
+    }
+    else {
+        parser->what = "request trailer";
+        parser->what_line = "request trailer line";
+    }
+    ap_h1_head_parser_reset(parser);
     return parser;
+}
+
+AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser)
+{
+    parser->head = apr_pcalloc(parser->pool, sizeof(*parser->head));
+    parser->head->headers = apr_table_make(parser->pool, 20);
+    parser->head->kind = parser->opts.kind;
+    if (parser->opts.kind == AP_H1_HEAD_HEADERS
+        || parser->opts.kind == AP_H1_HEAD_TRAILERS) {
+        parser->phase = H1_HEAD_FIELDS;
+    }
+    else {
+        parser->phase = H1_HEAD_START;
+    }
+    parser->status = OK;
+    parser->rv = APR_SUCCESS;
+    parser->blank_lines = 0;
+    parser->fields_read = 0;
+    parser->reusable = 0; /* a new line */
+}
+
+AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_getline_state_t *parser)
+{
+    return parser->rv;
 }
 
 AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
@@ -1039,9 +1152,16 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
     int status = OK;
     int strict = (parser->opts.flags & AP_H1_HEAD_OPT_STRICT);
     apr_size_t max_size = parser->opts.limit_field + 1;
-    int flags = AP_GETLINE_ALLOC | AP_GETLINE_FOLD;
+    int flags = AP_GETLINE_ALLOC;
 
     *head = NULL;
+    if (parser->phase == H1_HEAD_DONE) {
+        *head = parser->head;
+        return OK;
+    }
+    if (parser->phase == H1_HEAD_FAILED) {
+        goto failed;
+    }
     if (strict) {
         flags |= AP_GETLINE_CRLF;
     }
@@ -1050,6 +1170,44 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
     }
     if (!parser->bb) {
         parser->bb = apr_brigade_create(parser->pool, f->c->bucket_alloc);
+    }
+
+    /* Read past empty lines until we get the start line, a read error, the
+     * connection closes (EOF), or we timeout. Empty lines are skipped
+     * because browsers have to tack a CRLF on to the end of POSTs to support
+     * old CERN webservers.
+     */
+    while (parser->phase == H1_HEAD_START) {
+        char *line;
+        apr_size_t len;
+
+        /* limit + 2 for CRLF + 1 for NUL */
+        rv = ap_fgetline_state(parser, f, parser->opts.limit_start_line + 3,
+                               flags);
+        line = parser->buf;
+        len = parser->len;
+        if (rv != APR_SUCCESS) {
+            goto read_error;
+        }
+        if (len == 0) {
+            if (++parser->blank_lines > parser->opts.max_blank_lines) {
+                ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
+                              "too many empty lines before the %s",
+                              parser->what_start);
+                status = HTTP_BAD_REQUEST;
+                goto cleanup;
+            }
+            continue;
+        }
+        status = h1_head_start_line(parser, line);
+        if (status != OK) {
+            goto cleanup;
+        }
+        if (!*parser->head->protocol) {
+            /* HTTP/0.9: no header section */
+            goto done;
+        }
+        parser->phase = H1_HEAD_FIELDS;
     }
 
     /*
@@ -1061,27 +1219,12 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
         apr_size_t len;
 
         /* max_size + 2 for CRLF */
-        rv = ap_fgetline_state(parser, f, max_size + 2, flags);
+        rv = ap_fgetline_state(parser, f, max_size + 2,
+                               flags | AP_GETLINE_FOLD);
         field = parser->buf;
         len = parser->len;
-        if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
-            status = AGAIN;
-            goto cleanup;
-        }
         if (rv != APR_SUCCESS) {
-            if (APR_STATUS_IS_TIMEUP(rv)) {
-                status = HTTP_REQUEST_TIME_OUT;
-            }
-            else {
-                status = HTTP_BAD_REQUEST;
-            }
-
-            /* ap_fgetline returns APR_ENOSPC if it fills up the buffer before
-             * finding the end-of-line.  This is only going to happen if it
-             * exceeds the configured limit for a field size.
-             */
-            h1_head_line_error(parser, rv);
-            goto cleanup;
+            goto read_error;
         }
 
         /* Found the terminating empty end-of-headers line, stop. */
@@ -1117,6 +1260,7 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
                 ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, r, APLOGNO()
                               "number of %ss exceeds the limit of %u",
                               parser->what, parser->opts.limit_fields);
+                rv = APR_ENOSPC;
                 goto cleanup;
             }
 
@@ -1207,6 +1351,7 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
         }
     }
 
+done:
     if (parser->opts.flags & AP_H1_HEAD_OPT_MERGE) {
         /* Combine multiple message-header fields with the same
          * field-name, following RFC 2616, 4.2.
@@ -1217,14 +1362,32 @@ AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
         if (!apr_table_do(table_do_fn_check_lengths, parser,
                           parser->head->headers, NULL)) {
             status = HTTP_BAD_REQUEST;
+            rv = APR_ENOSPC;
             goto cleanup;
         }
     }
+    parser->phase = H1_HEAD_DONE;
     *head = parser->head;
+    return OK;
+
+read_error:
+    if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
+        return AGAIN;
+    }
+    status = h1_head_read_error(parser, rv);
 
 cleanup:
+    /* Failed or ended, final */
     apr_brigade_cleanup(parser->bb);
-    return status;
+    parser->phase = H1_HEAD_FAILED;
+    parser->status = status;
+    parser->rv = (rv != APR_SUCCESS) ? rv : APR_EINVAL;
+
+failed:
+    if (parser->head->start_line) {
+        *head = parser->head;
+    }
+    return parser->status;
 }
 
 AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb)
@@ -1235,13 +1398,13 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r, apr_bucket_brigade *bb
     int rc;
 
     /* A header section with the client side's rules, merged */
-    ap_h1_head_opts_init(&opts, r);
+    ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_HEADERS);
     opts.module_index = APLOG_MODULE_INDEX;
     parser = ap_h1_head_parser_create(r->pool, r, &opts);
     rc = ap_get_mime_headers_ex(parser, r->proto_input_filters, APR_BLOCK_READ,
                                 &head);
     if (rc != OK) {
-        r->status = rc;
+        r->status = (rc == DONE) ? HTTP_BAD_REQUEST : rc;
         return;
     }
     /* Copied into the caller's r->headers_in, the table itself since

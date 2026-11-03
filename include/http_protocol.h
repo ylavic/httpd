@@ -118,8 +118,16 @@ AP_DECLARE(int) ap_parse_request_line(request_rec *r);
  */
 AP_DECLARE(int) ap_check_request_header(request_rec *r);
 
-/** RFC 9112's rules: CRLF line ends, token field names and field-content
- * values; otherwise (Unsafe) bare LF line ends, field names without
+/** What an HTTP/1 head parser parses */
+typedef enum {
+    AP_H1_HEAD_REQUEST = 0, /**< A request-line, then a header section */
+    AP_H1_HEAD_HEADERS,     /**< A header section without start line */
+    AP_H1_HEAD_TRAILERS     /**< A trailer section (chunked trailers) */
+} ap_h1_head_kind_e;
+
+/** RFC 9112's rules: CRLF line ends, token field names, field-content
+ * values, and the request-line's whitespace rules of HttpProtocolOptions
+ * Strict; otherwise (Unsafe) bare LF line ends, field names without
  * whitespace and field values without LF, VT, FF nor CR are accepted
  */
 #define AP_H1_HEAD_OPT_STRICT  (1u << 0)
@@ -133,17 +141,37 @@ AP_DECLARE(int) ap_check_request_header(request_rec *r);
  * be longer than its limit by one byte, or by two if it ends with a bare LF.
  */
 typedef struct {
+    ap_h1_head_kind_e kind;         /**< what the parser parses */
     unsigned int flags;             /**< AP_H1_HEAD_OPT_* */
+    apr_size_t limit_start_line;    /**< request-line length, its line end
+                                     *   excluded */
     apr_size_t limit_field;         /**< field line length, obs-folds joined,
                                      *   its line end excluded */
     unsigned int limit_fields;      /**< number of headers, 0 for no limit */
+    unsigned int max_blank_lines;   /**< empty lines skipped before the
+                                     *   start line */
     int module_index;               /**< the module logging the errors */
 } ap_h1_head_opts_t;
 
 /** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */
 typedef struct {
+    const char *start_line;         /**< as received, line end excluded
+                                     *   (NULL for HEADERS and TRAILERS) */
+    const char *protocol;           /**< "HTTP/x.y", "" for HTTP/0.9 */
+    int proto_num;                  /**< HTTP_VERSION(x, y) */
     apr_table_t *headers;           /**< in the order received, not merged
                                      *   unless AP_H1_HEAD_OPT_MERGE */
+    apr_off_t length;               /**< bytes of the head, line ends
+                                     *   included */
+    ap_h1_head_kind_e kind;         /**< what this head is (the parser's
+                                     *   options' kind): u.req for REQUEST,
+                                     *   u.rsp for RESPONSE */
+    union {
+        struct {
+            const char *method;
+            const char *uri;
+        } req;                      /**< REQUEST */
+    } u;
 } ap_h1_head_t;
 
 /**
@@ -159,9 +187,11 @@ typedef struct ap_getline_state ap_getline_state_t;
  * r's server, merging the headers. The module logging the errors is mod_http.
  * @param opts The options to initialize
  * @param r The request whose server's configuration applies
+ * @param kind What is parsed
  */
 AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
-                                      request_rec *r);
+                                      request_rec *r,
+                                      ap_h1_head_kind_e kind);
 
 /**
  * Create a parser for an HTTP/1 head.
@@ -173,6 +203,22 @@ AP_DECLARE(void) ap_h1_head_opts_init(ap_h1_head_opts_t *opts,
 AP_DECLARE(ap_getline_state_t *) ap_h1_head_parser_create(apr_pool_t *p,
                                                           request_rec *r,
                                                           const ap_h1_head_opts_t *opts);
+
+/**
+ * Prepare a parser for the next head, also after DONE or an error: its
+ * state is reset and a new head allocated in its pool. The heads returned
+ * before stay valid.
+ * @param parser The parser
+ */
+AP_DECLARE(void) ap_h1_head_parser_reset(ap_getline_state_t *parser);
+
+/**
+ * The apr_status_t behind the last DONE or error of
+ * ap_get_mime_headers_ex(): a read error, APR_EOF, APR_ENOSPC for a limit,
+ * or APR_EINVAL.
+ * @param parser The parser
+ */
+AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_getline_state_t *parser);
 
 /**
  * Read the mime-encoded headers.
@@ -191,16 +237,25 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
 
 /**
  * Read and parse an HTTP/1 head from an input filter, as far as the input
- * goes, in blocking or non-blocking mode.
+ * goes, in blocking or non-blocking mode: line by line (AP_MODE_GETLINE),
+ * so nothing after the head is read.
  * @param parser The parser (ap_h1_head_parser_create())
  * @param f Input filter to read from
  * @param block  How the operations should be performed
  *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
- * @param head Set to the head on OK, to NULL otherwise
+ * @param head Set to the head on OK; on an error, to the head as parsed so
+ *        far once its start line is complete (u.req.method unset if the
+ *        start line is invalid), otherwise to NULL
  * @return OK: the head is complete (and its input consumed);
  *         AGAIN: non-blocking and more input is needed: call again once f's
  *         connection is readable, the state is kept;
- *         or an HTTP status: HTTP_BAD_REQUEST or HTTP_REQUEST_TIME_OUT
+ *         DONE: the input ended or failed (but timeouts) before the start
+ *         line was complete (a closed connection, not a malformed head);
+ *         or an HTTP status, its cause logged: HTTP_BAD_REQUEST,
+ *         HTTP_REQUEST_URI_TOO_LARGE (request-line) or
+ *         HTTP_REQUEST_TIME_OUT. ap_h1_head_parser_status() gives the
+ *         underlying apr_status_t of DONE and errors.
+ * @remark DONE and errors are final (until ap_h1_head_parser_reset()).
  */
 AP_DECLARE(int) ap_get_mime_headers_ex(ap_getline_state_t *parser,
                                        ap_filter_t *f,
