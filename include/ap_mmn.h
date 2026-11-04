@@ -775,7 +775,8 @@
  *                         ap_send_interim_response_ex(),
  *                         AP_SEND_INTERIM_NONBLOCK, ap_h1_head_kind_e,
  *                         AP_H1_HEAD_OPT_STRICT, AP_H1_HEAD_OPT_BACKEND,
- *                         AP_H1_HEAD_OPT_MERGE, ap_h1_head_opts_t,
+ *                         AP_H1_HEAD_OPT_MERGE,
+ *                         AP_H1_HEAD_OPT_ANY_VERSION, ap_h1_head_opts_t,
  *                         ap_h1_head_t, ap_h1_head_parser_t,
  *                         ap_h1_head_opts_init_() (and its macro
  *                         ap_h1_head_opts_init()), ap_h1_head_parser_create(),

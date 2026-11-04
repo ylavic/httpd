@@ -1107,25 +1107,36 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
         head->proto_num = h1_head_proto_num(protocol);
     }
     else {
+        int any_version = (parser->opts.flags & AP_H1_HEAD_OPT_ANY_VERSION);
         const char *reason = "";
+        apr_size_t plen = 0; /* the protocol's length */
         int status = 0;
 
         /* RFC 9112 4: HTTP/1.x, SP, 3DIGIT, then SP and the reason phrase
-         * if any (tolerated without), with no control characters but HTAB.
+         * if any (tolerated without), with no control characters but HTAB;
+         * HTTP/x.y or HTTP/x of any version with AP_H1_HEAD_OPT_ANY_VERSION.
          */
-        if (len >= 12
-            && apr_date_checkmask(line, "HTTP/#.# ###*")
-            && line[5] == '1' && (len == 12 || line[12] == ' ')) {
-            status = (line[9] - '0') * 100 + (line[10] - '0') * 10
-                     + (line[11] - '0');
-            for (reason = line + 12; *reason; reason++) {
+        if (len >= 12 && apr_date_checkmask(line, "HTTP/#.# ###*")
+            && (line[5] == '1' || any_version)) {
+            plen = 8;
+        }
+        else if (any_version && len >= 10
+                 && apr_date_checkmask(line, "HTTP/# ###*")) {
+            plen = 6;
+        }
+        if (plen && (len == plen + 4 || line[plen + 4] == ' ')) {
+            const char *code = line + plen + 1;
+
+            status = (code[0] - '0') * 100 + (code[1] - '0') * 10
+                     + (code[2] - '0');
+            for (reason = code + 3; *reason; reason++) {
                 const unsigned char c = *reason;
                 if ((c < 0x20 && c != '\t') || c == 0x7f) {
                     status = 0;
                     break;
                 }
             }
-            reason = (len > 13) ? line + 13 : "";
+            reason = (len > plen + 5) ? line + plen + 5 : "";
         }
         if (status < 100) {
             ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, parser->r,
@@ -1133,8 +1144,9 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
                           (int)((len > 128) ? 128 : len), line);
             return HTTP_BAD_REQUEST;
         }
-        head->protocol = apr_pstrmemdup(parser->pool, line, 8);
-        head->proto_num = HTTP_VERSION(line[5] - '0', line[7] - '0');
+        head->protocol = apr_pstrmemdup(parser->pool, line, plen);
+        head->proto_num = HTTP_VERSION(line[5] - '0',
+                                       (plen == 8) ? line[7] - '0' : 0);
         head->u.rsp.status = status;
         head->u.rsp.reason = reason;
     }
