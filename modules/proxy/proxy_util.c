@@ -6836,7 +6836,10 @@ PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
         return;
     }
 
-    ap_request_finish_suspended(r, status);
+    /* Then the handler chain, as if proxy_handler() had returned status:
+     * with DECLINED the next handlers run, otherwise the request ends.
+     */
+    ap_request_resume_suspended(r, status);
 }
 
 PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r)

@@ -1169,10 +1169,13 @@ PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r);
  * Finish a request that a scheme handler suspended (returned SUSPENDED for),
  * once done with it: let mod_proxy's handler continue as if the handler had
  * returned status (ap_proxy_handler_resume()), then unless suspended again
- * finish the request and give its connection back to the MPM.
+ * resume the handler chain as if proxy_handler() had returned that status
+ * (ap_request_resume_suspended(): with DECLINED the next handlers run,
+ * otherwise the request ends and its connection goes back to the MPM).
  * @param r       the request
  * @param status  the scheme handler's status
- * @remark Don't dereference r afterwards.
+ * @remark Call it once per suspension, from the continuation of the
+ * request's last wait. Don't dereference r afterwards.
  */
 PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status);
 
