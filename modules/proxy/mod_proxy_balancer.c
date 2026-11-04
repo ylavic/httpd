@@ -420,6 +420,7 @@ static proxy_worker *find_best_worker_retry(proxy_balancer *balancer,
 typedef struct {
     proxy_balancer *balancer;
     apr_time_t deadline;
+    ap_request_waitctx_t *timer; /* the core's wait between the attempts */
     unsigned int retrying :1; /* waiting, the next pre_request is a retry */
 } balancer_wait_t;
 
@@ -427,18 +428,16 @@ typedef struct {
  * between two attempts: let mod_proxy run the pre_request hooks again, to
  * retry.
  */
-static void balancer_wait_continuation(conn_rec *c, request_rec *r,
-                                       ap_mpm_wait_result_e why,
-                                       const apr_array_header_t *pfds,
+static void balancer_wait_continuation(request_rec *r, apr_status_t rv,
                                        void *baton)
 {
     balancer_wait_t *bw = baton;
 
-    if (why != AP_MPM_WAIT_TIMEOUT) {
+    if (rv != APR_SUCCESS) {
         bw->retrying = 0;
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "%s: waiting for a usable worker interrupted "
-                      "(async, %i)", bw->balancer->s->name, (int)why);
+                      "(async)", bw->balancer->s->name);
         ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
         return;
     }
@@ -446,11 +445,11 @@ static void balancer_wait_continuation(conn_rec *c, request_rec *r,
 }
 
 /* No usable worker was found for a balancer with a timeout: wait before
- * retrying, as find_best_worker_retry() would sleep, but in the MPM. The
- * first attempt (!retry) sets the deadline. Returns SUSPENDED while waiting
- * (the pre_request hook too), else the worker found by sleeping as
- * find_best_worker_retry() if the MPM refuses the wait, or NULL once the
- * timeout has elapsed.
+ * retrying, as find_best_worker_retry() would sleep, but on a timer of the
+ * core's request waits (ap_request_wait()). The first attempt (!retry) sets
+ * the deadline. Returns SUSPENDED while waiting (the pre_request hook too),
+ * else the worker found by sleeping as find_best_worker_retry() if the wait
+ * is declined, or NULL once the timeout has elapsed.
  */
 static int balancer_wait(proxy_balancer *balancer, request_rec *r, int retry,
                          proxy_worker **runtime)
@@ -459,11 +458,12 @@ static int balancer_wait(proxy_balancer *balancer, request_rec *r, int retry,
     apr_interval_time_t timeout = balancer->s->timeout;
     apr_interval_time_t step = timeout / 100;
     apr_time_t now = apr_time_now();
-    apr_status_t rv;
+    int rc;
 
     bw = ap_get_module_config(r->request_config, &proxy_balancer_module);
     if (!bw) {
         bw = apr_pcalloc(r->pool, sizeof(*bw));
+        bw->timer = ap_request_waitctx_timer(r, r->pool);
         ap_set_module_config(r->request_config, &proxy_balancer_module, bw);
     }
     bw->balancer = balancer;
@@ -478,10 +478,11 @@ static int balancer_wait(proxy_balancer *balancer, request_rec *r, int retry,
         step = bw->deadline - now;
     }
 
-    rv = ap_mpm_register_wait(r->connection, r->pool, NULL, step, NULL, 0,
-                              balancer_wait_continuation, bw);
-    if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+    bw->timer->timeout = step;
+    rc = ap_request_wait(bw->timer, AP_WAIT_IN, 0, balancer_wait_continuation,
+                         bw);
+    if (rc != SUSPENDED) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
                       "%s: can't wait for a usable worker asynchronously",
                       balancer->s->name);
         *runtime = find_best_worker_retry(balancer, r);
