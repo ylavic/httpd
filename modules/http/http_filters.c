@@ -1551,9 +1551,18 @@ struct ap_request_body {
     apr_status_t interrupted;        /* the last wait was (the MPM failed to
                                       * wait: APR_EGENERAL), else
                                       * APR_SUCCESS */
+    /* ap_request_body_run()'s */
+    apr_bucket_brigade *run_bb;      /* each read, given to the sink */
+    apr_off_t run_readbytes;
+    unsigned int run_flags;
+    int run_module_index;
+    ap_request_body_sink_fn *sink;
+    ap_request_body_done_fn *done;
+    void *run_baton;
     unsigned int timed_out :1,       /* the last wait timed out */
                  drained   :1,       /* the last read said EAGAIN */
-                 block     :1;       /* a wait declined: read blocking */
+                 block     :1,       /* a wait declined: read blocking */
+                 running   :1;       /* a run is in progress */
 };
 
 static struct ap_request_body *request_body_get(request_rec *r)
@@ -1765,6 +1774,118 @@ AP_DECLARE(int) ap_request_wait_body_(request_rec *r,
         return DECLINED;
     }
     return OK;
+}
+
+/* The loop of ap_request_body_run(): OK or an HTTP error once done, or
+ * SUSPENDED (request_body_run_continuation() goes on)
+ */
+static void request_body_run_continuation(request_rec *r,
+                                          apr_status_t status,
+                                          void *baton);
+
+static int request_body_run(struct ap_request_body *body)
+{
+    request_rec *r = body->r;
+    apr_bucket_brigade *bb = body->run_bb;
+    int rc;
+
+    for (;;) {
+        apr_bucket *e;
+        int eos = 0;
+
+        rc = ap_request_read_body_(r, bb, body->run_readbytes,
+                                   body->run_flags, body->run_module_index);
+        if (rc == AGAIN) {
+            rc = ap_request_wait_body_(r, request_body_run_continuation, body,
+                                       body->run_module_index);
+            if (rc == SUSPENDED) {
+                return SUSPENDED;
+            }
+            continue; /* ready, or blocking from now on */
+        }
+        if (rc != OK) {
+            apr_brigade_cleanup(bb);
+            return rc;
+        }
+
+        if (!APR_BRIGADE_EMPTY(bb)) {
+            e = APR_BRIGADE_LAST(bb);
+            if (APR_BUCKET_IS_EOS(e)) {
+                apr_bucket_delete(e);
+                eos = 1;
+            }
+        }
+        if (eos || !APR_BRIGADE_EMPTY(bb)) {
+            rc = body->sink(r, bb, eos, body->run_baton);
+            apr_brigade_cleanup(bb);
+            if (rc == DONE) {
+                return OK; /* the rest is discarded */
+            }
+            if (rc != OK) {
+                AP_DEBUG_ASSERT(rc != SUSPENDED);
+                if (rc == SUSPENDED) {
+                    ap_log_rerror(__FILE__, __LINE__, body->run_module_index,
+                                  APLOG_ERR, 0, r, APLOGNO()
+                                  "request body sink returned SUSPENDED");
+                    return HTTP_INTERNAL_SERVER_ERROR;
+                }
+                return rc;
+            }
+        }
+        if (eos) {
+            return OK;
+        }
+    }
+}
+
+static void request_body_run_continuation(request_rec *r,
+                                          apr_status_t status,
+                                          void *baton)
+{
+    struct ap_request_body *body = baton;
+    int rc;
+
+    /* The next read answers the wait's status */
+    rc = request_body_run(body);
+    if (rc != SUSPENDED) {
+        body->running = 0;
+        body->done(r, rc, body->run_baton);
+    }
+}
+
+AP_DECLARE(int) ap_request_body_run_(request_rec *r, apr_off_t readbytes,
+                                     unsigned int flags,
+                                     ap_request_body_sink_fn *sink,
+                                     ap_request_body_done_fn *done,
+                                     void *baton, int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    int rc;
+
+    AP_DEBUG_ASSERT(!body->running);
+    if (body->running) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "request body run while another one is in "
+                      "progress");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (!body->run_bb) {
+        body->run_bb = apr_brigade_create(r->pool,
+                                          r->connection->bucket_alloc);
+    }
+    body->run_readbytes = readbytes;
+    body->run_flags = flags;
+    body->run_module_index = module_index;
+    body->sink = sink;
+    body->done = done;
+    body->run_baton = baton;
+    body->running = 1;
+
+    rc = request_body_run(body);
+    if (rc != SUSPENDED) {
+        body->running = 0;
+    }
+    return rc;
 }
 
 /* Here we deal with getting the request message body from the client.

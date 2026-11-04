@@ -744,6 +744,64 @@ AP_DECLARE(int) ap_request_wait_body_(request_rec *r,
     ap_request_wait_body_(r, fn, baton, APLOG_MODULE_INDEX)
 
 /**
+ * The sink of ap_request_body_run(), given each read of the request body.
+ * @param r The request
+ * @param bb What was read (the EOS bucket removed), maybe transient buckets
+ *        unless AP_REQUEST_BODY_SETASIDE was given: the buckets left in it
+ *        are deleted once the sink returns
+ * @param eos Non-zero once the body is complete (bb may be empty then)
+ * @param baton The baton given to ap_request_body_run()
+ * @return OK to go on, DONE to stop reading (what's left of the body is
+ *         discarded at the end of the request, as usual), or an HTTP error
+ *         that the run ends with
+ */
+typedef int ap_request_body_sink_fn(request_rec *r, apr_bucket_brigade *bb,
+                                    int eos, void *baton);
+
+/**
+ * Called once by ap_request_body_run() when it returned SUSPENDED, with the
+ * outcome of the run: OK (the body was read whole, or the sink said DONE),
+ * or an HTTP error (from the reads, ap_request_read_body(), or the sink).
+ * It continues the request until it ends it, or it waits again.
+ * @param r The request
+ * @param status The outcome
+ * @param baton The baton given to ap_request_body_run()
+ */
+typedef void ap_request_body_done_fn(request_rec *r, int status, void *baton);
+
+/**
+ * Read the request body to a sink, ap_request_read_body() and
+ * ap_request_wait_body() in a loop: the sink gets each read (non-empty) and
+ * the end of the body.
+ * @param r The request
+ * @param readbytes The most bytes of each read (e.g. AP_IOBUFSIZE)
+ * @param flags As for ap_request_read_body()
+ * @param sink The sink
+ * @param done Called once the run is done, only if it returned SUSPENDED
+ * @param baton For sink and done
+ * @param module_index The module whose log level the log lines follow
+ * @return OK or an HTTP error when done without suspending: done is NOT
+ *         called, the caller goes on with the result; or SUSPENDED: return
+ *         SUSPENDED up, done is called later (never inline) from a
+ *         continuation of the request, once.
+ * @remark A done function shared with the path that called this must only
+ *         run there when it returned SUSPENDED, as done ends or resumes the
+ *         request (e.g. ap_request_resume_suspended()).
+ * @remark One run at a time per request; the sink has no way to slow the
+ *         reads down (it may stop them with DONE).
+ */
+AP_DECLARE(int) ap_request_body_run_(request_rec *r, apr_off_t readbytes,
+                                     unsigned int flags,
+                                     ap_request_body_sink_fn *sink,
+                                     ap_request_body_done_fn *done,
+                                     void *baton, int module_index);
+
+/** ap_request_body_run_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_body_run(r, readbytes, flags, sink, done, baton) \
+    ap_request_body_run_(r, readbytes, flags, sink, done, baton, \
+                         APLOG_MODULE_INDEX)
+
+/**
  * Kill the current request
  * @param type Why the request is dying
  * @param r The current request

@@ -800,9 +800,11 @@
  *                         ap_request_waitctx_release(), ap_request_wait(),
  *                         ap_request_wait_any(), ap_request_waitctx_ready(),
  *                         AP_REQUEST_BODY_SETASIDE, AP_REQUEST_BODY_BLOCK,
- *                         ap_request_read_body_() and
- *                         ap_request_wait_body_() (and their macros without
- *                         the trailing "_") to http_request.h;
+ *                         ap_request_read_body_(),
+ *                         ap_request_wait_body_(), ap_request_body_run_()
+ *                         (and their macros without the trailing "_"),
+ *                         ap_request_body_sink_fn and
+ *                         ap_request_body_done_fn to http_request.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
  *                         ap_proxy_handler_done(), proxy_req_conf->async,
