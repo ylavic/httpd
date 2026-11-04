@@ -279,10 +279,11 @@ AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
 
 /**
  * Read and parse an HTTP/1 head from an input filter, as far as the input
- * goes, in blocking or non-blocking mode: line by line (AP_MODE_GETLINE),
- * so nothing after the head is read.
+ * goes, in blocking or non-blocking mode: in blocks peeked at
+ * (AP_MODE_SPECULATIVE) then consumed (AP_MODE_READBYTES) up to the head's
+ * end, so nothing after the head is read.
  * @param parser The parser (ap_h1_head_parser_create())
- * @param f Input filter to read from
+ * @param f Input filter to read from, supporting both modes
  * @param block  How the operations should be performed
  *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
  * @param head Set to the head on OK; on an error, to the head as parsed so
