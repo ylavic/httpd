@@ -823,10 +823,12 @@
  *                         proxy_worker_shared, proxy_conn_rec->backend_wait
  *                         to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h;
- *                         AP_IMPLEMENT_HOOK_RUN_FIRST_FROM to ap_hooks.h; and
+ *                         AP_IMPLEMENT_HOOK_RUN_FIRST_FROM to ap_hooks.h;
+ *                         ap_run_handler_from() to http_config.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
- *                         ap_request_async_t (with its waits, ended,
- *                         running and suspended),
+ *                         ap_request_async_t (with its waits, handler_pos,
+ *                         handler, old_handler, ended, running and
+ *                         suspended),
  *                         core_request_config->async and
  *                         core_dir_config->async_requests to http_core.h
  * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and

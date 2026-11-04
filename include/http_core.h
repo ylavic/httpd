@@ -410,6 +410,13 @@ typedef struct {
     ap_request_phase_e phase;
     /** The state of its waits (ap_request_wait()), on first use */
     struct ap_request_waitset *waitset;
+    /** Where its handler chain suspended (ap_invoke_handler()), once it did:
+     * the index of the handler that returned SUSPENDED */
+    int handler_pos;
+    /** The handler chosen for the chain (r->handler while it runs) */
+    const char *handler;
+    /** r->handler before the chain, restored once the handlers are done */
+    const char *old_handler;
     /** Set by the end of the request for the run in progress, if any (a
      * flag of the thread running it, which can't touch the request once
      * ended) */

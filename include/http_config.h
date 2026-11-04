@@ -1399,6 +1399,17 @@ AP_DECLARE_HOOK(void,child_init,(apr_pool_t *pchild, server_rec *s))
 AP_DECLARE_HOOK(int,handler,(request_rec *r))
 
 /**
+ * Run the handler functions from a position on, as ap_run_handler() does
+ * from the first (AP_IMPLEMENT_HOOK_RUN_FIRST_FROM)
+ * @param r The request_rec
+ * @param pos The index of the first function to run, set to the index of
+ * the one that didn't decline (or the number of functions if all did)
+ * @return The status of the function that didn't decline, else DECLINED
+ * @ingroup hooks
+ */
+AP_DECLARE(int) ap_run_handler_from(request_rec *r, int *pos);
+
+/**
  * Run the quick handler functions for each module. The quick_handler
  * is run before any other requests hooks are called (location_walk,
  * directory_walk, access checking, et. al.). This hook was added
