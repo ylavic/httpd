@@ -822,7 +822,8 @@
  *                         http_unsafe* fields of proxy_dir_conf and
  *                         proxy_worker_shared, proxy_conn_rec->backend_wait
  *                         to mod_proxy.h;
- *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
+ *                         ap_get_listen_buckets_ratio() to ap_listen.h;
+ *                         AP_IMPLEMENT_HOOK_RUN_FIRST_FROM to ap_hooks.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
  *                         ap_request_async_t (with its waits),
  *                         core_request_config->async and
