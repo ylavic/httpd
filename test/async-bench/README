@@ -105,6 +105,25 @@ checks/async-*-check.py PREFIX WORKDIR
   PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
   backend connection pool).
 
+checks/async-wait-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  The core's request waits (ap_request_wait()) without mod_proxy, through
+  mod_aptest's "aptest-wait" handler (built with the install's apxs into
+  WORKDIR unless MOD_APTEST_SO is given): many timers on few threads,
+  crawling uploads (1MB, 16KB every 20ms) and crawling readers of an echo
+  (small socket buffers), chunked uploads whose trailers trickle, the read
+  timeouts (Timeout, and RequestReadTimeout's body= winning over it), a TLS
+  upload cut in the middle of a record, clients aborting mid-upload, a
+  notifier and its context serving several waits (re-armed, a stale
+  notification dropped, a re-arm in flight refused, a wait without the
+  re-arm declined and logged), 200 descriptor contexts per request made in
+  subpools destroyed after their waits, and a graceful stop during waits;
+  "sync" is AsyncRequests Off (every wait
+  blocks: the same results, and the blocking timers: as many as the threads
+  holding them all, as many more as wait for a worker without being closed
+  by Timeout, then beyond: some closed, the accepting stopped, the server
+  serving after), "async" also checks that no worker is held (mod_status)
+  and the times.
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
