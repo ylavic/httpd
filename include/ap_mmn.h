@@ -811,15 +811,17 @@
  *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
  *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
  *                         ap_proxy_tunnel_run_ex(),
- *                         ap_proxy_wait_continuation_fn,
- *                         ap_proxy_wait(),
+ *                         ap_proxy_wait_continuation_fn (the core's
+ *                         ap_request_continuation_fn),
+ *                         AP_PROXY_WAIT_DRAINED, ap_proxy_wait(),
  *                         ap_proxy_scheme_handler_fn,
  *                         ap_proxy_acquire_connection_async(),
  *                         ap_proxy_request_can_suspend(),
  *                         ap_proxy_h1_head_opts_() (and its macro
  *                         ap_proxy_h1_head_opts()), the limit_response_* and
  *                         http_unsafe* fields of proxy_dir_conf and
- *                         proxy_worker_shared to mod_proxy.h;
+ *                         proxy_worker_shared, proxy_conn_rec->backend_wait
+ *                         to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
  *                         ap_request_async_t (with its waits),

@@ -231,9 +231,14 @@ def log_findings():
     with open(os.path.join(work, "error_log")) as f:
         log = f.read()
     return {
-        "waiting (async)": log.count("proxy: waiting for the backend (async)"),
-        "done waiting (async)": log.count("done waiting for the backend (async)"),
-        "can't wait": log.count("can't wait for the backend asynchronously"),
+        # mod_proxy's own lines, or the core's (ap_request_wait()) for the
+        # backend's socket
+        "waiting (async)": (log.count("proxy: waiting for the backend (async)")
+                            + log.count("] waiting for the descriptor (in) (async)")),
+        "done waiting (async)": (log.count("done waiting for the backend (async)")
+                                 + log.count("done waiting for the descriptor (in) (async)")),
+        "can't wait": (log.count("can't wait for the backend asynchronously")
+                       + log.count("can't wait for the descriptor asynchronously")),
         "crashes": log.count("exit signal"),
         "errors": sum(1 for l in log.splitlines() if ":error]" in l or ":crit]" in l
                       or ":emerg]" in l),

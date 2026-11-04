@@ -100,7 +100,8 @@ PROXY_DECLARE(int) ap_proxy_canon_url(request_rec *r);
 struct proxy_req_async {
     struct proxy_handler_ctx *handler;  /* proxy_handler() suspended, see
                                          * ap_proxy_handler_resume() */
-    struct proxy_wait_ctx *wait;        /* ap_proxy_wait() */
+    struct proxy_backend_wait *backend_wait; /* ap_proxy_wait()'s context
+                                              * for the backend */
     struct proxy_acquire_wait *acquire; /* waiting for a connection, see
                                          * ap_proxy_acquire_connection_async() */
     proxy_conn_rec *held;               /* acquired by the request and not

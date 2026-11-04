@@ -147,7 +147,11 @@ def log_findings():
     with open(os.path.join(work, "error_log")) as f:
         log = f.read()
     return {
-        "waiting (async)": log.count("proxy: waiting for the backend (async)"),
+        # mod_proxy's own line, or the core's (ap_request_wait()) for a
+        # backend waited for through its connection or its socket
+        "waiting (async)": (log.count("proxy: waiting for the backend (async)")
+                            + log.count("] waiting for the connection (in) (async)")
+                            + log.count("] waiting for the descriptor (in) (async)")),
         "pool waits (async)": log.count("proxy: waiting for a connection to"),
         "timeouts logged": (log.count("Script timed out before returning headers")
                             + log.count("timeout waiting for the response of")

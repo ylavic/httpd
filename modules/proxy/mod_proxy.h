@@ -280,6 +280,7 @@ typedef struct {
 } proxy_req_conf;
 
 struct proxy_address; /* opaque TTL'ed and refcount'ed address */
+struct proxy_backend_wait; /* opaque, a request's wait context (proxy_util) */
 
 typedef struct {
     conn_rec     *connection;
@@ -309,6 +310,9 @@ typedef struct {
     apr_pool_t   *uds_pool;     /* Subpool for reusing UDS paths */
     apr_pool_t   *fwd_pool;     /* Subpool for reusing ProxyRemote infos */
     struct proxy_address *address; /* Current remote address */
+    /* The wait context of the request that waited for the connection
+     * (ap_proxy_wait()), released with the connection */
+    struct proxy_backend_wait *backend_wait;
     /* The asynchronous state of the request holding the connection, from
      * ap_proxy_hold_connection() to the release */
     struct proxy_req_async *holder;
@@ -1152,10 +1156,10 @@ PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
 
 /**
  * Whether a request can be suspended to wait asynchronously
- * (ap_mpm_register_wait()): unless ProxyAsyncDelay is -1, when the MPM can
- * wait, but not for a subrequest nor an internally redirected request
- * (their caller goes on once the handler returns), nor for an HTTP/2
- * stream's connection.
+ * (ap_proxy_wait()): unless ProxyAsyncDelay is -1, when the core can suspend
+ * it (ap_request_can_suspend(): the MPM can wait, AsyncRequests is not Off,
+ * and it's neither a subrequest nor an internally redirected request, whose
+ * caller goes on once the handler returns, nor an HTTP/2 stream's).
  * @param r  the request
  * @return   non-zero if it can
  */
@@ -1694,32 +1698,37 @@ typedef enum {
 
 /**
  * The continuation of a wait of ap_proxy_wait(), called from a thread
- * processing the request.
- * @param r       the request
- * @param status  APR_SUCCESS if the socket is ready, APR_TIMEUP if the wait
- *                timed out, or another error if it was interrupted (e.g. the
- *                MPM is stopping)
- * @param baton   the baton given to ap_proxy_wait()
+ * processing the request: the core's (ap_request_continuation_fn), with
+ * status APR_SUCCESS if the socket is ready, APR_TIMEUP if the wait timed
+ * out, or another error if it was interrupted (e.g. the MPM is stopping),
+ * and the baton given to ap_proxy_wait().
  */
-typedef void ap_proxy_wait_continuation_fn(request_rec *r, apr_status_t status,
-                                           void *baton);
+typedef ap_request_continuation_fn ap_proxy_wait_continuation_fn;
+
+/**
+ * Flag for ap_proxy_wait(): the caller's last read or write in the direction
+ * of the wait failed with EAGAIN since its last wait in this direction
+ * (AP_REQUEST_WAIT_DRAINED), which spares the MPM a check of a socket kept
+ * registered across the waits.
+ */
+#define AP_PROXY_WAIT_DRAINED (1u << 0)
 
 /**
  * Wait for the client or a backend connection to be ready in a direction
  * (e.g. the backend readable for its response once the request is sent)
- * without holding the thread when possible: unless the connection's filters
- * are ready already (input pending in the client's, or the backend's for
- * the schemes reading through them, ap_check_input_pending(); no output
- * pending in the client's, ap_check_output_pending()), poll the socket
- * synchronously for up to ProxyAsyncDelay, then let the MPM wait
- * (ap_mpm_register_wait()).
+ * without holding the thread when possible, with the core's request waits
+ * (ap_request_wait()): unless the connection's filters are ready already
+ * (for the client, or the backend of the schemes reading and writing
+ * through filters: input pending, ap_check_input_pending(); no output
+ * pending, ap_check_output_pending()), poll the socket synchronously for up
+ * to ProxyAsyncDelay if not 0, then let the MPM wait.
  * @param r          the request
  * @param conn       the backend connection (for AP_PROXY_BACKEND_*)
  * @param direction  what to wait for: AP_PROXY_CLIENT_IN (the client's
  *                   socket readable), AP_PROXY_CLIENT_OUT (writable),
  *                   AP_PROXY_BACKEND_IN or AP_PROXY_BACKEND_OUT (the
  *                   backend's)
- * @param flags      AP_PROXY_WAIT_* flags (none yet), or 0
+ * @param flags      AP_PROXY_WAIT_DRAINED, or 0
  * @param timeout    how long to wait (e.g. the connection's socket timeout)
  * @param fn         called once the asynchronous wait is over
  * @param baton      for fn
@@ -1728,14 +1737,13 @@ typedef void ap_proxy_wait_continuation_fn(request_rec *r, apr_status_t status,
  *                   ap_proxy_handler_done()), OK if ready now (or with an
  *                   error the next I/O will report): the caller goes on, or
  *                   DECLINED if the request can't wait asynchronously
- *                   (ProxyAsyncDelay -1, the MPM can't wait, a subrequest,
- *                   an internally redirected request or an HTTP/2 stream, or
- *                   the MPM refusing the wait): the caller goes on blocking.
+ *                   (ap_proxy_request_can_suspend(), or the MPM refusing
+ *                   the wait): the caller goes on blocking.
  *                   fn is called only after SUSPENDED.
  * @remark The backend connection's pfd stays registered in the MPM between
  * the waits of a request: the first wait adds it, the next ones keep it
  * (AP_MPM_WAIT_KEEP_PFDS), and mod_proxy releases it with the connection.
- * The client connection's likewise, until it is closed.
+ * The client connection's likewise, until the request is done.
  * @remark Input that the filters keep after the caller's last read
  * returned EAGAIN (e.g. mod_ssl's part of a line) is pending for
  * ap_check_input_pending() but not readable: such a wait answers OK once,

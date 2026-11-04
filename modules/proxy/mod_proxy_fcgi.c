@@ -298,24 +298,22 @@ static apr_status_t get_data(proxy_conn_rec *conn,
     return rv;
 }
 
-static apr_status_t get_data_full(proxy_conn_rec *conn,
-                                  char *buffer,
-                                  apr_size_t buflen)
+/* get_data() without blocking: APR_EAGAIN if the backend has nothing to read
+ * (the socket's timeout is zero for the read).
+ */
+static apr_status_t get_data_nonblock(proxy_conn_rec *conn,
+                                      char *buffer,
+                                      apr_size_t *buflen)
 {
-    apr_size_t readlen;
-    apr_size_t cumulative_len = 0;
+    apr_interval_time_t timeout;
     apr_status_t rv;
 
-    do {
-        readlen = buflen - cumulative_len;
-        rv = get_data(conn, buffer + cumulative_len, &readlen);
-        if (rv != APR_SUCCESS) {
-            return rv;
-        }
-        cumulative_len += readlen;
-    } while (cumulative_len < buflen);
+    apr_socket_timeout_get(conn->sock, &timeout);
+    apr_socket_timeout_set(conn->sock, 0);
+    rv = get_data(conn, buffer, buflen);
+    apr_socket_timeout_set(conn->sock, timeout);
 
-    return APR_SUCCESS;
+    return rv;
 }
 
 static apr_status_t send_begin_request(proxy_conn_rec *conn,
@@ -614,11 +612,18 @@ typedef struct {
     int header_state;
     int script_error_status;
     const char *err;
+    /* The record being read (nonblocking, in steps) */
+    unsigned char rec_header[AP_FCGI_HEADER_LEN];
+    apr_size_t rec_header_len; /* read of the header so far */
+    apr_uint16_t rec_clen;     /* content left to read */
+    unsigned char rec_plen;    /* padding left to read */
+    unsigned char rec_type;
     unsigned int seen_end_of_headers :1,
                  ignore_body         :1,
                  bad_request         :1,
                  has_responded       :1,
-                 flushing            :1; /* the client's output to drain */
+                 flushing            :1, /* the client's output to drain */
+                 mayflush            :1; /* response data passed */
 } fcgi_req_t;
 
 static fcgi_req_t *fcgi_req_make(request_rec *r, proxy_conn_rec *conn,
@@ -782,22 +787,22 @@ static int dispatch(fcgi_req_t *req)
             }
         }
 
-        /* Once the request is sent, wait for the response (or more of it)
-         * without holding the thread if possible.
+        /* Once the request is sent, read the response (or more of it)
+         * without polling first: the reads don't block, the backend is
+         * waited for when it has nothing to read (below).
          */
-        if (req->pfd.reqevents == APR_POLLIN
-            && ap_proxy_wait(r, conn, AP_PROXY_BACKEND_IN, 0, timeout,
-                             dispatch_continuation, req) == SUSPENDED) {
-            return SUSPENDED;
+        if (req->pfd.reqevents == APR_POLLIN) {
+            req->pfd.rtnevents = APR_POLLIN;
         }
-
-        rv = apr_poll(&req->pfd, 1, &n, timeout);
-        if (rv != APR_SUCCESS) {
-            if (APR_STATUS_IS_EINTR(rv)) {
-                continue;
+        else {
+            rv = apr_poll(&req->pfd, 1, &n, timeout);
+            if (rv != APR_SUCCESS) {
+                if (APR_STATUS_IS_EINTR(rv)) {
+                    continue;
+                }
+                req->err = "polling";
+                break;
             }
-            req->err = "polling";
-            break;
         }
 
         if (req->pfd.rtnevents & APR_POLLOUT) {
@@ -901,63 +906,95 @@ static int dispatch(fcgi_req_t *req)
         }
 
         if (req->pfd.rtnevents & APR_POLLIN) {
-            apr_size_t readbuflen;
-            apr_uint16_t clen, rid;
+            apr_size_t readbuflen = 0;
+            apr_uint16_t rid;
             apr_bucket *b;
-            unsigned char plen;
-            unsigned char type, version;
-            int mayflush = 0;
+            unsigned char version;
+            int handle = 0;
 
-            /* First, we grab the header... */
-            rv = get_data_full(conn, (char *) farray, AP_FCGI_HEADER_LEN);
-            if (rv != APR_SUCCESS) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01067)
-                              "Failed to read FastCGI header");
-                break;
+            /* A record is read in steps, its state kept in req between
+             * them: the header, the content (by iobuf_size at most), then
+             * the padding, without blocking. A read finding nothing
+             * (EAGAIN) waits for the backend (below), then goes on.
+             */
+            if (req->rec_header_len < AP_FCGI_HEADER_LEN) {
+                len = AP_FCGI_HEADER_LEN - req->rec_header_len;
+                rv = get_data_nonblock(conn,
+                                       (char *)req->rec_header
+                                       + req->rec_header_len,
+                                       &len);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
+                if (rv != APR_SUCCESS) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01067)
+                                  "Failed to read FastCGI header");
+                    break;
+                }
+                req->rec_header_len += len;
+                if (req->rec_header_len < AP_FCGI_HEADER_LEN) {
+                    continue;
+                }
+
+                ap_log_rdata(APLOG_MARK, APLOG_TRACE8, r, "FastCGI header",
+                             req->rec_header, AP_FCGI_HEADER_LEN, 0);
+
+                ap_fcgi_header_fields_from_array(&version, &req->rec_type,
+                                                 &rid, &req->rec_clen,
+                                                 &req->rec_plen,
+                                                 req->rec_header);
+
+                if (version != AP_FCGI_VERSION_1) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01068)
+                                  "Got bogus version %d", (int)version);
+                    rv = APR_EINVAL;
+                    break;
+                }
+
+                if (rid != request_id) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01069)
+                                  "Got bogus rid %d, expected %d",
+                                  rid, request_id);
+                    rv = APR_EINVAL;
+                    break;
+                }
+
+                if (req->rec_type != AP_FCGI_STDOUT
+                    && req->rec_type != AP_FCGI_STDERR
+                    && req->rec_type != AP_FCGI_END_REQUEST) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01072)
+                                  "Got bogus record %d", (int)req->rec_type);
+                }
+
+                /* A record without content is handled once (the end of
+                 * the response for STDOUT).
+                 */
+                handle = (req->rec_clen == 0);
             }
 
-            ap_log_rdata(APLOG_MARK, APLOG_TRACE8, r, "FastCGI header",
-                         farray, AP_FCGI_HEADER_LEN, 0);
-
-            ap_fcgi_header_fields_from_array(&version, &type, &rid,
-                                             &clen, &plen, farray);
-
-            if (version != AP_FCGI_VERSION_1) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01068)
-                              "Got bogus version %d", (int)version);
-                rv = APR_EINVAL;
-                break;
-            }
-
-            if (rid != request_id) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01069)
-                              "Got bogus rid %d, expected %d",
-                              rid, request_id);
-                rv = APR_EINVAL;
-                break;
-            }
-
-recv_again:
-            if (clen > iobuf_size) {
-                readbuflen = iobuf_size;
-            } else {
-                readbuflen = clen;
-            }
-
-            /* Now get the actual data.  Yes it sucks to do this in a second
-             * recv call, this will eventually change when we move to real
-             * nonblocking recv calls. */
-            if (readbuflen != 0) {
-                rv = get_data(conn, iobuf, &readbuflen);
+            if (req->rec_clen) {
+                readbuflen = req->rec_clen;
+                if (readbuflen > iobuf_size) {
+                    readbuflen = iobuf_size;
+                }
+                rv = get_data_nonblock(conn, iobuf, &readbuflen);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
                 if (rv != APR_SUCCESS) {
                     req->err = "reading response body";
                     break;
                 }
+                req->rec_clen -= (apr_uint16_t)readbuflen;
+                handle = 1;
             }
 
-            switch (type) {
+            if (!handle) {
+                goto read_padding; /* the content was handled already */
+            }
+            switch (req->rec_type) {
             case AP_FCGI_STDOUT:
-                if (clen != 0) {
+                if (readbuflen != 0) {
                     b = apr_bucket_transient_create(iobuf,
                                                     readbuflen,
                                                     c->bucket_alloc);
@@ -1043,7 +1080,7 @@ recv_again:
                                     req->err = "passing brigade to output filters";
                                     break;
                                 }
-                                mayflush = 1;
+                                req->mayflush = 1;
                             }
                             apr_brigade_cleanup(ob);
 
@@ -1070,16 +1107,9 @@ recv_again:
                                 req->err = "passing brigade to output filters";
                                 break;
                             }
-                            mayflush = 1;
+                            req->mayflush = 1;
                         }
                         apr_brigade_cleanup(ob);
-                    }
-
-                    /* If we didn't read all the data, go back and get the
-                     * rest of it. */
-                    if (clen > readbuflen) {
-                        clen -= readbuflen;
-                        goto recv_again;
                     }
                 } else {
                     /* XXX what if we haven't seen end of the headers yet? */
@@ -1102,44 +1132,53 @@ recv_again:
 
             case AP_FCGI_STDERR:
                 /* TODO: Should probably clean up this logging a bit... */
-                if (clen) {
+                if (readbuflen) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01071)
                                   "Got error '%.*s'", (int)readbuflen, iobuf);
                 }
-
-                if (clen > readbuflen) {
-                    clen -= readbuflen;
-                    goto recv_again;
-                }
                 break;
 
-            case AP_FCGI_END_REQUEST:
-                done = 1;
-                break;
-
-            default:
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01072)
-                              "Got bogus record %d", type);
+            default: /* END_REQUEST, a bogus record */
                 break;
             }
             /* Leave on above switch's inner error. */
             if (rv != APR_SUCCESS) {
                 break;
             }
+            if (req->rec_clen) {
+                continue; /* more content to read */
+            }
 
-            if (plen) {
-                rv = get_data_full(conn, iobuf, plen);
+read_padding:
+            if (req->rec_plen) {
+                len = req->rec_plen;
+                rv = get_data_nonblock(conn, iobuf, &len);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
                 if (rv != APR_SUCCESS) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02537)
                                   "Error occurred reading padding");
                     break;
                 }
+                req->rec_plen -= (unsigned char)len;
+                if (req->rec_plen) {
+                    continue;
+                }
             }
 
-            if (mayflush && ((conn->worker->s->flush_packets == flush_on) ||
-                             ((conn->worker->s->flush_packets == flush_auto) && 
-                              (apr_poll(flushpoll, 1, &flushpoll_fd,
-                               conn->worker->s->flush_wait) == APR_TIMEUP)))) {
+            /* The record is read, the next one follows */
+            req->rec_header_len = 0;
+            if (req->rec_type == AP_FCGI_END_REQUEST) {
+                done = 1;
+            }
+
+            if (req->mayflush
+                && (conn->worker->s->flush_packets == flush_on
+                    || (conn->worker->s->flush_packets == flush_auto
+                        && apr_poll(flushpoll, 1, &flushpoll_fd,
+                                    conn->worker->s->flush_wait)
+                           == APR_TIMEUP))) {
                 /* Don't block on the client (WC): the output left pending
                  * is waited for before reading on (above).
                  */
@@ -1151,7 +1190,35 @@ recv_again:
                     break;
                 }
                 req->flushing = 1;
-                mayflush = 0;
+            }
+            req->mayflush = 0;
+        }
+        continue;
+
+read_again:
+        /* The backend has nothing to read for now. While the request body
+         * is sent, the next poll waits for either side. Once it's sent, wait
+         * for the backend without holding the thread if possible (drained,
+         * the read failed with EAGAIN), else poll it.
+         */
+        rv = APR_SUCCESS;
+        if (req->pfd.reqevents == APR_POLLIN) {
+            int rc = ap_proxy_wait(r, conn, AP_PROXY_BACKEND_IN,
+                                   AP_PROXY_WAIT_DRAINED, timeout,
+                                   dispatch_continuation, req);
+            if (rc == SUSPENDED) {
+                return SUSPENDED;
+            }
+            if (rc != OK) {
+                rv = apr_poll(&req->pfd, 1, &n, timeout);
+                if (rv != APR_SUCCESS) {
+                    if (APR_STATUS_IS_EINTR(rv)) {
+                        rv = APR_SUCCESS;
+                        continue;
+                    }
+                    req->err = "reading response body";
+                    break;
+                }
             }
         }
     }
@@ -1185,7 +1252,7 @@ static void dispatch_continuation(request_rec *r, apr_status_t status, void *bat
         rc = dispatch_end(req, APR_ECONNABORTED);
     }
     else {
-        req->err = "polling";
+        req->err = "reading response body";
         rc = dispatch_end(req, status);
     }
 

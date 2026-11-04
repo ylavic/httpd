@@ -2362,9 +2362,11 @@ MPM for asynchronous processing</description>
     event loop, freeing the worker thread to serve other requests.</p>
 
     <p>With <code>0</code>, the default, the connection is handed to the
-    event loop as soon as it would wait. Setting this directive to
-    <code>-1</code> disables asynchronous handling entirely (all proxy
-    connections remain synchronous).</p>
+    event loop as soon as it would wait, without polling first. Setting
+    this directive to <code>-1</code> disables asynchronous handling
+    entirely (all proxy connections remain synchronous), as
+    <directive module="core">AsyncRequests</directive> <code>Off</code>
+    does for every module processing the requests it applies to.</p>
 
     <p>Tunnels (protocols upgraded with a <code>101 Switching
     Protocols</code> response, e.g. WebSocket, see the
@@ -2391,6 +2393,7 @@ MPM for asynchronous processing</description>
 
 <seealso><directive module="mod_proxy">ProxyAsyncIdleTimeout</directive></seealso>
 <seealso><directive module="mod_proxy">ProxyTimeout</directive></seealso>
+<seealso><directive module="core">AsyncRequests</directive></seealso>
 </directivesynopsis>
 
 <directivesynopsis>
