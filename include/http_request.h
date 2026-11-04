@@ -48,6 +48,7 @@
 #define APACHE_HTTP_REQUEST_H
 
 #include "apr_optional.h"
+#include "apr_poll.h"
 #include "util_filter.h"
 
 #ifdef __cplusplus
@@ -375,8 +376,9 @@ typedef enum {
  * The timeout of a wait context (ap_request_waitctx_t) that core resolves
  * at each wait: for the client connection, the time left to read
  * (ap_get_connection_timeout(): Timeout, or less with mod_reqtimeout) when
- * waiting for input, the server's Timeout when waiting for output only.
- * Not a timeout given to the MPM (where any negative value means none).
+ * waiting for input, the server's Timeout when waiting for output only; for
+ * other connections and descriptors, the server's Timeout. Not a timeout
+ * given to the MPM (where any negative value means none).
  */
 #define AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT ((apr_interval_time_t)-2)
 
@@ -448,6 +450,54 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_client_(request_rec *r,
     ap_request_waitctx_client_(r, APLOG_MODULE_INDEX)
 
 /**
+ * A context for the request to wait for another connection than the
+ * client's (e.g. a backend's), whose filters are checked like the client's
+ * (input pending, no output pending) before waiting for its socket.
+ * @param r The request
+ * @param p The pool to allocate the context from (see ap_request_waitctx_t)
+ * @param c The connection
+ * @param module_index The module whose log level the waits' log lines
+ *        follow
+ * @return The context, in p
+ * @remark The connection's socket is kept registered in the MPM from the
+ *         second wait in a direction (AP_MPM_WAIT_KEEP_PFDS): release the
+ *         context (ap_request_waitctx_release()) before closing it or
+ *         letting another request use it.
+ */
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_conn_(request_rec *r,
+                                                            apr_pool_t *p,
+                                                            conn_rec *c,
+                                                            int module_index);
+
+/** ap_request_waitctx_conn_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_waitctx_conn(r, p, c) \
+    ap_request_waitctx_conn_(r, p, c, APLOG_MODULE_INDEX)
+
+/**
+ * A context for the request to wait for a descriptor (socket or pipe) read
+ * or written directly, not through a connection's filters: nothing is
+ * checked before waiting for it.
+ * @param r The request
+ * @param p The pool to allocate the context from (see ap_request_waitctx_t)
+ * @param pfd The descriptor (desc_type and desc only, copied)
+ * @param module_index The module whose log level the waits' log lines
+ *        follow
+ * @return The context, in p
+ * @remark The descriptor is kept registered in the MPM from the second
+ *         wait in a direction (AP_MPM_WAIT_KEEP_PFDS): release the context
+ *         (ap_request_waitctx_release()) before closing it or letting
+ *         another request use it.
+ */
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_pfd_(request_rec *r,
+                                                           apr_pool_t *p,
+                                                           const apr_pollfd_t *pfd,
+                                                           int module_index);
+
+/** ap_request_waitctx_pfd_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_waitctx_pfd(r, p, pfd) \
+    ap_request_waitctx_pfd_(r, p, pfd, APLOG_MODULE_INDEX)
+
+/**
  * A context for the request to wait for a delay (its timeout, to set),
  * whatever the direction given to ap_request_wait(): a timer completes its
  * wait with APR_SUCCESS.
@@ -479,12 +529,12 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
 
 /**
  * Wait for a target without holding the thread when possible. Unless it's
- * ready already (input pending in the client connection's filters,
+ * ready already (for a connection: input pending in its filters,
  * ap_check_input_pending(); no output pending, ap_check_output_pending()),
  * or within the context's delay (polled), the MPM waits for it.
  * @param ctx The context of the target
- * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection, ignored by
- *        a timer
+ * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection or a
+ *        descriptor, ignored by a timer
  * @param flags AP_REQUEST_WAIT_DRAINED or 0
  * @param fn Called once the asynchronous wait completes
  * @param baton For fn

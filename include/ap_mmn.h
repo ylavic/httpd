@@ -790,6 +790,8 @@
  *                         AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT,
  *                         ap_request_waitctx_t, ap_request_continuation_fn,
  *                         ap_request_waitctx_client(),
+ *                         ap_request_waitctx_conn(),
+ *                         ap_request_waitctx_pfd(),
  *                         ap_request_waitctx_timer(),
  *                         ap_request_waitctx_release(), ap_request_wait()
  *                         and ap_request_waitctx_ready() to http_request.h;

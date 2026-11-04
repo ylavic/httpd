@@ -463,12 +463,14 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
 /* The kinds of targets */
 typedef enum {
     REQUEST_WAITCTX_CLIENT,
+    REQUEST_WAITCTX_CONN,
+    REQUEST_WAITCTX_PFD,
     REQUEST_WAITCTX_TIMER
 } request_waitctx_kind_e;
 
 /* Their names in the logs */
 static const char *const request_waitctx_kind_names[] = {
-    "client", "timer"
+    "client", "connection", "descriptor", "timer"
 };
 
 /* The state of a context's waits in a direction */
@@ -634,6 +636,33 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_client_(request_rec *r,
     return &ctx->pub;
 }
 
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_conn_(request_rec *r,
+                                                            apr_pool_t *p,
+                                                            conn_rec *c,
+                                                            int module_index)
+{
+    request_waitctx_t *ctx;
+
+    ctx = request_waitctx_make(r, p, REQUEST_WAITCTX_CONN, module_index);
+    ctx->c = c;
+    ctx->pfd.desc_type = APR_POLL_SOCKET;
+    ctx->pfd.desc.s = ap_get_conn_socket(c);
+    return &ctx->pub;
+}
+
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_pfd_(request_rec *r,
+                                                           apr_pool_t *p,
+                                                           const apr_pollfd_t *pfd,
+                                                           int module_index)
+{
+    request_waitctx_t *ctx;
+
+    ctx = request_waitctx_make(r, p, REQUEST_WAITCTX_PFD, module_index);
+    ctx->pfd.desc_type = pfd->desc_type;
+    ctx->pfd.desc = pfd->desc;
+    return &ctx->pub;
+}
+
 AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_timer_(request_rec *r,
                                                              apr_pool_t *p,
                                                              int module_index)
@@ -647,6 +676,13 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_timer_(request_rec *r,
 
 /* Whether the context waits for a descriptor */
 #define REQUEST_WAITCTX_HAS_PFD(ctx) ((ctx)->pfd.desc_type != APR_NO_DESC)
+
+/* Whether the context's descriptor is missing (e.g. a connection without a
+ * socket)
+ */
+#define REQUEST_WAITCTX_NO_DESC(ctx) \
+    ((ctx)->pfd.desc_type == APR_POLL_SOCKET ? !(ctx)->pfd.desc.s \
+                                             : !(ctx)->pfd.desc.f)
 
 /* Release the context's pfd kept by the MPM, if any */
 static void request_waitctx_release_pfd(request_waitctx_t *ctx)
@@ -882,9 +918,15 @@ static int request_wait(request_waitctx_t **ctxs,
             return DECLINED;
         }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
-            AP_DEBUG_ASSERT(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT));
-            if (!(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT))
-                || !ctx->pfd.desc.s) {
+            if (!(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT))) {
+                ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                              APLOG_ERR, 0, ctx->pub.r, APLOGNO()
+                              "can't wait for the %s: no direction given",
+                              request_waitctx_kind_names[ctx->kind]);
+                AP_DEBUG_ASSERT(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT));
+                return DECLINED;
+            }
+            if (REQUEST_WAITCTX_NO_DESC(ctx)) {
                 return DECLINED;
             }
         }
