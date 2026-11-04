@@ -7110,8 +7110,9 @@ PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
  */
 typedef struct proxy_acquire_wait {
     ap_proxy_conn_pool_waiter *waiter;
-    ap_mpm_notifier_t *notifier;  /* The MPM's notifier of the current wait */
-    apr_pool_t *wait_pool;
+    ap_mpm_notifier_t *notifier;  /* The MPM's notifier, re-armed per wait */
+    ap_request_waitctx_t *ctx;   /* its context (the core's wait), if any */
+    int waits;                    /* the waits so far */
     ap_proxy_scheme_handler_fn *handler;
     proxy_worker *worker;
     proxy_server_conf *conf;
@@ -7130,26 +7131,42 @@ static void proxy_acquire_released(void *baton)
     ap_mpm_notify(aw->notifier);
 }
 
+/* r->pool's cleanup of a request that waited for a pooled connection: the
+ * core drops a request's waits without calling their continuations (e.g. a
+ * subrequest's at its main request's end, or every wait when r->pool goes),
+ * so take the waiter out of the pool's queue, or give back the connection it
+ * was notified for, before the waiter and its notifier go with r->pool. The
+ * pool's lock makes sure no notification of the waiter is still running once
+ * this returns. Canceling is a no-op for a waiter neither queued nor notified
+ * (e.g. canceled already by the continuation).
+ */
+static apr_status_t proxy_acquire_cleanup(void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+
+    if (aw->worker && aw->worker->cp) {
+        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
+    }
+    return APR_SUCCESS;
+}
+
 /* The continuation of ap_proxy_acquire_connection_async(), called when a
  * connection was released to the pool (or on timeout or error): run the
  * scheme handler again, which acquires from the start.
  */
-static void proxy_acquire_continuation(conn_rec *c, request_rec *r,
-                                       ap_mpm_wait_result_e why,
-                                       const apr_array_header_t *pfds,
+static void proxy_acquire_continuation(request_rec *r, apr_status_t rv,
                                        void *baton)
 {
     proxy_acquire_wait_t *aw = baton;
     int status;
 
-    if (why != AP_MPM_WAIT_NOTIFIED) {
+    if (rv != APR_SUCCESS) {
         ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "proxy: %s waiting for a connection to (%s:%d) "
-                      "(async, %i)",
-                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
-                      aw->worker->s->hostname_ex, (int)aw->worker->s->port,
-                      (int)why);
+                      "(async)",
+                      APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "error",
+                      aw->worker->s->hostname_ex, (int)aw->worker->s->port);
         ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
         return;
     }
@@ -7246,16 +7263,41 @@ static int proxy_acquire_async(const char *proxy_function,
     aw->proxyname = proxyname;
     aw->proxyport = proxyport;
 
-    /* A new notifier for the wait, created before the waiter is queued: a
-     * connection released before the wait is armed completes it once armed.
+    /* The request's notifier, created once (in r->pool, as its context) and
+     * re-armed for each next wait, before the waiter is queued: a connection
+     * released before the wait is armed completes it once armed, while a
+     * notification left by a previous wait is dropped by the re-arm. Nothing
+     * is allocated per wait.
      */
-    if (aw->wait_pool) {
-        apr_pool_clear(aw->wait_pool);
+    if (!aw->notifier) {
+        rv = ap_mpm_notifier_create(&aw->notifier, r->connection, r->pool);
+        if (rv != APR_SUCCESS) {
+            aw->notifier = NULL;
+        }
+        else {
+            /* Registered after the notifier's creation, so that it runs
+             * before the notifier's own cleanups (if any)
+             */
+            apr_pool_cleanup_register(r->pool, aw, proxy_acquire_cleanup,
+                                      apr_pool_cleanup_null);
+        }
     }
     else {
-        apr_pool_create(&aw->wait_pool, r->pool);
+        rv = ap_mpm_notifier_rearm(aw->notifier);
+        if (rv == APR_EBUSY) {
+            /* Its previous wait is still in flight: a bug, don't wait twice */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "proxy: can't re-arm the notifier waiting for a "
+                          "connection to (%s:%d), its wait is in flight: "
+                          "blocking", worker->s->hostname_ex,
+                          (int)worker->s->port);
+        }
+        else if (rv == APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                          "proxy: notifier re-armed after %d wait(s)",
+                          aw->waits);
+        }
     }
-    rv = ap_mpm_notifier_create(&aw->notifier, r->connection, aw->wait_pool);
     if (rv != APR_SUCCESS) {
         return ap_proxy_acquire_connection(proxy_function, conn, worker,
                                            r->server);
@@ -7267,18 +7309,27 @@ static int proxy_acquire_async(const char *proxy_function,
         return status;
     }
 
-    rv = ap_mpm_register_wait(r->connection, aw->wait_pool, NULL,
-                              worker->s->acquire_set ? worker->s->acquire
-                                                       : r->server->timeout,
-                              aw->notifier, 0, proxy_acquire_continuation, aw);
-    if (rv != APR_SUCCESS) {
+    /* The context waits again once its notifier is re-armed */
+    if (!aw->ctx) {
+        aw->ctx = ap_request_waitctx_notifier(r, r->pool, aw->notifier);
+    }
+    aw->ctx->timeout = (worker->s->acquire_set) ? worker->s->acquire
+                                                : r->server->timeout;
+    status = ap_request_wait(aw->ctx, AP_WAIT_IN, 0,
+                             proxy_acquire_continuation, aw);
+    if (status != SUSPENDED) {
+        /* Can't wait asynchronously (a notifier is never ready before the
+         * wait): block
+         */
         ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
         return ap_proxy_acquire_connection(proxy_function, conn, worker,
                                            r->server);
     }
+    aw->waits++;
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                  "proxy: waiting for a connection to (%s:%d) (async)",
-                  worker->s->hostname_ex, (int)worker->s->port);
+                  "proxy: waiting for a connection to (%s:%d) (async, "
+                  "wait %d)", worker->s->hostname_ex, (int)worker->s->port,
+                  aw->waits);
     return SUSPENDED;
 }
 
