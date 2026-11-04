@@ -139,6 +139,25 @@ checks/async-resume-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   suspensions; "sync" is AsyncRequests Off (the handlers block: the same
   responses), "async" also checks that no worker is held (mod_status).
 
+checks/async-reqbody-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  The core's request body reader (ap_request_read_body(),
+  ap_request_wait_body(), ap_request_body_run(), ap_request_discard_body())
+  through mod_aptest's "aptest-body" handler (AptestBody pull, sink,
+  discard; mod_aptest built as for async-wait-check) and AptestSuspend's
+  "read": Content-Length and chunked bodies, small and 8MB (digests),
+  crawling uploads on few threads, trickling trailers, Expect: 100-continue,
+  LimitRequestBody (413 by Content-Length and mid-body), the reader's 408
+  (Timeout) and mod_reqtimeout's (RequestReadTimeout body=), a malformed
+  chunk, a TLS upload cut in a record, clients aborting mid-upload, the
+  discard (a small leftover keeping the connection, over the limit by
+  Content-Length or chunked, a 100 Continue never sent), a body read then
+  replayed to mod_proxy_http (this server's /pull, on port 18452),
+  mod_proxy_scgi and mod_proxy_uwsgi (schemebackend on ports 18453-18454),
+  blocking reads from an output filter (AP_REQUEST_BODY_BLOCK), the error
+  log, and graceful and immediate stops during uploads; "sync" is
+  AsyncRequests Off (the reads block: the same responses), "async" also
+  checks that no worker is held (mod_status). Ports 18449-18454.
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
