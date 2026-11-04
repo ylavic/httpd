@@ -388,6 +388,25 @@ AP_DECLARE(apr_socket_t *) ap_get_conn_socket(conn_rec *c);
 #define AP_CORE_MODULE_INDEX  (AP_DEBUG_ASSERT(core_module.module_index == 0), 0)
 #endif
 
+/** The phase of a top-level request, for ap_request_can_suspend() */
+typedef enum {
+    AP_REQUEST_PHASE_NONE,    /**< in no phase that can suspend */
+    AP_REQUEST_PHASE_HANDLER, /**< running the handlers (ap_invoke_handler()) */
+    AP_REQUEST_PHASE_DONE     /**< finished (ap_request_finish_suspended()) */
+} ap_request_phase_e;
+
+/**
+ * @brief The asynchronous state of a top-level request, allocated by
+ * ap_process_async_request(): core's own, may change; modules use the
+ * ap_request_*() functions (http_request.h).
+ */
+typedef struct {
+    /** The request */
+    request_rec *r;
+    /** Its phase */
+    ap_request_phase_e phase;
+} ap_request_async_t;
+
 /**
  * @brief  Per-request configuration
 */
@@ -441,6 +460,12 @@ typedef struct {
     /** Should addition of charset= be suppressed for this request?
      */
     int suppress_charset;
+
+    /** The asynchronous state of a top-level request processed by
+     * ap_process_async_request(), NULL otherwise (subrequests, internally
+     * redirected requests)
+     */
+    ap_request_async_t *async;
 } core_request_config;
 
 /* Standard entries that are guaranteed to be accessible via

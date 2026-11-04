@@ -393,6 +393,8 @@ AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
     int result;
     const char *old_handler = r->handler;
     const char *ignore;
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = (req_cfg) ? req_cfg->async : NULL;
 
     /*
      * The new insert_filter stage makes the most sense here.  We only use
@@ -440,7 +442,18 @@ AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
         r->handler = handler;
     }
 
+    /* The handlers of a top-level request can suspend it, until they return
+     * anything but SUSPENDED (ap_request_can_suspend())
+     */
+    if (async) {
+        async->phase = AP_REQUEST_PHASE_HANDLER;
+    }
+
     result = ap_run_handler(r);
+
+    if (async && result != SUSPENDED) {
+        async->phase = AP_REQUEST_PHASE_NONE;
+    }
 
     r->handler = old_handler;
 

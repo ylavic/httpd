@@ -344,6 +344,18 @@ void ap_process_async_request(request_rec *r);
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
 
 /**
+ * Whether the request can be suspended now, i.e. a module can wait
+ * asynchronously and return SUSPENDED from the current hook: the MPM can
+ * wait (AP_MPMQ_CAN_REGISTER_WAIT), the request is a top-level one processed
+ * by ap_process_async_request(), neither a subrequest nor (for now)
+ * internally redirected or on a secondary connection (HTTP/2 stream), and
+ * it is in a phase that can suspend (the handlers for now).
+ * @param r The request
+ * @return non-zero if it can
+ */
+AP_DECLARE(int) ap_request_can_suspend(request_rec *r);
+
+/**
  * Kill the current request
  * @param type Why the request is dying
  * @param r The current request

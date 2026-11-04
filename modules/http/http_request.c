@@ -403,10 +403,56 @@ AP_DECLARE(void) ap_process_request_after_handler(request_rec *r)
     }
 }
 
+/* Whether the MPM can wait for requests (AP_MPMQ_CAN_REGISTER_WAIT), set by
+ * ap_request_async_post_config()
+ */
+static int request_can_wait = 0;
+
+AP_CORE_DECLARE(void) ap_request_async_post_config(apr_pool_t *p,
+                                                   server_rec *s)
+{
+    if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &request_can_wait)
+            != APR_SUCCESS) {
+        request_can_wait = 0;
+    }
+}
+
+/* The asynchronous state of r, if it's the top-level request it was made for
+ * (ap_process_async_request()), else NULL
+ */
+static ap_request_async_t *request_async_get(request_rec *r)
+{
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = (req_cfg) ? req_cfg->async : NULL;
+
+    return (async && async->r == r) ? async : NULL;
+}
+
+AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
+{
+    ap_request_async_t *async;
+
+    if (!request_can_wait || r->main || r->prev || r->connection->master) {
+        return 0;
+    }
+    async = request_async_get(r);
+    return (async && async->phase == AP_REQUEST_PHASE_HANDLER);
+}
+
 void ap_process_async_request(request_rec *r)
 {
     conn_rec *c = r->connection;
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
     int access_status;
+
+    /* The state of the request's asynchronous processing, in no phase that
+     * can suspend until the handlers run (ap_invoke_handler())
+     */
+    if (req_cfg && !r->main && !r->prev) {
+        req_cfg->async = apr_pcalloc(r->pool, sizeof(*req_cfg->async));
+        req_cfg->async->r = r;
+        req_cfg->async->phase = AP_REQUEST_PHASE_NONE;
+    }
 
     /* Give quick handlers a shot at serving the request on the fast
      * path, bypassing all of the other Apache hooks.
@@ -480,6 +526,11 @@ void ap_process_async_request(request_rec *r)
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
 {
     conn_rec *c = r->connection;
+    ap_request_async_t *async = request_async_get(r);
+
+    if (async) {
+        async->phase = AP_REQUEST_PHASE_DONE;
+    }
 
     /* This run on a worker is timed as one, stopped by
      * ap_process_request_after_handler() (its STOP_PREQUEST)
