@@ -172,7 +172,10 @@ for mode in os.environ.get("MODES", "sync async").split():
             report.append("%s: 10 concurrent 1s responses, 2 workers: %ss, all ok: %s %s"
                           % ((m,) + concurrent(10, "/%s/slow?d=1000" % s, ok512)))
             r, t = timed(request, "GET", "/%s-to/t?d=3000" % s)
-            report.append("%s: timeout=1 vs a 3s backend: %s in %ss" % (m, r[0], t))
+            # uwsgi: no status line within the timeout is a 504
+            report.append("%s: timeout=1 vs a 3s backend: %s in %ss%s"
+                          % (m, r[0], t, (": OK" if r[0] == 504 else ": FAIL")
+                             if s == "uwsgi" else ""))
             r, t = timed(request, "GET", "/%s/big?s=%d" % (s, 1 << 20))
             report.append("%s: 1MB response: %s, %d bytes, %ss" % (m, r[0], len(r[1]), t))
             r, t = timed(request, "POST", "/%s/post?d=300" % s, b"y" * 100000)

@@ -302,15 +302,8 @@ static request_rec *make_fake_req(conn_rec *c, request_rec *r)
 static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
                           proxy_server_conf * conf)
 {
-
-    char buffer[HUGE_STRING_LEN];
     const char *buf;
-    char *value;
-    char keepchar;
-    int len;
     int backend_broke = 0;
-    int status_start;
-    int status_end;
     int finish = 0;
     conn_rec *c = r->connection;
     apr_off_t readbytes;
@@ -320,6 +313,10 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     apr_bucket_brigade *pass_bb;
     apr_bucket_brigade *bb;
     proxy_dir_conf *dconf;
+    ap_h1_head_opts_t opts;
+    ap_h1_head_parser_t *parser;
+    ap_h1_head_t *head;
+    int rc;
 
     request_rec *rp = make_fake_req(backend->connection, r);
     rp->proxyreq = PROXYREQ_RESPONSE;
@@ -327,83 +324,42 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     bb = apr_brigade_create(r->pool, c->bucket_alloc);
     pass_bb = apr_brigade_create(r->pool, c->bucket_alloc);
 
-    len = ap_getline(buffer, sizeof(buffer), rp, 1);
-    if (len <= 0) {
-        /* invalid or empty */
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-    backend->worker->s->read += len;
-    if ((apr_size_t)len >= sizeof(buffer)) {
-        /* too long */
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* Position of http status code */
-    if (apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
-        status_start = 9;
-    }
-    else if (apr_date_checkmask(buffer, "HTTP/# ###*")) {
-        status_start = 7;
-    }
-    else {
-        /* not HTTP */
-        return HTTP_BAD_GATEWAY;
-    }
-    status_end = status_start + 3;
-
-    keepchar = buffer[status_end];
-    buffer[status_end] = '\0';
-    r->status = atoi(&buffer[status_start]);
-
-    if (keepchar != '\0') {
-        buffer[status_end] = keepchar;
-    }
-    else {
-        /* 2616 requires the space in Status-Line; the origin
-         * server may have sent one but ap_rgetline will
-         * have stripped it. */
-        buffer[status_end] = ' ';
-        buffer[status_end + 1] = '\0';
-    }
-    r->status_line = apr_pstrdup(r->pool, &buffer[status_start]);
-
-    /* parse headers */
-    while ((len = ap_getline(buffer, sizeof(buffer), rp, 1)) > 0) {
-        if ((apr_size_t)len >= sizeof(buffer)) {
-            /* too long */
-            len = -1;
-            break;
+    /* Read the response head with the rules and limits of
+     * ap_proxy_h1_head_opts(), the status line being of any HTTP version
+     * ("HTTP/x.y" or "HTTP/x": the protocol of the request may be echoed)
+     */
+    ap_proxy_h1_head_opts(&opts, r, backend->worker, AP_H1_HEAD_RESPONSE);
+    opts.flags |= AP_H1_HEAD_OPT_ANY_VERSION;
+    parser = ap_h1_head_parser_create(r->pool, r, &opts);
+    rc = ap_h1_head_parse(parser, rp->input_filters, APR_BLOCK_READ, &head);
+    if (rc != OK) {
+        apr_status_t prv = ap_h1_head_parser_status(parser);
+        if (!head && APR_STATUS_IS_TIMEUP(prv)) {
+            /* No status line within the timeout: a gateway timeout, as
+             * mod_proxy_http's
+             */
+            return HTTP_GATEWAY_TIME_OUT;
         }
-        value = strchr(buffer, ':');
-        if (!value) {
-            /* invalid header */
-            len = -1;
-            break;
+        if (!head && !APR_STATUS_IS_EINVAL(prv)) {
+            /* No status line: the backend closed or failed before its end,
+             * or it is too long
+             */
+            return HTTP_INTERNAL_SERVER_ERROR;
         }
-        *value++ = '\0';
-        if (*ap_scan_http_token(buffer)) {
-            /* invalid name */
-            len = -1;
-            break;
-        }
-        while (apr_isspace(*value))
-            ++value;
-        ap_cstr_stripws(value);
-        if (*ap_scan_http_field_content(value)) {
-            /* invalid value */
-            len = -1;
-            break;
-        }
-        apr_table_add(r->headers_out, buffer, value);
-    }
-    if (len < 0) {
-        /* Reset headers, but not to NULL because things below the chain expect
-         * this to be non NULL e.g. the ap_content_length_filter.
+        /* A malformed status line or headers, or the headers not read in
+         * full (the parsing logged why)
          */
-        r->headers_out = apr_table_make(r->pool, 1);
         return HTTP_BAD_GATEWAY;
     }
-    
+    backend->worker->s->read += head->length;
+
+    r->status = head->u.rsp.status;
+    /* 2616 requires the space in Status-Line, even without a reason */
+    r->status_line = apr_psprintf(r->pool, "%03d %s", r->status,
+                                  head->u.rsp.reason);
+    r->headers_out = apr_table_overlay(r->pool, r->headers_out,
+                                       head->headers);
+
     /* Per PEP 3333, WSGI applications must not generate hop-by-hop
     * headers. Remove any such headers received from the backend.
     */
@@ -565,7 +521,7 @@ static void uwsgi_response_continuation(request_rec *r, apr_status_t rv, void *b
     int status, restore = 0;
 
     if (rv != APR_SUCCESS) {
-        /* The response's read doesn't log its failure, so say why here */
+        /* The response's read logs a timeout only, so say why here */
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "%s waiting for the response of %s:%u",
                       APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "interrupted",
