@@ -668,9 +668,6 @@ static apr_status_t ap_fgetline_ex(char **s, apr_size_t n,
                                    apr_pool_t *p)
 {
     apr_status_t rv;
-#if APR_CHARSET_EBCDIC
-    apr_size_t prev_len = 0;
-#endif
 
     if (!state->reusable) {
         /* A new line, the parser's members kept */
@@ -689,11 +686,6 @@ static apr_status_t ap_fgetline_ex(char **s, apr_size_t n,
         }
         state->max_size = n;
     }
-#if APR_CHARSET_EBCDIC
-    else {
-        prev_len = state->len;
-    }
-#endif
 
     rv = ap_fgetline_core(state, f, flags, bb, p, 0);
 
@@ -704,9 +696,11 @@ static apr_status_t ap_fgetline_ex(char **s, apr_size_t n,
      * translated into the code page used by the compiler.  Since
      * ap_fgetline_core uses recursion, we do the translation in a wrapper
      * function to ensure that each input character gets translated only once.
+     * A line to be resumed (APR_EAGAIN) is translated once read to its end
+     * only, since ap_fgetline_core() compares its bytes with ASCII ones.
      */
-    if (*read > prev_len) {
-        ap_xlate_proto_from_ascii(*s + prev_len, *read - prev_len);
+    if (*read && !state->reusable) {
+        ap_xlate_proto_from_ascii(*s, *read);
     }
 #endif
 
