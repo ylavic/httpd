@@ -3199,6 +3199,16 @@ static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
     struct kept_pfd *kept;
 
     if (cs->nkept >= EVENT_KEPT_MAX) {
+        /* Registered for the wait only, as if not kept: correct, but a
+         * syscall per wait to add and remove it, worth knowing.
+         */
+        static log_ratelimit_t rl;
+        if (LOG_RATELIMIT(&rl, APLOG_TRACE4, 1, NULL, cs->c)) {
+            ap_log_cerror(APLOG_MARK, APLOG_TRACE4, 0, cs->c,
+                          "can't keep a pollfd of connection %" CS_FMT
+                          ", %i kept already (EVENT_KEPT_MAX)",
+                          CS_ARG(cs), EVENT_KEPT_MAX);
+        }
         return NULL;
     }
     anchor = kept_anchor_of(pfd, 0);
