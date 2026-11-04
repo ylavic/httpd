@@ -124,6 +124,21 @@ checks/async-wait-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   serving after), "async" also checks that no worker is held (mod_status)
   and the times.
 
+checks/async-resume-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Handler chains resumed after a suspension (ap_request_resume_suspended()),
+  through mod_aptest's AptestSuspend handlers acting before the others
+  (mod_aptest built as for async-wait-check): suspended then DECLINED to a
+  static file or to mod_proxy (suspending in turn, backend's -addr on port
+  18448), two suspending handlers in a row, a handler answering, a 403 with
+  a local or a proxied ErrorDocument, the output filters answering an error
+  (one response), a resume before the handler returned SUSPENDED (refused
+  and logged; a debug build asserts, the child aborts), the suspending
+  location in a subrequest (mod_include), pipelined requests behind
+  suspended ones, many clients on few threads, ExtendedStatus' Total Duration
+  (no time counted while suspended in "async") and a graceful stop during
+  suspensions; "sync" is AsyncRequests Off (the handlers block: the same
+  responses), "async" also checks that no worker is held (mod_status).
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
