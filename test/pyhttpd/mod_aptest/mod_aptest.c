@@ -35,6 +35,11 @@
 #define APTEST_HAS_RESUME 1
 #endif
 
+/* ap_request_read_body() and the body reader's functions */
+#ifdef AP_REQUEST_BODY_SETASIDE
+#define APTEST_HAS_BODY 1
+#endif
+
 /* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
 typedef struct {
     int set;
@@ -52,7 +57,16 @@ typedef struct {
     apr_interval_time_t wait_timer; /* for "timer" */
     int wait_count;                 /* for "pfdpool" */
     aptest_suspend_conf suspend[2]; /* AptestSuspend, AptestSuspend2 */
+    int body_mode;                  /* APTEST_BODY_* (AptestBody) */
+    int body_block;                 /* read from an output filter, blocking */
+    apr_off_t body_limit;           /* for "discard" */
 } aptest_dir_conf;
+
+/* AptestBody's modes */
+#define APTEST_BODY_UNSET   0
+#define APTEST_BODY_PULL    1
+#define APTEST_BODY_SINK    2
+#define APTEST_BODY_DISCARD 3
 
 /* AptestWait's modes */
 #define APTEST_WAIT_UNSET  0
@@ -86,6 +100,16 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
     for (i = 0; i < 2; i++) {
         conf->suspend[i] = (add->suspend[i].set) ? add->suspend[i]
                                                  : base->suspend[i];
+    }
+    if (add->body_mode != APTEST_BODY_UNSET) {
+        conf->body_mode = add->body_mode;
+        conf->body_block = add->body_block;
+        conf->body_limit = add->body_limit;
+    }
+    else {
+        conf->body_mode = base->body_mode;
+        conf->body_block = base->body_block;
+        conf->body_limit = base->body_limit;
     }
     return conf;
 }
@@ -136,6 +160,8 @@ static const char *aptest_set_wait(cmd_parms *cmd, void *dconf,
 
 /* AptestSuspend's options */
 #define APTEST_SUSPEND_TWICE (1u << 0) /* resume once more, too early */
+#define APTEST_SUSPEND_READ  (1u << 1) /* read the body first, then replay
+                                        * it to the next handlers */
 
 static const char *aptest_set_suspend(cmd_parms *cmd, void *dconf,
                                       int argc, char *const argv[])
@@ -148,8 +174,8 @@ static const char *aptest_set_suspend(cmd_parms *cmd, void *dconf,
     sc = &conf->suspend[(cmd->info != NULL) ? 1 : 0];
     if (argc < 2) {
         return apr_pstrcat(cmd->pool, cmd->cmd->name, " <ms> "
-                           "declined|ok|filter-error|<status> [twice]",
-                           NULL);
+                           "declined|ok|filter-error|<status> [twice] "
+                           "[read]", NULL);
     }
     n = apr_atoi64(argv[0]);
     if (n < 0 || !apr_isdigit(*argv[0])) {
@@ -181,6 +207,11 @@ static const char *aptest_set_suspend(cmd_parms *cmd, void *dconf,
         if (strcmp(argv[i], "twice") == 0) {
             sc->flags |= APTEST_SUSPEND_TWICE;
         }
+#ifdef APTEST_HAS_BODY
+        else if (strcmp(argv[i], "read") == 0) {
+            sc->flags |= APTEST_SUSPEND_READ;
+        }
+#endif
         else {
             return apr_pstrcat(cmd->pool, cmd->cmd->name, ": unknown "
                                "option ", argv[i], NULL);
@@ -191,6 +222,31 @@ static const char *aptest_set_suspend(cmd_parms *cmd, void *dconf,
 }
 #endif /* APTEST_HAS_RESUME */
 
+#ifdef APTEST_HAS_BODY
+static const char *aptest_set_body(cmd_parms *cmd, void *dconf,
+                                   const char *mode, const char *arg)
+{
+    aptest_dir_conf *conf = dconf;
+
+    conf->body_block = 0;
+    if ((strcmp(mode, "pull") == 0 || strcmp(mode, "sink") == 0)
+        && (!arg || strcmp(arg, "block") == 0)) {
+        conf->body_mode = (*mode == 'p') ? APTEST_BODY_PULL
+                                         : APTEST_BODY_SINK;
+        conf->body_block = (arg != NULL);
+    }
+    else if (strcmp(mode, "discard") == 0 && arg
+             && (apr_isdigit(*arg) || *arg == '-')) {
+        conf->body_mode = APTEST_BODY_DISCARD;
+        conf->body_limit = apr_atoi64(arg);
+    }
+    else {
+        return "AptestBody pull|sink [block] | discard <limit>";
+    }
+    return NULL;
+}
+#endif /* APTEST_HAS_BODY */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
@@ -198,10 +254,15 @@ static const command_rec aptest_cmds[] = {
 #ifdef APTEST_HAS_RESUME
     AP_INIT_TAKE_ARGV("AptestSuspend", aptest_set_suspend, NULL, OR_ALL,
                       "the first suspending handler: <ms> "
-                      "declined|ok|filter-error|<status> [twice]"),
+                      "declined|ok|filter-error|<status> [twice] [read]"),
     AP_INIT_TAKE_ARGV("AptestSuspend2", aptest_set_suspend, "2", OR_ALL,
                       "the second suspending handler: <ms> "
-                      "declined|ok|filter-error|<status> [twice]"),
+                      "declined|ok|filter-error|<status> [twice] [read]"),
+#endif
+#ifdef APTEST_HAS_BODY
+    AP_INIT_TAKE12("AptestBody", aptest_set_body, NULL, OR_ALL,
+                   "how the \"aptest-body\" handler reads the request body: "
+                   "pull [block], sink [block] or discard <limit>"),
 #endif
     {NULL}
 };
@@ -1063,6 +1124,367 @@ static int aptest_wait(request_rec *r)
 }
 #endif /* AP_REQUEST_WAIT_DRAINED */
 
+#ifdef APTEST_HAS_BODY
+/*
+ * The body reader's checks: handler "aptest-body", as its location
+ * configures with AptestBody:
+ *  - "AptestBody pull": reads the request body with ap_request_read_body(),
+ *    waiting for the client with ap_request_wait_body(), then answers its
+ *    length and MD5 ("<length> <md5 hex> (pull, <n> async waits)");
+ *  - "AptestBody sink": likewise through ap_request_body_run() and a sink
+ *    ("<length> <md5 hex> (sink, async|sync)": whether the run suspended);
+ *  - "AptestBody pull block" or "sink block": the handler writes "block"
+ *    and flushes it, so that an output filter reads the body while the
+ *    handler runs (the request can suspend then), blocking
+ *    (AP_REQUEST_BODY_BLOCK), and puts "<length> <md5 hex> (<pull|sink>
+ *    block, <n> AGAIN)" before it;
+ *  - "AptestBody discard <limit>": answers "discard" at once (flushed), then
+ *    discards the body (ap_request_discard_body()), waiting for the client,
+ *    and logs the outcome at info ("aptest-body: discard: OK|DONE (<n> async
+ *    waits)").
+ * A request that can't suspend (e.g. AsyncRequests Off) reads blocking: the
+ * same responses. The suspended request is finished by
+ * ap_request_finish_suspended().
+ */
+
+/* A pull loop on ap_request_read_body() (also AptestSuspend's "read") */
+typedef struct {
+    request_rec *r;
+    apr_bucket_brigade *tmp;     /* each read */
+    apr_bucket_brigade *kept;    /* the body read, if kept (with its EOS) */
+    apr_md5_ctx_t md5;
+    apr_off_t length;
+    unsigned int flags;          /* for ap_request_read_body() */
+    int waits;                   /* asynchronous waits so far */
+    int again;                   /* reads that said AGAIN */
+    ap_request_continuation_fn *fn;  /* the waits' continuation */
+    void *baton;
+    unsigned int seen_eos :1;
+} aptest_pull_t;
+
+static void aptest_pull_init(aptest_pull_t *p, request_rec *r,
+                             unsigned int flags, int keep,
+                             ap_request_continuation_fn *fn, void *baton)
+{
+    p->r = r;
+    p->tmp = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+    p->kept = (keep) ? apr_brigade_create(r->pool,
+                                          r->connection->bucket_alloc)
+                     : NULL;
+    apr_md5_init(&p->md5);
+    p->flags = flags;
+    p->fn = fn;
+    p->baton = baton;
+}
+
+/* Digest the buckets of bb, noting the EOS: OK or an HTTP error */
+static int aptest_digest(apr_bucket_brigade *bb, apr_md5_ctx_t *md5,
+                         apr_off_t *length, int *eos)
+{
+    apr_bucket *e;
+
+    for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+         e = APR_BUCKET_NEXT(e)) {
+        const char *data;
+        apr_size_t len;
+
+        if (APR_BUCKET_IS_EOS(e)) {
+            *eos = 1;
+            break;
+        }
+        if (APR_BUCKET_IS_METADATA(e)) {
+            continue;
+        }
+        if (apr_bucket_read(e, &data, &len, APR_BLOCK_READ) != APR_SUCCESS) {
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+        apr_md5_update(md5, data, len);
+        *length += len;
+    }
+    return OK;
+}
+
+/* Read the body until its end: OK, SUSPENDED (p->fn reads on later), or an
+ * HTTP error
+ */
+static int aptest_pull(aptest_pull_t *p)
+{
+    while (!p->seen_eos) {
+        int rc, eos = 0;
+
+        rc = ap_request_read_body(p->r, p->tmp, AP_IOBUFSIZE, p->flags);
+        if (rc == AGAIN) {
+            p->again++;
+            rc = ap_request_wait_body(p->r, p->fn, p->baton);
+            if (rc == SUSPENDED) {
+                p->waits++;
+                return SUSPENDED;
+            }
+            continue; /* ready, or blocking from now on */
+        }
+        if (rc != OK) {
+            return rc;
+        }
+        rc = aptest_digest(p->tmp, &p->md5, &p->length, &eos);
+        if (rc != OK) {
+            return rc;
+        }
+        p->seen_eos = (eos != 0);
+        if (p->kept) {
+            APR_BRIGADE_CONCAT(p->kept, p->tmp);
+        }
+        else {
+            apr_brigade_cleanup(p->tmp);
+        }
+    }
+    return OK;
+}
+
+/* "<length> <md5 hex>" of what was digested */
+static const char *aptest_digest_str(apr_pool_t *pool, apr_md5_ctx_t *md5,
+                                     apr_off_t length)
+{
+    unsigned char digest[APR_MD5_DIGESTSIZE];
+    char hex[2 * APR_MD5_DIGESTSIZE + 1];
+    int i;
+
+    apr_md5_final(digest, md5);
+    for (i = 0; i < APR_MD5_DIGESTSIZE; i++) {
+        apr_snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+    }
+    return apr_psprintf(pool, "%" APR_OFF_T_FMT " %s", length, hex);
+}
+
+typedef struct {
+    request_rec *r;
+    const aptest_dir_conf *conf;
+    aptest_pull_t pull;          /* pull, and the sink's digest */
+    int sink_async;              /* the run suspended */
+    int discard_waits;
+} aptest_body_t;
+
+/* The response once the body is read: OK or the error */
+static int aptest_body_respond(aptest_body_t *b, int rc)
+{
+    request_rec *r = b->r;
+
+    if (rc != OK) {
+        return rc;
+    }
+    ap_set_content_type(r, "text/plain");
+    if (b->conf->body_mode == APTEST_BODY_PULL) {
+        ap_rprintf(r, "%s (pull, %d async waits)\n",
+                   aptest_digest_str(r->pool, &b->pull.md5, b->pull.length),
+                   b->pull.waits);
+    }
+    else {
+        ap_rprintf(r, "%s (sink, %s)\n",
+                   aptest_digest_str(r->pool, &b->pull.md5, b->pull.length),
+                   b->sink_async ? "async" : "sync");
+    }
+    return OK;
+}
+
+static void aptest_body_pull_continuation(request_rec *r, apr_status_t status,
+                                          void *baton)
+{
+    aptest_body_t *b = baton;
+    int rc;
+
+    /* The next read answers a timeout or an interruption */
+    rc = aptest_pull(&b->pull);
+    if (rc == SUSPENDED) {
+        return;
+    }
+    ap_request_finish_suspended(r, aptest_body_respond(b, rc));
+}
+
+static int aptest_body_sink(request_rec *r, apr_bucket_brigade *bb, int eos,
+                            void *baton)
+{
+    aptest_body_t *b = baton;
+    int seen = 0;
+
+    return aptest_digest(bb, &b->pull.md5, &b->pull.length, &seen);
+}
+
+static void aptest_body_sink_done(request_rec *r, int status, void *baton)
+{
+    aptest_body_t *b = baton;
+
+    ap_request_finish_suspended(r, aptest_body_respond(b, status));
+}
+
+/* The blocking reads from an output filter ("block"), at its first call */
+static apr_status_t aptest_body_block_filter(ap_filter_t *f,
+                                             apr_bucket_brigade *bb)
+{
+    aptest_body_t *b = f->ctx;
+    request_rec *r = f->r;
+    const char *line;
+    int rc;
+
+    if (b->conf->body_mode == APTEST_BODY_PULL) {
+        rc = aptest_pull(&b->pull);
+    }
+    else {
+        rc = ap_request_body_run(r, AP_IOBUFSIZE, AP_REQUEST_BODY_BLOCK,
+                                 aptest_body_sink, aptest_body_sink_done, b);
+    }
+    if (rc == SUSPENDED) {
+        /* Never with AP_REQUEST_BODY_BLOCK */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "aptest-body: a blocking read suspended");
+        return APR_EGENERAL;
+    }
+    line = (rc == OK)
+           ? apr_psprintf(r->pool, "%s (%s block, %d AGAIN)\n",
+                          aptest_digest_str(r->pool, &b->pull.md5,
+                                            b->pull.length),
+                          b->conf->body_mode == APTEST_BODY_PULL ? "pull"
+                                                                 : "sink",
+                          b->pull.again)
+           : apr_psprintf(r->pool, "error %d\n", rc);
+    APR_BRIGADE_INSERT_HEAD(bb, apr_bucket_pool_create(line, strlen(line),
+                                                       r->pool,
+                                                       f->c->bucket_alloc));
+    ap_remove_output_filter(f);
+    return ap_pass_brigade(f->next, bb);
+}
+
+static void aptest_body_discard_continuation(request_rec *r,
+                                             apr_status_t status,
+                                             void *baton);
+
+/* Discard the body, waiting for the client: OK once done, or SUSPENDED */
+static int aptest_body_discard(aptest_body_t *b)
+{
+    request_rec *r = b->r;
+    int rc;
+
+    for (;;) {
+        rc = ap_request_discard_body(r, b->conf->body_limit);
+        if (rc != AGAIN) {
+            break;
+        }
+        rc = ap_request_wait_body(r, aptest_body_discard_continuation, b);
+        if (rc == SUSPENDED) {
+            b->discard_waits++;
+            return SUSPENDED;
+        }
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO()
+                  "aptest-body: discard: %s (%d async waits)",
+                  rc == OK ? "OK" : "DONE", b->discard_waits);
+    return OK; /* answered already */
+}
+
+static void aptest_body_discard_continuation(request_rec *r,
+                                             apr_status_t status,
+                                             void *baton)
+{
+    aptest_body_t *b = baton;
+
+    /* The next read answers a timeout or an interruption */
+    if (aptest_body_discard(b) == SUSPENDED) {
+        return;
+    }
+    ap_request_finish_suspended(r, OK);
+}
+
+static int aptest_body(request_rec *r)
+{
+    const aptest_dir_conf *conf;
+    aptest_body_t *b;
+    int rc;
+
+    if (strcmp(r->handler, "aptest-body") != 0) {
+        return DECLINED;
+    }
+    conf = ap_get_module_config(r->per_dir_config, &aptest_module);
+    if (!conf || conf->body_mode == APTEST_BODY_UNSET) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "aptest-body: no AptestBody for this location");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    b = apr_pcalloc(r->pool, sizeof(*b));
+    b->r = r;
+    b->conf = conf;
+
+    if (conf->body_mode == APTEST_BODY_DISCARD) {
+        ap_set_content_type(r, "text/plain");
+        ap_rputs("discard\n", r);
+        if (ap_rflush(r) != APR_SUCCESS) {
+            return DONE;
+        }
+        return aptest_body_discard(b);
+    }
+
+    aptest_pull_init(&b->pull, r,
+                     conf->body_block ? AP_REQUEST_BODY_BLOCK : 0, 0,
+                     aptest_body_pull_continuation, b);
+    if (conf->body_block) {
+        ap_set_content_type(r, "text/plain");
+        ap_add_output_filter("APTEST_BODY_BLOCK", b, r, r->connection);
+        ap_rputs("block\n", r);
+        if (ap_rflush(r) != APR_SUCCESS) {
+            return DONE;
+        }
+        return OK;
+    }
+
+    if (conf->body_mode == APTEST_BODY_PULL) {
+        rc = aptest_pull(&b->pull);
+    }
+    else {
+        rc = ap_request_body_run(r, AP_IOBUFSIZE, 0, aptest_body_sink,
+                                 aptest_body_sink_done, b);
+        b->sink_async = (rc == SUSPENDED);
+    }
+    if (rc == SUSPENDED) {
+        return SUSPENDED;
+    }
+    return aptest_body_respond(b, rc);
+}
+
+/* AptestSuspend's "read": the body read is served to the next handlers by
+ * this input filter, as a module checking the body before them would
+ */
+static apr_status_t aptest_replay_filter(ap_filter_t *f,
+                                         apr_bucket_brigade *bb,
+                                         ap_input_mode_t mode,
+                                         apr_read_type_e block,
+                                         apr_off_t readbytes)
+{
+    apr_bucket_brigade *kept = f->ctx;
+    apr_bucket *after;
+    apr_status_t rv;
+
+    if (mode != AP_MODE_READBYTES && mode != AP_MODE_GETLINE) {
+        return APR_ENOTIMPL;
+    }
+    if (APR_BRIGADE_EMPTY(kept)) {
+        /* All served: the end again */
+        APR_BRIGADE_INSERT_TAIL(bb, apr_bucket_eos_create(f->c->bucket_alloc));
+        return APR_SUCCESS;
+    }
+    if (mode == AP_MODE_GETLINE) {
+        return apr_brigade_split_line(bb, kept, APR_BLOCK_READ,
+                                      HUGE_STRING_LEN);
+    }
+    rv = apr_brigade_partition(kept, readbytes, &after);
+    if (rv != APR_SUCCESS && rv != APR_INCOMPLETE) {
+        return rv;
+    }
+    while (APR_BRIGADE_FIRST(kept) != after) {
+        apr_bucket *e = APR_BRIGADE_FIRST(kept);
+        APR_BUCKET_REMOVE(e);
+        APR_BRIGADE_INSERT_TAIL(bb, e);
+    }
+    return APR_SUCCESS;
+}
+#endif /* APTEST_HAS_BODY */
+
 #ifdef APTEST_HAS_RESUME
 /*
  * The suspending handlers: two handler functions, at APR_HOOK_REALLY_FIRST
@@ -1078,16 +1500,27 @@ static int aptest_wait(request_rec *r)
  *    (which answer it), then AP_FILTER_ERROR;
  *  - a status, e.g. 403 (an ErrorDocument applies).
  * The option "twice" resumes once more before the handler returns SUSPENDED,
- * which the core refuses (logged; debug builds assert). A request that
- * can't suspend (ap_request_can_suspend(), e.g. AsyncRequests Off or a
- * subrequest) sleeps for ms holding the thread, then returns the result as
- * a synchronous module would. The response header "AP-Test-Suspend<1|2>"
- * says "async" or "sync" for each handler that acted.
+ * which the core refuses (logged; debug builds assert). The option "read"
+ * reads the whole request body first (ap_request_read_body(), set aside,
+ * waiting for the client with ap_request_wait_body()), then serves it to
+ * the next handlers with an input filter ("APTEST_REPLAY"), as a module
+ * checking the body before them would, then waits: the response header
+ * "AP-Test-Read<1|2>" gives the length read and the waits for it, a read
+ * failing is the handler's result. A request that can't suspend
+ * (ap_request_can_suspend(), e.g. AsyncRequests Off or a subrequest) reads
+ * and sleeps for ms holding the thread, then returns the result as a
+ * synchronous module would. The response header "AP-Test-Suspend<1|2>"
+ * says "async" or "sync" for each handler that acted (the timer's wait).
  */
 typedef struct {
     request_rec *r;
     const aptest_suspend_conf *sc;
     int which;  /* 1 or 2 */
+#ifdef APTEST_HAS_BODY
+    aptest_pull_t pull;          /* "read" */
+#endif
+    unsigned int read_done :1,
+                 suspended :1;   /* the handler returned SUSPENDED */
 } aptest_suspend_t;
 
 /* The handler's result once done waiting */
@@ -1141,12 +1574,78 @@ static void aptest_suspend_continuation(request_rec *r, apr_status_t status,
     ap_request_resume_suspended(r, rc);
 }
 
+/* Read the body if configured, then wait for the timer: the handler's
+ * result, or SUSPENDED (a continuation goes on)
+ */
+static int aptest_suspend_run(aptest_suspend_t *s)
+{
+    request_rec *r = s->r;
+    ap_request_waitctx_t *ctx;
+    const char *hdr = (s->which == 1) ? "AP-Test-Suspend1"
+                                      : "AP-Test-Suspend2";
+    int rc;
+
+#ifdef APTEST_HAS_BODY
+    if ((s->sc->flags & APTEST_SUSPEND_READ) && !s->read_done) {
+        rc = aptest_pull(&s->pull);
+        if (rc == SUSPENDED) {
+            s->suspended = 1;
+            return SUSPENDED;
+        }
+        s->read_done = 1;
+        apr_table_setn(r->err_headers_out,
+                       s->which == 1 ? "AP-Test-Read1" : "AP-Test-Read2",
+                       apr_psprintf(r->pool, "%" APR_OFF_T_FMT " %d",
+                                    s->pull.length, s->pull.waits));
+        if (rc != OK) {
+            return rc;
+        }
+        ap_add_input_filter("APTEST_REPLAY", s->pull.kept, r,
+                            r->connection);
+    }
+#endif
+
+    if (ap_request_can_suspend(r)) {
+        ctx = ap_request_waitctx_timer(r, r->pool);
+        ctx->timeout = s->sc->timer;
+        rc = ap_request_wait(ctx, AP_WAIT_IN, 0, aptest_suspend_continuation,
+                             s);
+        if (rc == SUSPENDED) {
+            apr_table_setn(r->err_headers_out, hdr, "async");
+            if ((s->sc->flags & APTEST_SUSPEND_TWICE) && !s->suspended) {
+                /* Too early: refused by the core */
+                ap_request_resume_suspended(r, DECLINED);
+            }
+            s->suspended = 1;
+            return SUSPENDED;
+        }
+    }
+    apr_table_setn(r->err_headers_out, hdr, "sync");
+    apr_sleep(s->sc->timer);
+    return aptest_suspend_result(s);
+}
+
+#ifdef APTEST_HAS_BODY
+static void aptest_suspend_read_continuation(request_rec *r,
+                                             apr_status_t status,
+                                             void *baton)
+{
+    aptest_suspend_t *s = baton;
+    int rc;
+
+    /* The next read answers a timeout or an interruption */
+    rc = aptest_suspend_run(s);
+    if (rc == SUSPENDED) {
+        return;
+    }
+    ap_request_resume_suspended(r, rc);
+}
+#endif
+
 static int aptest_suspend_handler(request_rec *r, int which)
 {
     const aptest_dir_conf *conf;
     aptest_suspend_t *s;
-    ap_request_waitctx_t *ctx;
-    int rc;
 
     conf = ap_get_module_config(r->per_dir_config, &aptest_module);
     if (!conf || !conf->suspend[which - 1].set) {
@@ -1156,29 +1655,13 @@ static int aptest_suspend_handler(request_rec *r, int which)
     s->r = r;
     s->sc = &conf->suspend[which - 1];
     s->which = which;
-
-    if (ap_request_can_suspend(r)) {
-        ctx = ap_request_waitctx_timer(r, r->pool);
-        ctx->timeout = s->sc->timer;
-        rc = ap_request_wait(ctx, AP_WAIT_IN, 0, aptest_suspend_continuation,
-                             s);
-        if (rc == SUSPENDED) {
-            apr_table_setn(r->err_headers_out,
-                           which == 1 ? "AP-Test-Suspend1"
-                                      : "AP-Test-Suspend2",
-                           "async");
-            if (s->sc->flags & APTEST_SUSPEND_TWICE) {
-                /* Too early: refused by the core */
-                ap_request_resume_suspended(r, DECLINED);
-            }
-            return SUSPENDED;
-        }
+#ifdef APTEST_HAS_BODY
+    if (s->sc->flags & APTEST_SUSPEND_READ) {
+        aptest_pull_init(&s->pull, r, AP_REQUEST_BODY_SETASIDE, 1,
+                         aptest_suspend_read_continuation, s);
     }
-    apr_table_setn(r->err_headers_out,
-                   which == 1 ? "AP-Test-Suspend1" : "AP-Test-Suspend2",
-                   "sync");
-    apr_sleep(s->sc->timer);
-    return aptest_suspend_result(s);
+#endif
+    return aptest_suspend_run(s);
 }
 
 static int aptest_suspend1(request_rec *r)
@@ -1207,6 +1690,13 @@ static void aptest_hooks(apr_pool_t *pool)
     ap_hook_handler(aptest_queue, NULL, NULL, APR_HOOK_MIDDLE);
 #ifdef AP_REQUEST_WAIT_DRAINED
     ap_hook_handler(aptest_wait, NULL, NULL, APR_HOOK_MIDDLE);
+#endif
+#ifdef APTEST_HAS_BODY
+    ap_hook_handler(aptest_body, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_register_output_filter("APTEST_BODY_BLOCK", aptest_body_block_filter,
+                              NULL, AP_FTYPE_RESOURCE);
+    ap_register_input_filter("APTEST_REPLAY", aptest_replay_filter, NULL,
+                             AP_FTYPE_RESOURCE);
 #endif
 #ifdef APTEST_HAS_RESUME
     {
