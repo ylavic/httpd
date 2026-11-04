@@ -789,12 +789,15 @@
  *                         AP_REQUEST_WAIT_DRAINED,
  *                         AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT,
  *                         ap_request_waitctx_t, ap_request_continuation_fn,
- *                         ap_request_waitctx_client(),
- *                         ap_request_waitctx_conn(),
- *                         ap_request_waitctx_pfd(),
- *                         ap_request_waitctx_timer(),
- *                         ap_request_waitctx_release(), ap_request_wait()
- *                         and ap_request_waitctx_ready() to http_request.h;
+ *                         ap_request_waitctx_client_(),
+ *                         ap_request_waitctx_conn_(),
+ *                         ap_request_waitctx_pfd_(),
+ *                         ap_request_waitctx_timer_(),
+ *                         ap_request_waitctx_notifier_() (and their macros
+ *                         without the trailing "_"),
+ *                         ap_request_waitctx_release(), ap_request_wait(),
+ *                         ap_request_wait_any() and ap_request_waitctx_ready()
+ *                         to http_request.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
  *                         ap_proxy_handler_done(), proxy_req_conf->async,

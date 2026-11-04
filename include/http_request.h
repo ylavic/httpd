@@ -363,10 +363,10 @@ typedef enum {
 } ap_wait_direction_e;
 
 /**
- * Flag for ap_request_wait(): the caller drained what it waits for, i.e.
- * the read or write it waits for failed with EAGAIN since its last wait,
- * so a target that the MPM keeps registered across the waits needs no
- * check for a readiness the caller would have consumed
+ * Flag for ap_request_wait() and ap_request_wait_any(): the caller drained
+ * what it waits for, i.e. the read or write it waits for failed with EAGAIN
+ * since its last wait, so a target that the MPM keeps registered across the
+ * waits needs no check for a readiness the caller would have consumed
  * (AP_MPM_WAIT_DRAINED). Without it the MPM checks such targets, which is
  * always correct.
  */
@@ -407,8 +407,9 @@ typedef struct {
      *  another module */
     int module_index;
     /** The timeout of the waits: AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT (initially,
-     *  but for timers), a negative value for none, or the delay of a
-     *  timer (initially negative: to be set) */
+     *  but for timers and notifiers), a negative value for none (initially
+     *  for a notifier), or the delay of a timer (initially negative: to be
+     *  set) */
     apr_interval_time_t timeout;
     /** How long to poll the target synchronously before suspending, for a
      *  readiness expected soon: none if zero (initially) or negative */
@@ -419,9 +420,9 @@ typedef struct {
  * The continuation of a request's wait (ap_request_wait()), called by a
  * thread processing the request once the wait completes.
  * @param r The request that waited (the context's)
- * @param status APR_SUCCESS when ready (or a timer's delay elapsed),
- *        APR_TIMEUP when the wait timed out, or another error when it was
- *        interrupted (e.g. the MPM is stopping)
+ * @param status APR_SUCCESS when ready (or a timer's delay elapsed, a
+ *        notifier notified), APR_TIMEUP when the wait timed out, or
+ *        APR_EGENERAL when the MPM failed to wait (e.g. a pollset error)
  * @param baton The baton given to the wait
  * @remark The continuation either waits again (and returns), or continues
  *         the request until it ends it (ap_request_finish_suspended()),
@@ -515,6 +516,44 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_timer_(request_rec *r,
 #define ap_request_waitctx_timer(r, p) \
     ap_request_waitctx_timer_(r, p, APLOG_MODULE_INDEX)
 
+/* ap_mpm.h's ap_mpm_notifier_t, not included here to keep this header from
+ * pulling ap_mpm.h and scoreboard.h into every module (and C89 forbids
+ * repeating its typedef)
+ */
+struct ap_mpm_notifier_t;
+
+/**
+ * A context for the request to wait for a notifier, notified from any thread
+ * (ap_mpm_notify()), whatever the direction given to ap_request_wait(): a
+ * notifier completes its wait with APR_SUCCESS. No timeout by default.
+ * @param r The request
+ * @param p The pool to allocate the context from (see ap_request_waitctx_t),
+ *        e.g. the notifier's
+ * @param notifier The notifier (ap_mpm_notifier_create()), whose pool must
+ *        outlive the waits
+ * @param module_index The module whose log level the waits' log lines
+ *        follow
+ * @return The context, in p
+ * @remark A notifier serves a single wait, so does its context, unless the
+ *         notifier is re-armed (ap_mpm_notifier_rearm()) once that wait
+ *         has completed (its continuation called): the context then waits
+ *         again, its fields set before each wait, a notification made
+ *         before the re-arm dropped. Otherwise the next wait needs a new
+ *         notifier and context (the old one released,
+ *         ap_request_waitctx_release()): a wait on a context whose
+ *         notifier served a wait and wasn't re-armed is logged as an error
+ *         and answered DECLINED, the notifier never re-armed implicitly.
+ */
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_notifier_(request_rec *r,
+                                                                apr_pool_t *p,
+                                                                struct ap_mpm_notifier_t *notifier,
+                                                                int module_index);
+
+/** ap_request_waitctx_notifier_() for the calling module
+ *  (APLOG_MODULE_INDEX) */
+#define ap_request_waitctx_notifier(r, p, notifier) \
+    ap_request_waitctx_notifier_(r, p, notifier, APLOG_MODULE_INDEX)
+
 /**
  * Release a wait context once its target is given up: the MPM stops keeping
  * its descriptor registered (ap_mpm_release_pfd()), when the wait in
@@ -534,7 +573,7 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  * or within the context's delay (polled), the MPM waits for it.
  * @param ctx The context of the target
  * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection or a
- *        descriptor, ignored by a timer
+ *        descriptor, ignored by a timer or a notifier
  * @param flags AP_REQUEST_WAIT_DRAINED or 0
  * @param fn Called once the asynchronous wait completes
  * @param baton For fn
@@ -542,7 +581,8 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  *         called later, never inline), OK if ready now or with an error the
  *         next I/O will report (go on), or DECLINED if the request can't
  *         wait asynchronously (ap_request_can_suspend(), or the MPM
- *         refusing the wait): go on blocking (or sleep for a timer).
+ *         refusing the wait, e.g. a notifier not re-armed after its
+ *         previous wait): go on blocking (or sleep for a timer).
  * @remark From the second wait in a direction, the MPM keeps the target's
  *         descriptor registered (AP_MPM_WAIT_KEEP_PFDS).
  * @remark Input that the filters keep after the caller's last read returned
@@ -556,11 +596,39 @@ AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *ctx,
                                 ap_request_continuation_fn *fn, void *baton);
 
 /**
+ * Wait for several targets of a request at once, the first ready completing
+ * the wait, as ap_request_wait() does for one: OK when some are ready
+ * already, else SUSPENDED or DECLINED. The timeout is the smallest of the
+ * contexts', the delay the smallest of those waiting for a descriptor (no
+ * poll if any of them has none).
+ * @param ctxs The contexts, all of the same request, at most one notifier
+ * @param nctxs The number of contexts
+ * @param directions For each context, AP_WAIT_IN and/or AP_WAIT_OUT (both
+ *        for the same descriptor in one wait), ignored by a timer or a
+ *        notifier
+ * @param flags AP_REQUEST_WAIT_DRAINED or 0
+ * @param fn Called once the asynchronous wait completes
+ * @param baton For fn
+ * @return As ap_request_wait()
+ * @remark The MPM keeps the targets' descriptors registered from the first
+ *         wait (AP_MPM_WAIT_KEEP_PFDS), such waits being repeated.
+ * @remark ap_request_waitctx_ready() tells which targets and directions are
+ *         ready, for each context.
+ */
+AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
+                                    int nctxs,
+                                    const unsigned int *directions,
+                                    unsigned int flags,
+                                    ap_request_continuation_fn *fn,
+                                    void *baton);
+
+/**
  * The directions found ready by the last wait of a context: when it
  * answered OK, or for its continuation.
  * @param ctx The context
- * @return AP_WAIT_IN and/or AP_WAIT_OUT, or 0 (e.g. after a timeout); both
- *         for a timer whose delay elapsed
+ * @return AP_WAIT_IN and/or AP_WAIT_OUT, or 0 (e.g. after a timeout, or
+ *         another target of ap_request_wait_any() ready); both for a timer
+ *         whose delay elapsed or a notifier notified
  */
 AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ctx);
 

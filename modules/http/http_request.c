@@ -465,12 +465,17 @@ typedef enum {
     REQUEST_WAITCTX_CLIENT,
     REQUEST_WAITCTX_CONN,
     REQUEST_WAITCTX_PFD,
-    REQUEST_WAITCTX_TIMER
+    REQUEST_WAITCTX_TIMER,
+    REQUEST_WAITCTX_NOTIFIER
 } request_waitctx_kind_e;
 
 /* Their names in the logs */
 static const char *const request_waitctx_kind_names[] = {
-    "client", "connection", "descriptor", "timer"
+    "client",     /* REQUEST_WAITCTX_CLIENT */
+    "connection", /* REQUEST_WAITCTX_CONN */
+    "descriptor", /* REQUEST_WAITCTX_PFD */
+    "timer",      /* REQUEST_WAITCTX_TIMER */
+    "notifier"    /* REQUEST_WAITCTX_NOTIFIER */
 };
 
 /* The state of a context's waits in a direction */
@@ -487,11 +492,15 @@ typedef struct {
     apr_pool_t *pool;             /* allocated from (the constructor's) */
     conn_rec *c;                  /* whose filters are checked, if any */
     apr_pollfd_t pfd;             /* the target's descriptor, if any */
+    ap_mpm_notifier_t *notifier;  /* the target's notifier, if any */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
     apr_interval_time_t timeout;  /* of the wait in flight, resolved */
     unsigned int ready;           /* AP_WAIT_* of the last wait */
     unsigned int waiting  :1,     /* in the wait in flight */
                  kept     :1,     /* its pfd may be kept by the MPM */
+                 used     :1,     /* its notifier given to a wait (the
+                                   * MPM refuses another one until the
+                                   * notifier is re-armed) */
                  released :1;     /* ap_request_waitctx_release()d */
 } request_waitctx_t;
 
@@ -505,10 +514,12 @@ struct ap_request_waitset {
     request_rec *r;
     request_waitctx_t *client;   /* the client's context, if created */
     apr_array_header_t *pfds;     /* of the wait, reused */
+    int *pfd_ctxs;                /* the index in ctxs of each pfd's context */
     request_waitctx_t **ctxs;    /* of the wait in flight */
     unsigned int *directions;     /* of ctxs */
-    int nctx, nalloc;             /* ctxs used, allocated */
+    int nctxs, nalloc;            /* ctxs used, allocated (all three) */
     apr_interval_time_t timeout;  /* of the wait in flight */
+    int timer_expires;            /* the timeout is a timer's */
     ap_request_continuation_fn *fn;
     void *baton;
     int ending;                   /* r->pool is being destroyed */
@@ -573,7 +584,7 @@ static apr_status_t request_waitctx_cleanup(void *data)
                       "the pool of a %s wait context destroyed while it "
                       "waits", request_waitctx_kind_names[ctx->kind]);
         AP_DEBUG_ASSERT(0);
-        for (i = 0; w && i < w->nctx; i++) {
+        for (i = 0; w && i < w->nctxs; i++) {
             if (w->ctxs[i] == ctx) {
                 w->ctxs[i] = NULL;
             }
@@ -671,6 +682,19 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_timer_(request_rec *r,
 
     ctx = request_waitctx_make(r, p, REQUEST_WAITCTX_TIMER, module_index);
     ctx->pub.timeout = -1;
+    return &ctx->pub;
+}
+
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_notifier_(request_rec *r,
+                                                                apr_pool_t *p,
+                                                                ap_mpm_notifier_t *notifier,
+                                                                int module_index)
+{
+    request_waitctx_t *ctx;
+
+    ctx = request_waitctx_make(r, p, REQUEST_WAITCTX_NOTIFIER, module_index);
+    ctx->pub.timeout = -1;
+    ctx->notifier = notifier;
     return &ctx->pub;
 }
 
@@ -827,52 +851,64 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     ap_request_continuation_fn *fn = w->fn;
     void *fn_baton = w->baton;
     apr_status_t rv;
-    int i, j;
+    int i, k;
 
     AP_DEBUG_ASSERT(mpm_r == r);
     switch (why) {
     case AP_MPM_WAIT_READY:
         rv = APR_SUCCESS;
         break;
+    case AP_MPM_WAIT_NOTIFIED:
+        rv = APR_SUCCESS;
+        break;
     case AP_MPM_WAIT_TIMEOUT:
-        rv = APR_TIMEUP; /* or a timer's success, below */
+        rv = (w->timer_expires) ? APR_SUCCESS : APR_TIMEUP;
         break;
     default:
         rv = APR_EGENERAL;
         break;
     }
 
-    /* The pfds are the wait's, in the order of the contexts having one */
-    for (i = 0, j = 0; i < w->nctx; i++) {
-        request_waitctx_t *ctx = w->ctxs[i];
-        unsigned int directions = w->directions[i];
-
-        ctx->ready = 0;
-        if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
-            if (why == AP_MPM_WAIT_READY && pfds && j < pfds->nelts) {
-                const apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, j,
-                                                         apr_pollfd_t);
-                ctx->ready = ready_directions(pfd->rtnevents,
-                                              directions);
+    /* The contexts' readiness is 0 since request_waitreg_prepare() found none
+     * ready. The pfds are the wait's (w->pfds), w->pfd_ctxs giving the
+     * index of each one's context.
+     */
+    if (why == AP_MPM_WAIT_READY && pfds) {
+        for (k = 0; k < pfds->nelts && k < w->pfds->nelts; k++) {
+            const apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, k, apr_pollfd_t);
+            i = w->pfd_ctxs[k];
+            if (w->ctxs[i]) {
+                w->ctxs[i]->ready = ready_directions(pfd->rtnevents,
+                                                     w->directions[i]);
             }
-            j++;
         }
-        else if (ctx->kind == REQUEST_WAITCTX_TIMER
-                 && why == AP_MPM_WAIT_TIMEOUT
-                 && ctx->timeout == w->timeout) {
+    }
+
+    /* No pointer to the contexts is kept past the wait (w->ctxs cleared),
+     * one detached by its pool's cleanup is NULL already
+     */
+    for (i = 0; i < w->nctxs; i++) {
+        request_waitctx_t *ctx = w->ctxs[i];
+        const char *name, *dir;
+
+        if (!ctx) {
+            continue;
+        }
+        w->ctxs[i] = NULL;
+        name = request_waitctx_kind_names[ctx->kind];
+        dir = request_waitctx_dir_name(ctx, w->directions[i]);
+
+        if ((ctx->kind == REQUEST_WAITCTX_TIMER
+             && why == AP_MPM_WAIT_TIMEOUT
+             && ctx->timeout == w->timeout)
+            || (ctx->kind == REQUEST_WAITCTX_NOTIFIER
+                && why == AP_MPM_WAIT_NOTIFIED)) {
             ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
-            rv = APR_SUCCESS;
         }
         ctx->waiting = 0;
         if (ctx->released) {
             request_waitctx_release_pfd(ctx);
         }
-    }
-
-    for (i = 0; i < w->nctx; i++) {
-        request_waitctx_t *ctx = w->ctxs[i];
-        const char *name = request_waitctx_kind_names[ctx->kind];
-        const char *dir = request_waitctx_dir_name(ctx, w->directions[i]);
 
         if (rv == APR_EGENERAL) {
             ap_log_rerror(WAITCTX_LOG_MARK(ctx),
@@ -884,38 +920,71 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
                       APLOG_TRACE5, rv, r,
                       "done waiting for the %s%s (async)", name, dir);
     }
-    w->nctx = 0;
+    w->nctxs = 0;
 
     fn(r, rv, fn_baton);
 }
 
-/* Wait for the targets of nctx contexts, the first ready completing the
- * wait (ap_request_wait()).
+/* What request_waitreg_prepare() found for a wait */
+typedef struct {
+    ap_mpm_notifier_t *notifier;  /* the targets' notifier, if any */
+    apr_interval_time_t timeout;  /* the smallest, negative for none */
+    apr_interval_time_t delay;    /* the smallest of the pfds', if any */
+    int timer_expires;            /* the timeout is a timer's */
+    int keep;                     /* the MPM can keep the pfds registered */
+} request_waitreg_plan_t;
+
+/* Check the contexts of a wait, and whether some are ready in their
+ * connections' filters already, then build the wait: the descriptors to
+ * poll and wait for in w->pfds (the index of each one's context in
+ * w->pfd_ctxs), the notifier, the smallest timeout and delay in plan. The
+ * MPM keeps the descriptors registered from their second wait in the same
+ * direction, or from the first for several targets (repeated waits by
+ * nature). Returns DECLINED for a context that can't wait, OK if some are
+ * ready, else AGAIN.
  */
-static int request_wait(request_waitctx_t **ctxs,
-                        const unsigned int *directions, int nctx,
-                        unsigned int flags,
-                        ap_request_continuation_fn *fn, void *baton)
+static int request_waitreg_prepare(struct ap_request_waitset *w,
+                                   ap_request_waitctx_t *const *ctxs, int nctxs,
+                                   const unsigned int *directions, int any,
+                                   request_waitreg_plan_t *plan)
 {
-    request_rec *r = ctxs[0]->pub.r;
-    struct ap_request_waitset *w;
-    apr_interval_time_t timeout = -1, delay = -1;
-    unsigned int mpm_flags = 0, ready = 0;
-    int i, npfds = 0, keep = 1, polled = 0;
-    apr_status_t rv;
+    request_rec *r = w->r;
+    apr_interval_time_t timer_timeout = -1;
+    unsigned int ready = 0;
+    int i;
 
-    if (!ap_request_can_suspend(r)) {
-        return DECLINED;
+    plan->notifier = NULL;
+    plan->timeout = -1;
+    plan->delay = -1;
+    plan->keep = 1;
+
+    if (w->nalloc < nctxs) {
+        w->nalloc = (nctxs > 2) ? nctxs : 2;
+        w->ctxs = apr_palloc(r->pool, w->nalloc * sizeof(*w->ctxs));
+        w->directions = apr_palloc(r->pool,
+                                   w->nalloc * sizeof(*w->directions));
+        w->pfd_ctxs = apr_palloc(r->pool, w->nalloc * sizeof(*w->pfd_ctxs));
     }
-    w = request_waitset_get(request_async_get(r));
+    apr_array_clear(w->pfds);
 
-    /* Ready in the connections' filters already? */
-    for (i = 0; i < nctx; i++) {
-        request_waitctx_t *ctx = ctxs[i];
+    for (i = 0; i < nctxs; i++) {
+        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+        apr_interval_time_t t;
 
         AP_DEBUG_ASSERT(ctx->pub.r == r && !ctx->released && !ctx->waiting);
         if (ctx->pub.r != r || ctx->released || ctx->waiting) {
             return DECLINED;
+        }
+        if (ctx->notifier) {
+            /* A wait has one notifier. One that served a wait already is
+             * refused by the MPM unless re-armed (ap_mpm_notifier_rearm()),
+             * which only the MPM knows: see request_wait().
+             */
+            AP_DEBUG_ASSERT(!plan->notifier);
+            if (plan->notifier) {
+                return DECLINED;
+            }
+            plan->notifier = ctx->notifier;
         }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             if (!(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT))) {
@@ -930,123 +999,123 @@ static int request_wait(request_waitctx_t **ctxs,
                 return DECLINED;
             }
         }
+
+        /* Ready in the connection's filters already? */
         ctx->ready = request_waitctx_check_ready(ctx, directions[i]);
         ready |= ctx->ready;
-    }
-    if (ready) {
-        return OK;
-    }
-
-    /* The descriptors to poll and wait for, the smallest timeout and delay;
-     * the MPM keeps the descriptors registered from their second wait in
-     * the same direction.
-     */
-    apr_array_clear(w->pfds);
-    for (i = 0; i < nctx; i++) {
-        request_waitctx_t *ctx = ctxs[i];
-        apr_interval_time_t t = request_waitctx_timeout(ctx, directions[i]);
-
-        ctx->timeout = t;
-        if (t >= 0 && (timeout < 0 || t < timeout)) {
-            timeout = t;
+        if (ready) {
+            continue; /* OK below: the next contexts are only checked */
         }
-        if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
-            apr_pollfd_t *pfd = apr_array_push(w->pfds);
 
+        t = request_waitctx_timeout(ctx, directions[i]);
+        ctx->timeout = t;
+        if (t >= 0 && (plan->timeout < 0 || t < plan->timeout)) {
+            plan->timeout = t;
+        }
+        if (ctx->kind == REQUEST_WAITCTX_TIMER
+            && t >= 0 && (timer_timeout < 0 || t < timer_timeout)) {
+            timer_timeout = t;
+        }
+
+        if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
+            apr_pollfd_t *pfd;
+
+            w->pfd_ctxs[w->pfds->nelts] = i;
+            pfd = apr_array_push(w->pfds);
             *pfd = ctx->pfd;
             pfd->reqevents = 0;
             if (directions[i] & AP_WAIT_IN) {
                 pfd->reqevents |= APR_POLLIN;
-                if (!ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
-                    keep = 0;
+                if (!any && !ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
+                    plan->keep = 0;
                 }
             }
             if (directions[i] & AP_WAIT_OUT) {
                 pfd->reqevents |= APR_POLLOUT;
-                if (!ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
-                    keep = 0;
+                if (!any && !ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
+                    plan->keep = 0;
                 }
             }
             pfd->rtnevents = 0;
             pfd->client_data = NULL;
-            if (delay < 0 || ctx->pub.delay < delay) {
-                delay = ctx->pub.delay;
+            if (plan->delay < 0 || ctx->pub.delay < plan->delay) {
+                plan->delay = ctx->pub.delay;
             }
-            npfds++;
         }
     }
-
-    /* Ready within the delay: no need to wait. Anything but a timeout lets
-     * the caller do its I/O as usual: readiness, an error the I/O will
-     * report, or the poll's own failure (e.g. EINTR, which must not fail
-     * the request).
-     */
-    if (npfds && delay > 0) {
-        apr_int32_t nready = 0;
-
-        rv = apr_poll((apr_pollfd_t *)w->pfds->elts, npfds, &nready, delay);
-        if (!APR_STATUS_IS_TIMEUP(rv)) {
-            for (i = 0, npfds = 0; i < nctx; i++) {
-                request_waitctx_t *ctx = ctxs[i];
-
-                if (!REQUEST_WAITCTX_HAS_PFD(ctx)) {
-                    continue;
-                }
-                if (rv == APR_SUCCESS) {
-                    apr_pollfd_t *pfd = &APR_ARRAY_IDX(w->pfds, npfds,
-                                                       apr_pollfd_t);
-                    ctx->ready = ready_directions(pfd->rtnevents,
-                                                  directions[i]);
-                }
-                else {
-                    ctx->ready = directions[i] & (AP_WAIT_IN | AP_WAIT_OUT);
-                }
-                npfds++;
-            }
-            if (rv != APR_SUCCESS) {
-                ap_log_rerror(WAITCTX_LOG_MARK(ctxs[0]),
-                              APLOG_TRACE2, rv, r,
-                              "polling the %s failed, going on",
-                              request_waitctx_kind_names[ctxs[0]->kind]);
-            }
-            return OK;
-        }
-        /* Not ready, so drained */
-        polled = 1;
+    if (ready) {
+        return OK;
     }
+    plan->timer_expires = (timer_timeout >= 0
+                           && timer_timeout == plan->timeout);
+    return AGAIN;
+}
 
-    /* A readiness the MPM saw for the last wait of a kept pfd was consumed
-     * since if the caller says so, or if the poll above found none.
-     */
-    if (npfds && keep) {
-        mpm_flags = AP_MPM_WAIT_KEEP_PFDS;
-        if ((flags & AP_REQUEST_WAIT_DRAINED) || polled) {
-            mpm_flags |= AP_MPM_WAIT_DRAINED;
+/* Poll the wait's descriptors for the delay: APR_TIMEUP if none is ready,
+ * else their contexts' readiness is set, all their directions on the poll's
+ * failure (e.g. EINTR, which must not fail the request): the caller's I/O
+ * goes on as usual and reports an error if any.
+ */
+static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
+                                         ap_request_waitctx_t *const *ctxs,
+                                         const unsigned int *directions,
+                                         apr_interval_time_t delay)
+{
+    apr_int32_t nready = 0;
+    apr_status_t rv;
+    int k;
+
+    rv = apr_poll((apr_pollfd_t *)w->pfds->elts, w->pfds->nelts, &nready,
+                  delay);
+    if (APR_STATUS_IS_TIMEUP(rv)) {
+        return rv;
+    }
+    for (k = 0; k < w->pfds->nelts; k++) {
+        int i = w->pfd_ctxs[k];
+        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+
+        if (rv == APR_SUCCESS) {
+            const apr_pollfd_t *pfd = &APR_ARRAY_IDX(w->pfds, k,
+                                                     apr_pollfd_t);
+            ctx->ready = ready_directions(pfd->rtnevents,
+                                          directions[i]);
+        }
+        else {
+            ctx->ready = directions[i] & (AP_WAIT_IN | AP_WAIT_OUT);
         }
     }
-    rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, timeout, NULL,
-                              mpm_flags, request_waitset_continuation, w);
     if (rv != APR_SUCCESS) {
-        ap_log_rerror(WAITCTX_LOG_MARK(ctxs[0]),
-                      APLOG_DEBUG, rv, r, APLOGNO()
-                      "can't wait for the %s%s asynchronously",
-                      request_waitctx_kind_names[ctxs[0]->kind],
-                      request_waitctx_dir_name(ctxs[0], directions[0]));
-        return DECLINED; /* the caller waits synchronously */
-    }
+        const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
 
-    if (w->nalloc < nctx) {
-        w->nalloc = (nctx > 2) ? nctx : 2;
-        w->ctxs = apr_palloc(r->pool, w->nalloc * sizeof(*w->ctxs));
-        w->directions = apr_palloc(r->pool,
-                                   w->nalloc * sizeof(*w->directions));
+        ap_log_rerror(WAITCTX_LOG_MARK(first),
+                      APLOG_TRACE2, rv, w->r,
+                      "polling the %s failed, going on",
+                      request_waitctx_kind_names[first->kind]);
     }
-    for (i = 0; i < nctx; i++) {
-        request_waitctx_t *ctx = ctxs[i];
+    return rv;
+}
+
+/* The MPM took the wait: the contexts wait until request_waitset_continuation(),
+ * their descriptors kept registered by the MPM if mpm_flags says so.
+ */
+static void request_waitreg_commit(struct ap_request_waitset *w,
+                                   ap_request_waitctx_t *const *ctxs, int nctxs,
+                                   const unsigned int *directions,
+                                   const request_waitreg_plan_t *plan,
+                                   unsigned int mpm_flags,
+                                   ap_request_continuation_fn *fn, void *baton)
+{
+    int i;
+
+    for (i = 0; i < nctxs; i++) {
+        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
 
         w->ctxs[i] = ctx;
         w->directions[i] = directions[i];
         ctx->waiting = 1;
+        if (ctx->notifier) {
+            ctx->used = 1;
+        }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             if (directions[i] & AP_WAIT_IN) {
                 ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits++;
@@ -1059,14 +1128,112 @@ static int request_wait(request_waitctx_t **ctxs,
             }
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                      APLOG_TRACE5, 0, r, "waiting for the %s%s (async)",
+                      APLOG_TRACE5, 0, w->r, "waiting for the %s%s (async)",
                       request_waitctx_kind_names[ctx->kind],
                       request_waitctx_dir_name(ctx, directions[i]));
     }
-    w->nctx = nctx;
-    w->timeout = timeout;
+    w->nctxs = nctxs;
+    w->timeout = plan->timeout;
+    w->timer_expires = plan->timer_expires;
     w->fn = fn;
     w->baton = baton;
+}
+
+/* The index of the notifier context among a wait's contexts whose notifier
+ * served a wait already, or -1
+ */
+static int request_wait_used_notifier(ap_request_waitctx_t *const *ctxs,
+                                      int nctxs)
+{
+    int i;
+
+    for (i = 0; i < nctxs; i++) {
+        const request_waitctx_t *ctx = (const request_waitctx_t *)ctxs[i];
+        if (ctx->notifier && ctx->used) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Wait for the targets of nctxs contexts, the first ready completing the
+ * wait (ap_request_wait(), ap_request_wait_any() if any).
+ */
+static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
+                        const unsigned int *directions,
+                        unsigned int flags,
+                        ap_request_continuation_fn *fn, void *baton,
+                        int any)
+{
+    request_rec *r = ctxs[0]->r;
+    struct ap_request_waitset *w;
+    request_waitreg_plan_t plan;
+    unsigned int mpm_flags = 0;
+    int rc, polled = 0;
+    apr_status_t rv;
+
+    if (!ap_request_can_suspend(r)) {
+        return DECLINED;
+    }
+    w = request_waitset_get(request_async_get(r));
+
+    rc = request_waitreg_prepare(w, ctxs, nctxs, directions, any, &plan);
+    if (rc != AGAIN) {
+        return rc;
+    }
+
+    /* Ready within the delay: no need to wait. Anything but a timeout lets
+     * the caller do its I/O as usual (readiness, an error the I/O will
+     * report, or the poll's own failure).
+     */
+    if (w->pfds->nelts && plan.delay > 0) {
+        rv = request_waitreg_poll(w, ctxs, directions, plan.delay);
+        if (!APR_STATUS_IS_TIMEUP(rv)) {
+            return OK;
+        }
+        /* Not ready, so drained */
+        polled = 1;
+    }
+
+    /* A readiness the MPM saw for the last wait of a kept pfd was consumed
+     * since if the caller says so, or if the poll above found none.
+     */
+    if (w->pfds->nelts && plan.keep) {
+        mpm_flags = AP_MPM_WAIT_KEEP_PFDS;
+        if ((flags & AP_REQUEST_WAIT_DRAINED) || polled) {
+            mpm_flags |= AP_MPM_WAIT_DRAINED;
+        }
+    }
+    rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, plan.timeout,
+                              plan.notifier, mpm_flags,
+                              request_waitset_continuation, w);
+    if (rv != APR_SUCCESS) {
+        const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
+        int used = request_wait_used_notifier(ctxs, nctxs);
+
+        if (APR_STATUS_IS_EBUSY(rv) && used >= 0 && !w->nctxs) {
+            /* No wait in flight: the notifier served one and wasn't
+             * re-armed, a bug of the caller (never re-armed implicitly,
+             * that would let a stale notification complete this wait)
+             */
+            ap_log_rerror(__FILE__, __LINE__, ctxs[used]->module_index,
+                          APLOG_ERR, rv, r, APLOGNO()
+                          "can't wait for the notifier: it served a wait "
+                          "already and wasn't re-armed "
+                          "(ap_mpm_notifier_rearm())");
+        }
+        else {
+            ap_log_rerror(WAITCTX_LOG_MARK(first),
+                          APLOG_DEBUG, rv, r, APLOGNO()
+                          "can't wait for the %s%s asynchronously",
+                          request_waitctx_kind_names[first->kind],
+                          request_waitctx_dir_name(first, directions[0]));
+        }
+        return DECLINED; /* the caller waits synchronously */
+    }
+
+    request_waitreg_commit(w, ctxs, nctxs, directions, &plan, mpm_flags, fn,
+                           baton);
     return SUSPENDED;
 }
 
@@ -1090,7 +1257,24 @@ AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *pub,
                         || directions == AP_WAIT_OUT);
         return DECLINED;
     }
-    return request_wait(&ctx, &directions, 1, flags, fn, baton);
+    return request_wait(&pub, 1, &directions, flags, fn, baton, 0);
+}
+
+AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
+                                    int nctxs,
+                                    const unsigned int *directions,
+                                    unsigned int flags,
+                                    ap_request_continuation_fn *fn,
+                                    void *baton)
+{
+    if (nctxs <= 0) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf, APLOGNO()
+                     "ap_request_wait_any() called with %i context(s)",
+                     nctxs);
+        AP_DEBUG_ASSERT(nctxs > 0);
+        return DECLINED;
+    }
+    return request_wait(ctxs, nctxs, directions, flags, fn, baton, 1);
 }
 
 void ap_process_async_request(request_rec *r)
