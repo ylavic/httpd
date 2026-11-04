@@ -1572,38 +1572,83 @@ static request_rec *make_fake_req(conn_rec *c, request_rec *r)
     return rp;
 }
 
+/* How process_proxy_header() rewrites a response header */
+typedef enum {
+    PROXY_HDR_ASIS = 0,
+    PROXY_HDR_DATE,         /* date_canon() */
+    PROXY_HDR_LOCATION,     /* ap_proxy_location_reverse_map() */
+    PROXY_HDR_COOKIE        /* ap_proxy_cookie_reverse_map() */
+} proxy_hdr_e;
+
+/* The rewriting of the header named key: the names rewritten have distinct
+ * lengths, so one comparison tells
+ */
+static proxy_hdr_e proxy_header_kind(const char *key)
+{
+    const char *name;
+    proxy_hdr_e kind;
+
+    switch (strlen(key)) {
+    case 3:
+        name = "URI";
+        kind = PROXY_HDR_LOCATION;
+        break;
+    case 4:
+        name = "Date";
+        kind = PROXY_HDR_DATE;
+        break;
+    case 7:
+        name = "Expires";
+        kind = PROXY_HDR_DATE;
+        break;
+    case 8:
+        name = "Location";
+        kind = PROXY_HDR_LOCATION;
+        break;
+    case 10:
+        name = "Set-Cookie";
+        kind = PROXY_HDR_COOKIE;
+        break;
+    case 11:
+        name = "Destination";
+        kind = PROXY_HDR_LOCATION;
+        break;
+    case 13:
+        name = "Last-Modified";
+        kind = PROXY_HDR_DATE;
+        break;
+    case 16:
+        name = "Content-Location";
+        kind = PROXY_HDR_LOCATION;
+        break;
+    default:
+        return PROXY_HDR_ASIS;
+    }
+    return ap_cstr_casecmp(key, name) ? PROXY_HDR_ASIS : kind;
+}
+
+/* Add a response header to r->headers_out, rewritten if need be; key and
+ * value are the parsed head's, in r->pool
+ */
 static void process_proxy_header(request_rec *r, proxy_dir_conf *c,
                                  const char *key, const char *value)
 {
-    static const char *const date_hdrs[]
-        = { "Date", "Expires", "Last-Modified", NULL };
-    static const struct {
-        const char *name;
-        ap_proxy_header_reverse_map_fn func;
-    } transform_hdrs[] = {
-        { "Location", ap_proxy_location_reverse_map },
-        { "Content-Location", ap_proxy_location_reverse_map },
-        { "URI", ap_proxy_location_reverse_map },
-        { "Destination", ap_proxy_location_reverse_map },
-        { "Set-Cookie", ap_proxy_cookie_reverse_map },
-        { NULL, NULL }
-    };
-    int i;
-    for (i = 0; date_hdrs[i]; ++i) {
-        if (!ap_cstr_casecmp(date_hdrs[i], key)) {
-            apr_table_add(r->headers_out, key,
-                          date_canon(r->pool, value));
-            return;
-        }
+    switch (proxy_header_kind(key)) {
+    case PROXY_HDR_DATE:
+        apr_table_add(r->headers_out, key, date_canon(r->pool, value));
+        break;
+    case PROXY_HDR_LOCATION:
+        apr_table_add(r->headers_out, key,
+                      ap_proxy_location_reverse_map(r, c, value));
+        break;
+    case PROXY_HDR_COOKIE:
+        apr_table_add(r->headers_out, key,
+                      ap_proxy_cookie_reverse_map(r, c, value));
+        break;
+    default:
+        apr_table_addn(r->headers_out, key, value);
+        break;
     }
-    for (i = 0; transform_hdrs[i].name; ++i) {
-        if (!ap_cstr_casecmp(transform_hdrs[i].name, key)) {
-            apr_table_add(r->headers_out, key,
-                          (*transform_hdrs[i].func)(r, c, value));
-            return;
-       }
-    }
-    apr_table_add(r->headers_out, key, value);
 }
 
 /* Add the headers of a response head to r->headers_out, through
