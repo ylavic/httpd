@@ -339,10 +339,49 @@ void ap_process_async_request(request_rec *r);
  * ap_process_request_after_handler()), then give the connection back to the
  * MPM (ap_mpm_resume_suspended()).
  * @param r The suspended request
- * @param status The handler's final status (OK, DONE or an HTTP error)
- * @remark Don't dereference r afterwards.
+ * @param status The handler's final status (OK, DONE, AP_FILTER_ERROR or an
+ *        HTTP error)
+ * @remark Call it once per request, and only after the handler returned
+ *         SUSPENDED: from the continuation of the request's last wait,
+ *         never from the code path that returns to the handler. Don't
+ *         dereference r afterwards.
+ * @remark The next handlers don't run, unlike with
+ *         ap_request_resume_suspended() and DECLINED.
  */
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
+
+/**
+ * Continue a request suspended by one of its handlers (it returned
+ * SUSPENDED), as if that handler had returned @a status: with DECLINED the
+ * next handlers run, otherwise the handlers are done with status; then the
+ * request ends (ap_die() for an error, its end, write completion) and its
+ * connection goes back to the MPM, unless a handler suspends it again.
+ * @param r The suspended request
+ * @param status The suspended handler's result: OK, DONE, DECLINED,
+ *        AP_FILTER_ERROR (a filter answered already, e.g. a failed pass of
+ *        the handler's own response) or an HTTP status
+ * @param module_index The module whose log level the log lines follow (a
+ *        refused resume, SUSPENDED given as status)
+ * @remark Call it exactly once per suspension, and only after the handler
+ *         returned SUSPENDED: from the continuation of the request's last
+ *         wait (ap_request_continuation_fn), never from the code path that
+ *         returns to the handler (a request not suspended is refused, with
+ *         an error logged). Don't dereference r afterwards.
+ * @remark The next handlers may run on another thread than the first ones,
+ *         as continuations do.
+ * @remark This resumes a *request* (its handlers), unlike
+ *         ap_mpm_resume_suspended() which gives a suspended *connection* back
+ *         to the MPM (called by this function once the request is done).
+ *         ap_request_finish_suspended() ends the request with status at
+ *         once, the next handlers not run.
+ */
+AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
+                                              int module_index);
+
+/** ap_request_resume_suspended_() for the calling module
+ *  (APLOG_MODULE_INDEX) */
+#define ap_request_resume_suspended(r, status) \
+    ap_request_resume_suspended_(r, status, APLOG_MODULE_INDEX)
 
 /**
  * Whether the request can be suspended now, i.e. a module can wait

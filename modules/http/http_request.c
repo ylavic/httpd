@@ -1487,6 +1487,63 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
     async_request_end(r, async, status, 0);
 }
 
+AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
+                                              int module_index)
+{
+    ap_request_async_t *async = request_async_get(r);
+    int entered = 0;
+
+    if (status == SUSPENDED) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "request resumed with SUSPENDED as its "
+                      "handler's status");
+        status = HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (!async) {
+        /* Not processed by ap_process_async_request(), no handler chain to
+         * continue: the handlers are done
+         */
+        ap_request_finish_suspended(r, (status == DECLINED)
+                                       ? HTTP_INTERNAL_SERVER_ERROR
+                                       : status);
+        return;
+    }
+
+    /* Once per suspension, after the handlers returned SUSPENDED */
+    if (!async->suspended) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "request resumed while not suspended "
+                      "(resumed already, or before its handler returned "
+                      "SUSPENDED): ignored");
+        AP_DEBUG_ASSERT(async->suspended);
+        return;
+    }
+    async->suspended = 0;
+
+    /* Called from the continuation of the request's wait (already entered),
+     * or from the continuation of a module's own MPM wait
+     * (ap_mpm_register_wait())
+     */
+    if (!async->running) {
+        async_request_enter(r, async);
+        entered = 1;
+    }
+
+    status = ap_invoke_handler_resume(r, status);
+    if (status == SUSPENDED) {
+        /* Suspended again by the next handlers: the run that entered leaves
+         * (the continuation of the request's wait, or this one)
+         */
+        if (entered) {
+            async_request_leave(r, async, 0);
+        }
+        return;
+    }
+
+    async_request_end(r, async, status, 0);
+}
+
 AP_DECLARE(void) ap_process_request(request_rec *r)
 {
     apr_bucket_brigade *bb;

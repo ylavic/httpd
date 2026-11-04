@@ -423,8 +423,8 @@ typedef struct {
     int *ended;
     /** A thread runs the request (its first run, or a continuation) */
     unsigned int running :1;
-    /** Its handlers suspended it (a run returned SUSPENDED), until it
-     * ends */
+    /** Its handlers suspended it (a run returned SUSPENDED), until it's
+     * resumed or ends */
     unsigned int suspended :1;
 } ap_request_async_t;
 

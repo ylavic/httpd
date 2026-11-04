@@ -785,6 +785,8 @@
  *                         ->workers_live to scoreboard.h;
  *                         AP_SHUTDOWN_CONN_* to http_connection.h;
  *                         ap_request_finish_suspended(),
+ *                         ap_request_resume_suspended_() (and its macro
+ *                         without the trailing "_"),
  *                         ap_request_can_suspend(), ap_wait_direction_e,
  *                         AP_REQUEST_WAIT_DRAINED,
  *                         AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT,
@@ -824,7 +826,8 @@
  *                         to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h;
  *                         AP_IMPLEMENT_HOOK_RUN_FIRST_FROM to ap_hooks.h;
- *                         ap_run_handler_from() to http_config.h; and
+ *                         ap_run_handler_from() and
+ *                         ap_invoke_handler_resume() to http_config.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
  *                         ap_request_async_t (with its waits, handler_pos,
  *                         handler, old_handler, ended, running and

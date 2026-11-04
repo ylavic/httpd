@@ -386,8 +386,8 @@ static int invoke_filter_init(request_rec *r, ap_filter_t *filters)
     return OK;
 }
 
-/* The end of the handler chain run by ap_invoke_handler(): restore
- * r->handler, check the result
+/* The end of the handler chain run by ap_invoke_handler(), or continued by
+ * ap_invoke_handler_resume(): restore r->handler, check the result
  */
 static int invoke_handler_epilogue(request_rec *r, const char *old_handler,
                                    int result)
@@ -499,6 +499,39 @@ AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
     }
 
     return invoke_handler_epilogue(r, old_handler, result);
+}
+
+AP_CORE_DECLARE(int) ap_invoke_handler_resume(request_rec *r, int status)
+{
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = (req_cfg) ? req_cfg->async : NULL;
+    const char *old_handler;
+    int pos;
+
+    if (!async || !async->handler) {
+        /* No handler chain suspended to continue: the handlers are done */
+        return invoke_handler_epilogue(r, r->handler, status);
+    }
+    old_handler = async->old_handler;
+
+    if (status == DECLINED) {
+        /* The next handlers, after the one that suspended the chain, with
+         * the handler chosen for it
+         */
+        r->handler = async->handler;
+        async->phase = AP_REQUEST_PHASE_HANDLER;
+        pos = async->handler_pos + 1;
+        status = ap_run_handler_from(r, &pos);
+        if (status == SUSPENDED) {
+            async->handler_pos = pos;
+        }
+    }
+    if (status != SUSPENDED) {
+        async->phase = AP_REQUEST_PHASE_NONE;
+        async->handler = NULL;
+    }
+
+    return invoke_handler_epilogue(r, old_handler, status);
 }
 
 AP_DECLARE(int) ap_method_is_limited(cmd_parms *cmd, const char *method)

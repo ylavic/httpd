@@ -1264,6 +1264,18 @@ AP_DECLARE(void *) ap_retained_data_get(const char *key);
  */
 AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r);
 
+/**
+ * Continue the handler phase of a request whose handler chain suspended
+ * (ap_invoke_handler() returned SUSPENDED), as if the handler that suspended
+ * it had returned status: with DECLINED the next handlers run, otherwise the
+ * handlers are done with status
+ * @param r The suspended request
+ * @param status The status of the handler that suspended the request
+ * @return The status of the request, as ap_invoke_handler()'s
+ * @remark For ap_request_resume_suspended()
+ */
+AP_CORE_DECLARE(int) ap_invoke_handler_resume(request_rec *r, int status);
+
 /* for mod_perl */
 
 /**
