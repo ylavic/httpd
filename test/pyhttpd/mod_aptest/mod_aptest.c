@@ -16,6 +16,7 @@
 
 #include <apr_optional.h>
 #include <apr_optional_hooks.h>
+#include <apr_lib.h>
 #include <apr_strings.h>
 #include <apr_cstr.h>
 #include <apr_md5.h>
@@ -29,11 +30,28 @@
 #include <http_log.h>
 #include <ap_mpm.h>
 
-/* The per-directory configuration: AptestWait (see "aptest-wait") */
+/* ap_request_resume_suspended() came with AP_IMPLEMENT_HOOK_RUN_FIRST_FROM */
+#ifdef AP_IMPLEMENT_HOOK_RUN_FIRST_FROM
+#define APTEST_HAS_RESUME 1
+#endif
+
+/* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
+typedef struct {
+    int set;
+    apr_interval_time_t timer;  /* the wait */
+    int result;                 /* the handler's result after it (a status),
+                                 * or APTEST_SUSPEND_OK / _FILTER_ERROR */
+    unsigned int flags;         /* APTEST_SUSPEND_* */
+} aptest_suspend_conf;
+
+/* The per-directory configuration: AptestWait (see "aptest-wait"),
+ * AptestSuspend and AptestSuspend2
+ */
 typedef struct {
     int wait_mode;                  /* APTEST_WAIT_* */
     apr_interval_time_t wait_timer; /* for "timer" */
     int wait_count;                 /* for "pfdpool" */
+    aptest_suspend_conf suspend[2]; /* AptestSuspend, AptestSuspend2 */
 } aptest_dir_conf;
 
 /* AptestWait's modes */
@@ -53,8 +71,22 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
 {
     aptest_dir_conf *base = basev, *add = addv;
     aptest_dir_conf *conf = apr_palloc(p, sizeof(*conf));
+    int i;
 
-    *conf = (add->wait_mode != APTEST_WAIT_UNSET) ? *add : *base;
+    if (add->wait_mode != APTEST_WAIT_UNSET) {
+        conf->wait_mode = add->wait_mode;
+        conf->wait_timer = add->wait_timer;
+        conf->wait_count = add->wait_count;
+    }
+    else {
+        conf->wait_mode = base->wait_mode;
+        conf->wait_timer = base->wait_timer;
+        conf->wait_count = base->wait_count;
+    }
+    for (i = 0; i < 2; i++) {
+        conf->suspend[i] = (add->suspend[i].set) ? add->suspend[i]
+                                                 : base->suspend[i];
+    }
     return conf;
 }
 
@@ -95,10 +127,82 @@ static const char *aptest_set_wait(cmd_parms *cmd, void *dconf,
     return NULL;
 }
 
+#ifdef APTEST_HAS_RESUME
+/* AptestSuspend's results besides a status */
+#define APTEST_SUSPEND_OK           (-1000) /* a small body, then OK */
+#define APTEST_SUSPEND_FILTER_ERROR (-1001) /* an error answered by the
+                                             * output filters, then
+                                             * AP_FILTER_ERROR */
+
+/* AptestSuspend's options */
+#define APTEST_SUSPEND_TWICE (1u << 0) /* resume once more, too early */
+
+static const char *aptest_set_suspend(cmd_parms *cmd, void *dconf,
+                                      int argc, char *const argv[])
+{
+    aptest_dir_conf *conf = dconf;
+    aptest_suspend_conf *sc;
+    apr_int64_t n;
+    int i;
+
+    sc = &conf->suspend[(cmd->info != NULL) ? 1 : 0];
+    if (argc < 2) {
+        return apr_pstrcat(cmd->pool, cmd->cmd->name, " <ms> "
+                           "declined|ok|filter-error|<status> [twice]",
+                           NULL);
+    }
+    n = apr_atoi64(argv[0]);
+    if (n < 0 || !apr_isdigit(*argv[0])) {
+        return apr_pstrcat(cmd->pool, cmd->cmd->name, " needs a number of "
+                           "milliseconds", NULL);
+    }
+    sc->timer = apr_time_from_msec(n);
+
+    if (strcmp(argv[1], "declined") == 0) {
+        sc->result = DECLINED;
+    }
+    else if (strcmp(argv[1], "ok") == 0) {
+        sc->result = APTEST_SUSPEND_OK;
+    }
+    else if (strcmp(argv[1], "filter-error") == 0) {
+        sc->result = APTEST_SUSPEND_FILTER_ERROR;
+    }
+    else {
+        n = apr_atoi64(argv[1]);
+        if (!apr_isdigit(*argv[1]) || !ap_is_HTTP_VALID_RESPONSE((int)n)) {
+            return apr_pstrcat(cmd->pool, cmd->cmd->name, ": unknown "
+                               "result ", argv[1], NULL);
+        }
+        sc->result = (int)n;
+    }
+
+    sc->flags = 0;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "twice") == 0) {
+            sc->flags |= APTEST_SUSPEND_TWICE;
+        }
+        else {
+            return apr_pstrcat(cmd->pool, cmd->cmd->name, ": unknown "
+                               "option ", argv[i], NULL);
+        }
+    }
+    sc->set = 1;
+    return NULL;
+}
+#endif /* APTEST_HAS_RESUME */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
                    "digest, notifier or pfdpool <n>"),
+#ifdef APTEST_HAS_RESUME
+    AP_INIT_TAKE_ARGV("AptestSuspend", aptest_set_suspend, NULL, OR_ALL,
+                      "the first suspending handler: <ms> "
+                      "declined|ok|filter-error|<status> [twice]"),
+    AP_INIT_TAKE_ARGV("AptestSuspend2", aptest_set_suspend, "2", OR_ALL,
+                      "the second suspending handler: <ms> "
+                      "declined|ok|filter-error|<status> [twice]"),
+#endif
     {NULL}
 };
 
@@ -959,6 +1063,135 @@ static int aptest_wait(request_rec *r)
 }
 #endif /* AP_REQUEST_WAIT_DRAINED */
 
+#ifdef APTEST_HAS_RESUME
+/*
+ * The suspending handlers: two handler functions, at APR_HOOK_REALLY_FIRST
+ * and APR_HOOK_FIRST (before mod_proxy's), acting on any request whose
+ * location configures them, whatever its handler: "AptestSuspend <ms>
+ * <result>" for the first one, AptestSuspend2 for the second. Each waits for
+ * ms on a timer context without holding a thread, then resumes the request
+ * (ap_request_resume_suspended()) with the result:
+ *  - "declined": the next handlers run (e.g. the second one, mod_proxy's,
+ *    or the default handler);
+ *  - "ok": a small body ("aptest-suspend<1|2>: ok"), then OK;
+ *  - "filter-error": an error bucket for a 413 down the output filters
+ *    (which answer it), then AP_FILTER_ERROR;
+ *  - a status, e.g. 403 (an ErrorDocument applies).
+ * The option "twice" resumes once more before the handler returns SUSPENDED,
+ * which the core refuses (logged; debug builds assert). A request that
+ * can't suspend (ap_request_can_suspend(), e.g. AsyncRequests Off or a
+ * subrequest) sleeps for ms holding the thread, then returns the result as
+ * a synchronous module would. The response header "AP-Test-Suspend<1|2>"
+ * says "async" or "sync" for each handler that acted.
+ */
+typedef struct {
+    request_rec *r;
+    const aptest_suspend_conf *sc;
+    int which;  /* 1 or 2 */
+} aptest_suspend_t;
+
+/* The handler's result once done waiting */
+static int aptest_suspend_result(aptest_suspend_t *s)
+{
+    request_rec *r = s->r;
+    conn_rec *c = r->connection;
+    apr_bucket_brigade *bb;
+    apr_bucket *e;
+
+    switch (s->sc->result) {
+    case APTEST_SUSPEND_OK:
+        ap_set_content_type(r, "text/plain");
+        ap_rprintf(r, "aptest-suspend%d: ok\n", s->which);
+        return OK;
+
+    case APTEST_SUSPEND_FILTER_ERROR:
+        /* As HTTP_IN does on httpd 2.4 for a body over LimitRequestBody:
+         * the header filter answers the error bucket (ap_die())
+         */
+        bb = apr_brigade_create(r->pool, c->bucket_alloc);
+        e = ap_bucket_error_create(HTTP_REQUEST_ENTITY_TOO_LARGE, NULL,
+                                   r->pool, c->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(bb, e);
+        APR_BRIGADE_INSERT_TAIL(bb, apr_bucket_eos_create(c->bucket_alloc));
+        (void)ap_pass_brigade(r->output_filters, bb);
+        apr_brigade_cleanup(bb);
+        return AP_FILTER_ERROR;
+
+    default:
+        return s->sc->result;
+    }
+}
+
+static void aptest_suspend_continuation(request_rec *r, apr_status_t status,
+                                        void *baton)
+{
+    aptest_suspend_t *s = baton;
+    int rc;
+
+    if (status == APR_SUCCESS) {
+        rc = aptest_suspend_result(s);
+    }
+    else {
+        /* The MPM failed to wait (a timer's wait doesn't time out) */
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, APLOGNO()
+                      "aptest-suspend%d: waiting interrupted (async)",
+                      s->which);
+        rc = HTTP_SERVICE_UNAVAILABLE;
+    }
+    ap_request_resume_suspended(r, rc);
+}
+
+static int aptest_suspend_handler(request_rec *r, int which)
+{
+    const aptest_dir_conf *conf;
+    aptest_suspend_t *s;
+    ap_request_waitctx_t *ctx;
+    int rc;
+
+    conf = ap_get_module_config(r->per_dir_config, &aptest_module);
+    if (!conf || !conf->suspend[which - 1].set) {
+        return DECLINED;
+    }
+    s = apr_pcalloc(r->pool, sizeof(*s));
+    s->r = r;
+    s->sc = &conf->suspend[which - 1];
+    s->which = which;
+
+    if (ap_request_can_suspend(r)) {
+        ctx = ap_request_waitctx_timer(r, r->pool);
+        ctx->timeout = s->sc->timer;
+        rc = ap_request_wait(ctx, AP_WAIT_IN, 0, aptest_suspend_continuation,
+                             s);
+        if (rc == SUSPENDED) {
+            apr_table_setn(r->err_headers_out,
+                           which == 1 ? "AP-Test-Suspend1"
+                                      : "AP-Test-Suspend2",
+                           "async");
+            if (s->sc->flags & APTEST_SUSPEND_TWICE) {
+                /* Too early: refused by the core */
+                ap_request_resume_suspended(r, DECLINED);
+            }
+            return SUSPENDED;
+        }
+    }
+    apr_table_setn(r->err_headers_out,
+                   which == 1 ? "AP-Test-Suspend1" : "AP-Test-Suspend2",
+                   "sync");
+    apr_sleep(s->sc->timer);
+    return aptest_suspend_result(s);
+}
+
+static int aptest_suspend1(request_rec *r)
+{
+    return aptest_suspend_handler(r, 1);
+}
+
+static int aptest_suspend2(request_rec *r)
+{
+    return aptest_suspend_handler(r, 2);
+}
+#endif /* APTEST_HAS_RESUME */
+
 /* Install this module into the apache2 infrastructure.
  */
 static void aptest_hooks(apr_pool_t *pool)
@@ -974,6 +1207,13 @@ static void aptest_hooks(apr_pool_t *pool)
     ap_hook_handler(aptest_queue, NULL, NULL, APR_HOOK_MIDDLE);
 #ifdef AP_REQUEST_WAIT_DRAINED
     ap_hook_handler(aptest_wait, NULL, NULL, APR_HOOK_MIDDLE);
+#endif
+#ifdef APTEST_HAS_RESUME
+    {
+        static const char *const before_proxy[] = { "mod_proxy.c", NULL };
+        ap_hook_handler(aptest_suspend1, NULL, NULL, APR_HOOK_REALLY_FIRST);
+        ap_hook_handler(aptest_suspend2, NULL, before_proxy, APR_HOOK_FIRST);
+    }
 #endif
 
 }
