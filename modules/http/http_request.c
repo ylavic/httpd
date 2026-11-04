@@ -461,6 +461,109 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
 }
 
 /*
+ * The runs of a top-level request: the first one (ap_process_async_request()),
+ * then once suspended one per continuation of its waits, each entered with
+ * async_request_enter() and left with async_request_leave() if the request
+ * suspends again, or ended with async_request_end(). A run is probed
+ * (PROCESS_REQUEST ENTRY and RETURN), timed on the worker running it
+ * (ExtendedStatus) and holds r->invoke_mtx.
+ */
+
+/* async_request_end() flags */
+#define ASYNC_REQUEST_END_FIRST  (1u << 0) /* in the first run, which gives
+                                            * the connection back to the MPM
+                                            * by returning */
+#define ASYNC_REQUEST_END_NOLOCK (1u << 1) /* not entered (r->invoke_mtx not
+                                            * held) */
+
+static void async_request_enter(request_rec *r, ap_request_async_t *async)
+{
+    AP_PROCESS_REQUEST_ENTRY((uintptr_t)r, r->uri);
+    if (ap_extended_status) {
+        ap_time_process_request(r->connection->sbh, START_PREQUEST);
+    }
+#if APR_HAS_THREADS
+    if (!r->invoke_mtx) {
+        apr_thread_mutex_create(&r->invoke_mtx, APR_THREAD_MUTEX_DEFAULT,
+                                r->pool);
+    }
+    apr_thread_mutex_lock(r->invoke_mtx);
+#endif
+    if (async) {
+        async->running = 1;
+    }
+}
+
+/* Leave a run after which the request is suspended (its handlers returned
+ * SUSPENDED, or a continuation waits again).
+ */
+static void async_request_leave(request_rec *r, ap_request_async_t *async,
+                                int first)
+{
+    conn_rec *c = r->connection;
+
+    if (async) {
+        async->running = 0;
+        async->suspended = 1;
+        async->ended = NULL;
+    }
+    AP_PROCESS_REQUEST_RETURN((uintptr_t)r, r->uri, SUSPENDED);
+    if (ap_extended_status) {
+        ap_time_process_request(c->sbh, STOP_PREQUEST);
+    }
+    if (first && c->cs) {
+        c->cs->state = CONN_STATE_SUSPENDED;
+    }
+#if APR_HAS_THREADS
+    apr_thread_mutex_unlock(r->invoke_mtx);
+#endif
+}
+
+/* End the request, its handlers done with status: answer an error if any
+ * (ap_die()), then end the request (its EOR bucket frees it, its
+ * PROCESS_REQUEST RETURN probe and the end of the run's timing), then give
+ * the connection back to the MPM unless in the first run.
+ */
+static void async_request_end(request_rec *r, ap_request_async_t *async,
+                              int status, unsigned int flags)
+{
+    conn_rec *c = r->connection;
+
+    if (async) {
+        async->phase = AP_REQUEST_PHASE_DONE;
+        async->running = 0;
+        async->suspended = 0;
+        if (async->ended) {
+            *async->ended = 1;
+            async->ended = NULL;
+        }
+    }
+#if APR_HAS_THREADS
+    if (!(flags & ASYNC_REQUEST_END_NOLOCK)) {
+        apr_thread_mutex_unlock(r->invoke_mtx);
+    }
+#endif
+
+    /* As if the handler had returned this status in the first run: an
+     * error is not a recursive one.
+     */
+    ap_die_r(status, r, HTTP_OK);
+
+    ap_process_request_after_handler(r);
+    /* don't dereference r from here! */
+
+    if (!(flags & ASYNC_REQUEST_END_FIRST)) {
+        if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
+            c->cs->state = CONN_STATE_LINGER;
+        }
+        else {
+            c->cs->state = CONN_STATE_WRITE_COMPLETION;
+        }
+        ap_mpm_resume_suspended(c);
+    }
+}
+
+/*
  * Requests' waits (ap_request_wait()): a wait context per target, the state
  * of the request's waits in its ap_request_async_t.
  */
@@ -853,12 +956,15 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 {
     struct ap_request_waitset *w = baton;
     request_rec *r = w->r;
+    ap_request_async_t *async = request_async_get(r);
     ap_request_continuation_fn *fn = w->fn;
     void *fn_baton = w->baton;
     apr_status_t rv;
-    int i, k;
+    int i, k, ended = 0;
 
     AP_DEBUG_ASSERT(mpm_r == r);
+    AP_DEBUG_ASSERT(async != NULL && !async->running);
+    async_request_enter(r, async);
     switch (why) {
     case AP_MPM_WAIT_READY:
         rv = APR_SUCCESS;
@@ -927,7 +1033,16 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     }
     w->nctxs = 0;
 
+    /* fn ends the request (r can't be touched afterwards), or it's suspended
+     * again (fn waits again), or abandoned (the MPM closes the connection).
+     */
+    if (async) {
+        async->ended = &ended;
+    }
     fn(r, rv, fn_baton);
+    if (!ended) {
+        async_request_leave(r, async, 0);
+    }
 }
 
 /* What request_waitreg_prepare() found for a wait */
@@ -1284,17 +1399,35 @@ AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
 
 void ap_process_async_request(request_rec *r)
 {
-    conn_rec *c = r->connection;
     core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = NULL;
     int access_status;
 
     /* The state of the request's asynchronous processing, in no phase that
      * can suspend until the handlers run (ap_invoke_handler())
      */
     if (req_cfg && !r->main && !r->prev) {
-        req_cfg->async = apr_pcalloc(r->pool, sizeof(*req_cfg->async));
-        req_cfg->async->r = r;
-        req_cfg->async->phase = AP_REQUEST_PHASE_NONE;
+        async = apr_pcalloc(r->pool, sizeof(*async));
+        async->r = r;
+        async->phase = AP_REQUEST_PHASE_NONE;
+        req_cfg->async = async;
+    }
+
+    /* The first run of the request, until it ends or suspends */
+    async_request_enter(r, async);
+
+    if (APLOGrtrace4(r)) {
+        int i;
+        const apr_array_header_t *t_h = apr_table_elts(r->headers_in);
+        const apr_table_entry_t *t_elt = (apr_table_entry_t *)t_h->elts;
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "Header received from client:");
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "  %s", r->the_request);
+        for (i = 0; i < t_h->nelts; i++, t_elt++) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "  %s: %s",
+                          ap_escape_logitem(r->pool, t_elt->key),
+                          ap_escape_logitem(r->pool, t_elt->val));
+        }
     }
 
     /* Give quick handlers a shot at serving the request on the fast
@@ -1311,29 +1444,6 @@ void ap_process_async_request(request_rec *r)
      * Use this hook with extreme care and only if you know what you are
      * doing.
      */
-    AP_PROCESS_REQUEST_ENTRY((uintptr_t)r, r->uri);
-    if (ap_extended_status) {
-        ap_time_process_request(r->connection->sbh, START_PREQUEST);
-    }
-
-    if (APLOGrtrace4(r)) {
-        int i;
-        const apr_array_header_t *t_h = apr_table_elts(r->headers_in);
-        const apr_table_entry_t *t_elt = (apr_table_entry_t *)t_h->elts;
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
-                      "Header received from client:");
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "  %s", r->the_request);
-        for (i = 0; i < t_h->nelts; i++, t_elt++) {
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r, "  %s: %s",
-                          ap_escape_logitem(r->pool, t_elt->key),
-                          ap_escape_logitem(r->pool, t_elt->val));
-        }
-    }
-
-#if APR_HAS_THREADS
-    apr_thread_mutex_create(&r->invoke_mtx, APR_THREAD_MUTEX_DEFAULT, r->pool);
-    apr_thread_mutex_lock(r->invoke_mtx);
-#endif
     access_status = ap_run_quick_handler(r, 0);  /* Not a look-up request */
     if (access_status == DECLINED) {
         access_status = ap_process_request_internal(r);
@@ -1343,59 +1453,38 @@ void ap_process_async_request(request_rec *r)
     }
 
     if (access_status == SUSPENDED) {
-        /* TODO: Should move these steps into a generic function, so modules
-         * working on a suspended request can also call _ENTRY again.
-         */
-        AP_PROCESS_REQUEST_RETURN((uintptr_t)r, r->uri, access_status);
-        if (ap_extended_status) {
-            ap_time_process_request(c->sbh, STOP_PREQUEST);
-        }
-        if (c->cs)
-            c->cs->state = CONN_STATE_SUSPENDED;
-#if APR_HAS_THREADS
-        apr_thread_mutex_unlock(r->invoke_mtx);
-#endif
+        /* The continuation of its wait goes on with it */
+        async_request_leave(r, async, 1);
         return;
     }
-#if APR_HAS_THREADS
-    apr_thread_mutex_unlock(r->invoke_mtx);
-#endif
 
-    ap_die_r(access_status, r, HTTP_OK);
-
-    ap_process_request_after_handler(r);
+    async_request_end(r, async, access_status, ASYNC_REQUEST_END_FIRST);
 }
 
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
 {
-    conn_rec *c = r->connection;
     ap_request_async_t *async = request_async_get(r);
 
-    if (async) {
-        async->phase = AP_REQUEST_PHASE_DONE;
+    if (!async) {
+        /* Not processed by ap_process_async_request() (no run to enter):
+         * this run on a worker is timed as one, stopped by the end of the
+         * request
+         */
+        if (ap_extended_status) {
+            ap_time_process_request(r->connection->sbh, START_PREQUEST);
+        }
+        async_request_end(r, NULL, status, ASYNC_REQUEST_END_NOLOCK);
+        return;
     }
 
-    /* This run on a worker is timed as one, stopped by
-     * ap_process_request_after_handler() (its STOP_PREQUEST)
+    /* Called from the continuation of the request's wait (already entered),
+     * or from the continuation of a module's own MPM wait
+     * (ap_mpm_register_wait())
      */
-    if (ap_extended_status) {
-        ap_time_process_request(c->sbh, START_PREQUEST);
+    if (!async->running) {
+        async_request_enter(r, async);
     }
-
-    /* As ap_process_async_request() would have if the handler had returned
-     * this status: an error is not a recursive one.
-     */
-    ap_die_r(status, r, HTTP_OK);
-    ap_process_request_after_handler(r);
-    /* don't dereference r from here! */
-
-    if (c->keepalive == AP_CONN_CLOSE || c->aborted) {
-        c->cs->state = CONN_STATE_LINGER;
-    }
-    else {
-        c->cs->state = CONN_STATE_WRITE_COMPLETION;
-    }
-    ap_mpm_resume_suspended(c);
+    async_request_end(r, async, status, 0);
 }
 
 AP_DECLARE(void) ap_process_request(request_rec *r)

@@ -410,6 +410,15 @@ typedef struct {
     ap_request_phase_e phase;
     /** The state of its waits (ap_request_wait()), on first use */
     struct ap_request_waitset *waitset;
+    /** Set by the end of the request for the run in progress, if any (a
+     * flag of the thread running it, which can't touch the request once
+     * ended) */
+    int *ended;
+    /** A thread runs the request (its first run, or a continuation) */
+    unsigned int running :1;
+    /** Its handlers suspended it (a run returned SUSPENDED), until it
+     * ends */
+    unsigned int suspended :1;
 } ap_request_async_t;
 
 /**
