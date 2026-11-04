@@ -315,7 +315,8 @@ typedef struct {
     const char *upgrade;
     proxy_tunnel_rec *tunnel;
 
-    apr_pool_t *async_pool;
+    ap_request_waitctx_t *connect_wait; /* of the connect in progress */
+    apr_pool_t *connect_pool;            /* its pool, cleared per attempt */
     apr_interval_time_t idle_timeout;
 
     /* The response body's streaming state (proxy_http_response_body()) */
@@ -444,52 +445,12 @@ static void proxy_http_async_finish(proxy_http_req_t *req, int status)
         ap_proxy_release_connection(req->proto, req->backend, r->server);
         req->backend = NULL;
     }
-    if (req->async_pool) {
-        apr_pool_destroy(req->async_pool);
-        req->async_pool = NULL;
-    }
-
     ap_proxy_handler_done(r, status);
 }
 
 static int proxy_http_response_read_heads(proxy_http_req_t *req,
                                           int nonblocking);
 static int proxy_http_response_suspend(proxy_http_req_t *req);
-
-/* Poll sock synchronously for up to ProxyAsyncDelay (when > 0) before waiting
- * in the MPM. This is called after a nonblocking read (or write) said it would
- * block, so there is nothing left to read in the filters. Returns non-zero if
- * the caller goes on without waiting: sock becomes ready within the delay,
- * has an error that the next read or write will report, or the poll itself
- * fails (e.g. EINTR, which must not fail the request), anything but a
- * timeout.
- */
-static int proxy_http_ready_within_delay(proxy_http_req_t *req,
-                                         apr_socket_t *sock,
-                                         apr_int16_t events)
-{
-    apr_pollfd_t pfd;
-    apr_int32_t nready = 0;
-    apr_status_t rv;
-
-    if (req->dconf->async_delay <= 0) {
-        return 0;
-    }
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.p = req->r->pool;
-    pfd.desc_type = APR_POLL_SOCKET;
-    pfd.desc.s = sock;
-    pfd.reqevents = events;
-    rv = apr_poll(&pfd, 1, &nready, req->dconf->async_delay);
-    if (APR_STATUS_IS_TIMEUP(rv)) {
-        return 0;
-    }
-    if (rv != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, rv, req->r,
-                      "proxy %s: polling failed, going on", req->proto);
-    }
-    return 1;
-}
 
 /* The continuation of proxy_http_response_head_wait(), called when the
  * backend's response is available (or on timeout or error): read its head,
@@ -2775,39 +2736,47 @@ static void proxy_http_continuation_finish(proxy_http_req_t *req, int status)
     proxy_http_async_finish(req, status);
 }
 
+/* Release the wait context of the connect in progress, if any, then clear
+ * the pool it was made from: released first, since destroying the context of
+ * a wait in flight is a bug for the core.
+ */
+static void proxy_http_connect_wait_release(proxy_http_req_t *req)
+{
+    if (req->connect_wait) {
+        ap_request_waitctx_release(req->connect_wait);
+        req->connect_wait = NULL;
+    }
+    if (req->connect_pool) {
+        apr_pool_clear(req->connect_pool);
+    }
+}
+
 /* The continuation of proxy_http_connect(), called when the connect in
  * progress completes (or on timeout or error): go on with the steps from
  * there.
  */
-static void proxy_http_connect_continuation(conn_rec *c, request_rec *r,
-                                            ap_mpm_wait_result_e why,
-                                            const apr_array_header_t *pfds,
+static void proxy_http_connect_continuation(request_rec *r, apr_status_t rv,
                                             void *baton)
 {
     proxy_http_req_t *req = baton;
     int status;
 
     AP_DEBUG_ASSERT(req->r == r);
-    switch (why) {
-    case AP_MPM_WAIT_READY:
-        req->connect.status = APR_SUCCESS;
-        break;
-    case AP_MPM_WAIT_TIMEOUT:
-        /* Fail this address: the next one is tried */
-        req->connect.status = APR_TIMEUP;
-        break;
-    default:
+    if (rv != APR_SUCCESS && !APR_STATUS_IS_TIMEUP(rv)) {
         ap_proxy_connect_backend_cancel(&req->connect);
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+        proxy_http_connect_wait_release(req);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "proxy %s: can't wait for the connection to %s:%d "
-                      "(async, %i)", req->proto,
-                      req->backend->hostname, req->backend->port, (int)why);
+                      "(async)", req->proto,
+                      req->backend->hostname, req->backend->port);
         status = HTTP_SERVICE_UNAVAILABLE;
         goto finish;
     }
+    /* A timeout fails this address: the next one is tried */
+    req->connect.status = rv;
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                   "proxy %s: connect %s (async)", req->proto,
-                  why == AP_MPM_WAIT_READY ? "ready" : "timeout");
+                  rv == APR_SUCCESS ? "ready" : "timeout");
 
     req->connecting = 1;
     status = proxy_http_process(req);
@@ -2822,16 +2791,20 @@ finish:
 /* Connect to the backend, without blocking when waiting asynchronously is
  * possible (ProxyAsyncDelay). Each connect in progress is polled first (for up
  * to ProxyAsyncDelay the first time, then without waiting, so that a connect
- * which has completed already doesn't suspend), then waited for in the MPM
- * with the connect timeout (proxy_http_connect_continuation() continues then).
+ * which has completed already doesn't suspend), then waited for with
+ * ap_request_wait() and the connect timeout, on a descriptor context of its
+ * socket made for each wait: never kept in the MPM, since the connect closes
+ * the socket of an address that fails before trying the next one
+ * (proxy_http_connect_continuation() continues then). The contexts are made
+ * from a subpool of the request (created at the first wait), cleared at each
+ * next attempt once the previous context is released.
  * Returns OK, SUSPENDED or DECLINED.
  */
 static int proxy_http_connect(proxy_http_req_t *req)
 {
     request_rec *r = req->r;
     proxy_conn_rec *backend = req->backend;
-    apr_array_header_t *pfds;
-    apr_pollfd_t pfd, *ppfd;
+    apr_pollfd_t pfd;
     apr_interval_time_t delay = 0;
     apr_int32_t nready;
     apr_status_t rv;
@@ -2846,6 +2819,8 @@ static int proxy_http_connect(proxy_http_req_t *req)
         delay = req->dconf->async_delay;
     }
     req->connecting = 0;
+
+    proxy_http_connect_wait_release(req);
 
     for (;;) {
         status = ap_proxy_connect_backend_ex(req->proto, backend, req->worker,
@@ -2878,27 +2853,26 @@ static int proxy_http_connect(proxy_http_req_t *req)
         delay = 0;
     }
 
-    if (req->async_pool) {
-        apr_pool_clear(req->async_pool);
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = req->connect.sock;
+    if (!req->connect_pool) {
+        apr_pool_create(&req->connect_pool, r->pool);
+        apr_pool_tag(req->connect_pool, "proxy_http_connect");
     }
-    else {
-        apr_pool_create(&req->async_pool, req->p);
-    }
-    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
-    ppfd = apr_array_push(pfds);
-    memset(ppfd, 0, sizeof(*ppfd));
-    ppfd->p = req->async_pool;
-    ppfd->desc_type = APR_POLL_SOCKET;
-    ppfd->desc.s = req->connect.sock;
-    ppfd->reqevents = req->connect.events;
-    rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
-                              req->connect.timeout, NULL, 0,
-                              proxy_http_connect_continuation, req);
-    if (rv != APR_SUCCESS) {
+    req->connect_wait = ap_request_waitctx_pfd(r, req->connect_pool, &pfd);
+    req->connect_wait->timeout = req->connect.timeout;
+    req->connect_wait->delay = 0; /* polled above */
+    status = ap_request_wait(req->connect_wait,
+                             (req->connect.events & APR_POLLOUT) ? AP_WAIT_OUT
+                                                                 : AP_WAIT_IN,
+                             0, proxy_http_connect_continuation, req);
+    if (status != SUSPENDED) {
         /* We can't wait asynchronously: wait synchronously, for each address
          * as needed.
          */
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+        proxy_http_connect_wait_release(req);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
                       "proxy %s: can't wait for the connection "
                       "asynchronously", req->proto);
         do {
@@ -2925,16 +2899,15 @@ static int proxy_http_connect(proxy_http_req_t *req)
     return SUSPENDED;
 }
 
-static void proxy_http_handshake_continuation(conn_rec *c, request_rec *r,
-                                              ap_mpm_wait_result_e why,
-                                              const apr_array_header_t *pfds,
+static void proxy_http_handshake_continuation(request_rec *r,
+                                              apr_status_t status,
                                               void *baton);
 
 /* Perform the TLS handshake with the backend before sending the request.
  * Without this, the handshake would happen (blocking) in the first write of
  * the request. Here it's driven by nonblocking reads (mod_ssl's AP_MODE_INIT
- * with APR_NONBLOCK_READ): when it would block, we poll for up to
- * ProxyAsyncDelay and then wait in the MPM, which calls
+ * with APR_NONBLOCK_READ): when it would block, we wait with ap_proxy_wait()
+ * (the backend's context of the request's later waits), which calls
  * proxy_http_handshake_continuation() once the backend is ready. Nothing is
  * done for a reused connection, whose handshake is complete already. Returns
  * OK, SUSPENDED, or an HTTP error. On error, the backend connection is marked
@@ -2946,10 +2919,9 @@ static int proxy_http_handshake(proxy_http_req_t *req)
     conn_rec *origin = req->origin;
     proxy_conn_rec *backend = req->backend;
     apr_bucket_brigade *bb;
-    apr_array_header_t *pfds;
-    apr_pollfd_t *pfd;
-    apr_int16_t events;
+    ap_proxy_direction_e direction = AP_PROXY_BACKEND_IN;
     apr_status_t rv;
+    int rc = OK;
 
     req->handshaking = 0;
     bb = apr_brigade_create(req->p, origin->bucket_alloc);
@@ -2961,12 +2933,15 @@ static int proxy_http_handshake(proxy_http_req_t *req)
             break;
         }
         /* Wait for the backend to be writable if the handshake left output
-         * pending, otherwise for it to be readable.
+         * pending, otherwise for it to be readable: after EAGAIN either way.
          */
-        events = (ap_check_output_pending(origin) == AGAIN) ? APR_POLLOUT
-                                                             : APR_POLLIN;
-        if (!proxy_http_ready_within_delay(req, backend->sock, events)) {
-            break;
+        direction = (ap_check_output_pending(origin) == AGAIN)
+                    ? AP_PROXY_BACKEND_OUT : AP_PROXY_BACKEND_IN;
+        rc = ap_proxy_wait(r, backend, direction, AP_PROXY_WAIT_DRAINED,
+                           req->idle_timeout,
+                           proxy_http_handshake_continuation, req);
+        if (rc != OK) {
+            break; /* waiting (SUSPENDED), or can't wait (DECLINED) */
         }
     }
     apr_brigade_destroy(bb);
@@ -2994,27 +2969,11 @@ static int proxy_http_handshake(proxy_http_req_t *req)
         return HTTP_BAD_GATEWAY;
     }
 
-    if (req->async_pool) {
-        apr_pool_clear(req->async_pool);
-    }
-    else {
-        apr_pool_create(&req->async_pool, req->p);
-    }
-    pfds = apr_array_make(req->async_pool, 1, sizeof(apr_pollfd_t));
-    pfd = apr_array_push(pfds);
-    memset(pfd, 0, sizeof(*pfd));
-    pfd->p = req->async_pool;
-    pfd->desc_type = APR_POLL_SOCKET;
-    pfd->desc.s = backend->sock;
-    pfd->reqevents = events;
-    rv = ap_mpm_register_wait(r->connection, req->async_pool, pfds,
-                              req->idle_timeout, NULL, 0,
-                              proxy_http_handshake_continuation, req);
-    if (rv != APR_SUCCESS) {
+    if (rc != SUSPENDED) {
         /* We can't wait asynchronously, so the first write of the request
          * will finish the handshake (blocking).
          */
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
                       "proxy %s: can't wait for the TLS handshake "
                       "asynchronously", req->proto);
         return OK;
@@ -3022,7 +2981,7 @@ static int proxy_http_handshake(proxy_http_req_t *req)
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                   "proxy %s: TLS handshake with %s:%d: waiting to %s (async)",
                   req->proto, backend->hostname, backend->port,
-                  events == APR_POLLOUT ? "write" : "read");
+                  direction == AP_PROXY_BACKEND_OUT ? "write" : "read");
     return SUSPENDED;
 }
 
@@ -3030,21 +2989,20 @@ static int proxy_http_handshake(proxy_http_req_t *req)
  * backend is ready, or on timeout or error: continue the handshake, then the
  * remaining steps.
  */
-static void proxy_http_handshake_continuation(conn_rec *c, request_rec *r,
-                                              ap_mpm_wait_result_e why,
-                                              const apr_array_header_t *pfds,
+static void proxy_http_handshake_continuation(request_rec *r,
+                                              apr_status_t rv,
                                               void *baton)
 {
     proxy_http_req_t *req = baton;
     int status;
 
     AP_DEBUG_ASSERT(req->r == r);
-    if (why != AP_MPM_WAIT_READY) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "proxy %s: %s during the TLS handshake with %s:%d "
-                      "(async, %i)", req->proto,
-                      why == AP_MPM_WAIT_TIMEOUT ? "timeout" : "error",
-                      req->backend->hostname, req->backend->port, (int)why);
+                      "(async)", req->proto,
+                      APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "error",
+                      req->backend->hostname, req->backend->port);
         req->backend->close = 1;
         /* A failed handshake (as ap_proxy_pass_brigade() reports it) */
         status = ap_proxyerror(r, HTTP_INTERNAL_SERVER_ERROR,
