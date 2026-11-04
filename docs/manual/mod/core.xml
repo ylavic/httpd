@@ -635,6 +635,33 @@ AllowOverrideList CookieTracking CookieName
 </directivesynopsis>
 
 <directivesynopsis>
+<name>AsyncRequests</name>
+<description>Whether the requests can be processed asynchronously</description>
+<syntax>AsyncRequests On|Off</syntax>
+<default>AsyncRequests On</default>
+<contextlist><context>server config</context><context>virtual host</context>
+<context>directory</context></contextlist>
+<compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
+
+<usage>
+    <p>When the MPM can wait for the requests' connections, descriptors
+    and timers without holding a thread (e.g. <module>event</module>), the
+    modules processing a request can let it wait so (suspend it) through
+    the core rather than block, for instance while the client sends the
+    request body slowly, or while a backend prepares its response. With
+    <code>AsyncRequests Off</code> the requests it applies to never wait
+    asynchronously through the core: every such wait blocks the thread
+    processing the request.</p>
+
+    <p>This can be used to rule out the asynchronous processing of some
+    locations, e.g. those handled by a module known to misbehave once its
+    requests are suspended. Subrequests, internally redirected requests
+    and the requests of HTTP/2 streams are processed synchronously
+    anyway.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
 <name>CGIMapExtension</name>
 <description>Technique for locating the interpreter for CGI
 scripts</description>

@@ -349,8 +349,9 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
  * asynchronously and return SUSPENDED from the current hook: the MPM can
  * wait (AP_MPMQ_CAN_REGISTER_WAIT), the request is a top-level one processed
  * by ap_process_async_request(), neither a subrequest nor (for now)
- * internally redirected or on a secondary connection (HTTP/2 stream), and
- * it is in a phase that can suspend (the handlers for now).
+ * internally redirected or on a secondary connection (HTTP/2 stream), it
+ * is in a phase that can suspend (the handlers for now), and AsyncRequests
+ * isn't off for it.
  * @param r The request
  * @return non-zero if it can
  */

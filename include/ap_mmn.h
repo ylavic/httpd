@@ -822,8 +822,9 @@
  *                         proxy_worker_shared to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
- *                         ap_request_async_t (with its waits) and
- *                         core_request_config->async to http_core.h
+ *                         ap_request_async_t (with its waits),
+ *                         core_request_config->async and
+ *                         core_dir_config->async_requests to http_core.h
  * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and
  *                         proxy_conn_rec->holder to mod_proxy.h
  */

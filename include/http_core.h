@@ -714,6 +714,10 @@ typedef struct {
     apr_hash_t *cgi_var_rules;
 
     apr_size_t read_buf_size;
+
+    /** AsyncRequests: whether the requests can suspend (AP_CORE_CONFIG_*),
+     * see ap_request_can_suspend() */
+    unsigned int async_requests :2;
 } core_dir_config;
 
 /* macro to implement off by default behaviour */

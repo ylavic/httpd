@@ -446,13 +446,18 @@ static ap_request_async_t *request_async_get(request_rec *r)
 
 AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
 {
+    core_dir_config *d;
     ap_request_async_t *async;
 
     if (!request_can_wait || r->main || r->prev || r->connection->master) {
         return 0;
     }
     async = request_async_get(r);
-    return (async && async->phase == AP_REQUEST_PHASE_HANDLER);
+    if (!async || async->phase != AP_REQUEST_PHASE_HANDLER) {
+        return 0;
+    }
+    d = ap_get_core_module_config(r->per_dir_config);
+    return (d->async_requests != AP_CORE_CONFIG_OFF);
 }
 
 /*
