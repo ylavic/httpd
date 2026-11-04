@@ -802,6 +802,31 @@ AP_DECLARE(int) ap_request_body_run_(request_rec *r, apr_off_t readbytes,
                          APLOG_MODULE_INDEX)
 
 /**
+ * Discard what's left of the request body, without blocking when the
+ * request can suspend (ap_request_can_suspend()), blocking otherwise, so
+ * that the connection can serve the next request.
+ * @param r The request
+ * @param limit The most bytes to drop, beyond which closing the connection
+ *        is better than reading (negative for no limit)
+ * @param module_index The module whose log level the log lines follow
+ * @return OK when the body is consumed (or there was none, or the
+ *         connection closes anyway); AGAIN when nothing can be read now:
+ *         wait (ap_request_wait_body()) and call it again (from its
+ *         continuation if it suspends); or DONE when the connection should
+ *         close instead (AP_CONN_CLOSE set): the body is longer than limit
+ *         (by its Content-Length before reading, else once read), the client
+ *         waits for a 100 Continue that wasn't sent, or the read failed.
+ * @remark As ap_discard_request_body(), nothing is read for a subrequest, a
+ *         connection closing, or a status that drops the connection.
+ */
+AP_DECLARE(int) ap_request_discard_body_(request_rec *r, apr_off_t limit,
+                                         int module_index);
+
+/** ap_request_discard_body_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_discard_body(r, limit) \
+    ap_request_discard_body_(r, limit, APLOG_MODULE_INDEX)
+
+/**
  * Kill the current request
  * @param type Why the request is dying
  * @param r The current request

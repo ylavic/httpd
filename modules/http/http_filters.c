@@ -1559,6 +1559,9 @@ struct ap_request_body {
     ap_request_body_sink_fn *sink;
     ap_request_body_done_fn *done;
     void *run_baton;
+    /* ap_request_discard_body()'s */
+    apr_bucket_brigade *discard_bb;  /* each read, dropped */
+    apr_off_t discarded;             /* bytes dropped so far */
     unsigned int timed_out :1,       /* the last wait timed out */
                  drained   :1,       /* the last read said EAGAIN */
                  block     :1,       /* a wait declined: read blocking */
@@ -1886,6 +1889,147 @@ AP_DECLARE(int) ap_request_body_run_(request_rec *r, apr_off_t readbytes,
         body->running = 0;
     }
     return rc;
+}
+
+/* The length left to read of a Content-Length body, from HTTP1_BODY_IN's
+ * state (or the request's headers before its first read), or -1 when not
+ * known (chunked, an invalid length that the read will fail on, or no
+ * HTTP1_BODY_IN, e.g. HTTP/2)
+ */
+static apr_off_t request_body_length_left(request_rec *r)
+{
+    const char *lenp;
+    apr_off_t len;
+    ap_filter_t *f;
+
+    for (f = r->input_filters; f; f = f->next) {
+        if (f->frec == ap_h1_body_in_filter_handle) {
+            break;
+        }
+    }
+    if (!f) {
+        return -1;
+    }
+    if (f->ctx) {
+        const http_ctx_t *ctx = f->ctx;
+        if (ctx->at_eos) {
+            return 0;
+        }
+        return (ctx->state == BODY_LENGTH) ? ctx->remaining : -1;
+    }
+    if (apr_table_get(r->headers_in, "Transfer-Encoding")) {
+        return -1;
+    }
+    lenp = apr_table_get(r->headers_in, "Content-Length");
+    if (!lenp) {
+        return 0;
+    }
+    if (!ap_parse_strict_length(&len, lenp)) {
+        return -1;
+    }
+    return len;
+}
+
+AP_DECLARE(int) ap_request_discard_body_(request_rec *r, apr_off_t limit,
+                                         int module_index)
+{
+    conn_rec *c = r->connection;
+    struct ap_request_body *body;
+    apr_bucket_brigade *bb;
+    apr_off_t left;
+    int rc;
+
+    /* As ap_discard_request_body() */
+    if (r->main || c->keepalive == AP_CONN_CLOSE) {
+        return OK;
+    }
+    if (ap_status_drops_connection(r->status)) {
+        c->keepalive = AP_CONN_CLOSE;
+        return OK;
+    }
+
+    /* The client waits for a 100 Continue that wasn't sent (the response
+     * is final): it may never send the body, close (as ap_set_keepalive()
+     * does then)
+     */
+    if (r->expecting_100) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE3, 0, r,
+                      "discarding the request body: 100 Continue not sent, "
+                      "closing");
+        c->keepalive = AP_CONN_CLOSE;
+        return DONE;
+    }
+
+    body = request_body_get(r);
+    if (!body->discard_bb) {
+        body->discard_bb = apr_brigade_create(r->pool, c->bucket_alloc);
+    }
+    bb = body->discard_bb;
+
+    /* A Content-Length over the limit closes without reading */
+    left = request_body_length_left(r);
+    if (limit >= 0 && left > limit - body->discarded) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, 0, r,
+                      APLOGNO() "discarding the request body: %"
+                      APR_OFF_T_FMT " bytes left over the limit of %"
+                      APR_OFF_T_FMT ", closing", left, limit);
+        c->keepalive = AP_CONN_CLOSE;
+        return DONE;
+    }
+
+    for (;;) {
+        apr_off_t readbytes = AP_IOBUFSIZE;
+
+        /* Up to the limit, and one byte more tells it's over */
+        if (limit >= 0 && readbytes > limit - body->discarded + 1) {
+            readbytes = limit - body->discarded + 1;
+        }
+        rc = ap_request_read_body_(r, bb, readbytes, 0, module_index);
+        if (rc == AGAIN) {
+            return AGAIN;
+        }
+        if (rc != OK) {
+            apr_brigade_cleanup(bb);
+            c->keepalive = AP_CONN_CLOSE; /* set already */
+            return DONE;
+        }
+
+        while (!APR_BRIGADE_EMPTY(bb)) {
+            apr_bucket *e = APR_BRIGADE_FIRST(bb);
+
+            if (APR_BUCKET_IS_EOS(e)) {
+                apr_brigade_cleanup(bb);
+                return OK;
+            }
+
+            /* There is no need to read empty or metadata buckets or buckets
+             * of known length, but buckets of unknown length must be read
+             * to be exhausted.
+             */
+            if (e->length == (apr_size_t)-1) {
+                const char *data;
+                apr_size_t len;
+                apr_status_t rv;
+
+                rv = apr_bucket_read(e, &data, &len, APR_BLOCK_READ);
+                if (rv != APR_SUCCESS) {
+                    apr_brigade_cleanup(bb);
+                    c->keepalive = AP_CONN_CLOSE;
+                    return DONE;
+                }
+            }
+            body->discarded += e->length;
+            apr_bucket_delete(e);
+        }
+
+        if (limit >= 0 && body->discarded > limit) {
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, 0, r,
+                          APLOGNO() "discarding the request body: over the "
+                          "limit of %" APR_OFF_T_FMT ", closing", limit);
+            c->keepalive = AP_CONN_CLOSE;
+            return DONE;
+        }
+    }
 }
 
 /* Here we deal with getting the request message body from the client.
