@@ -395,6 +395,9 @@ typedef enum {
     AP_REQUEST_PHASE_DONE     /**< finished (ap_request_finish_suspended()) */
 } ap_request_phase_e;
 
+/** The state of a request's waits, core's own (opaque) */
+struct ap_request_waitset;
+
 /**
  * @brief The asynchronous state of a top-level request, allocated by
  * ap_process_async_request(): core's own, may change; modules use the
@@ -405,6 +408,8 @@ typedef struct {
     request_rec *r;
     /** Its phase */
     ap_request_phase_e phase;
+    /** The state of its waits (ap_request_wait()), on first use */
+    struct ap_request_waitset *waitset;
 } ap_request_async_t;
 
 /**

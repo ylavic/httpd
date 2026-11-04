@@ -355,6 +355,165 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
  */
 AP_DECLARE(int) ap_request_can_suspend(request_rec *r);
 
+/** The directions of a request's wait (ap_request_wait()), as bits */
+typedef enum {
+    AP_WAIT_IN  = (1u << 0), /**< readable (input) */
+    AP_WAIT_OUT = (1u << 1)  /**< writable (room for the pending output) */
+} ap_wait_direction_e;
+
+/**
+ * Flag for ap_request_wait(): the caller drained what it waits for, i.e.
+ * the read or write it waits for failed with EAGAIN since its last wait,
+ * so a target that the MPM keeps registered across the waits needs no
+ * check for a readiness the caller would have consumed
+ * (AP_MPM_WAIT_DRAINED). Without it the MPM checks such targets, which is
+ * always correct.
+ */
+#define AP_REQUEST_WAIT_DRAINED (1u << 0)
+
+/**
+ * The timeout of a wait context (ap_request_waitctx_t) that core resolves
+ * at each wait: for the client connection, the time left to read
+ * (ap_get_connection_timeout(): Timeout, or less with mod_reqtimeout) when
+ * waiting for input, the server's Timeout when waiting for output only.
+ * Not a timeout given to the MPM (where any negative value means none).
+ */
+#define AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT ((apr_interval_time_t)-2)
+
+/**
+ * @brief A request's wait context: what a module waits for (the client
+ * connection, a timer, ...), created by core for a request
+ * (ap_request_waitctx_*()) from the pool given to its constructor, but the
+ * client's (in the request's pool, for the whole request). The module sets
+ * the fields below as needed before waiting (ap_request_wait()); core's own
+ * part follows them in the allocation.
+ * @remark The pool must outlive every wait on the context, and not outlive
+ *         the request: the request's pool or one destroyed before it (e.g.
+ *         a subpool, for a context made per target). Cleaning it up
+ *         releases the context (ap_request_waitctx_release()); destroying
+ *         it while a wait on the context is in flight is a bug of the
+ *         caller (logged as an error, the context detached from the wait,
+ *         debug builds asserting).
+ */
+typedef struct {
+    /** The request that waits (set by core) */
+    request_rec *r;
+    /** The module whose log level the waits' log lines follow: the module
+     *  calling the ap_request_waitctx_*() macros (APLOG_MODULE_INDEX, which
+     *  is APLOG_NO_MODULE outside a module, as for logging), or the index
+     *  given to their ap_request_waitctx_*_() functions by code acting for
+     *  another module */
+    int module_index;
+    /** The timeout of the waits: AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT (initially,
+     *  but for timers), a negative value for none, or the delay of a
+     *  timer (initially negative: to be set) */
+    apr_interval_time_t timeout;
+    /** How long to poll the target synchronously before suspending, for a
+     *  readiness expected soon: none if zero (initially) or negative */
+    apr_interval_time_t delay;
+} ap_request_waitctx_t;
+
+/**
+ * The continuation of a request's wait (ap_request_wait()), called by a
+ * thread processing the request once the wait completes.
+ * @param r The request that waited (the context's)
+ * @param status APR_SUCCESS when ready (or a timer's delay elapsed),
+ *        APR_TIMEUP when the wait timed out, or another error when it was
+ *        interrupted (e.g. the MPM is stopping)
+ * @param baton The baton given to the wait
+ * @remark The continuation either waits again (and returns), or continues
+ *         the request until it ends it (ap_request_finish_suspended()),
+ *         then doesn't touch r.
+ */
+typedef void ap_request_continuation_fn(request_rec *r, apr_status_t status,
+                                        void *baton);
+
+/**
+ * The context of the request's waits for its client connection, the same
+ * for the whole request (shared by the modules waiting for the client: set
+ * its fields before each wait).
+ * @param r The request
+ * @param module_index The module whose log level the waits' log lines
+ *        follow, set at each call
+ * @return The context
+ * @remark The client's socket is kept registered in the MPM from the second
+ *         wait in a direction (AP_MPM_WAIT_KEEP_PFDS) until the request is
+ *         done, or the context is released (ap_request_waitctx_release()).
+ */
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_client_(request_rec *r,
+                                                              int module_index);
+
+/** ap_request_waitctx_client_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_waitctx_client(r) \
+    ap_request_waitctx_client_(r, APLOG_MODULE_INDEX)
+
+/**
+ * A context for the request to wait for a delay (its timeout, to set),
+ * whatever the direction given to ap_request_wait(): a timer completes its
+ * wait with APR_SUCCESS.
+ * @param r The request
+ * @param p The pool to allocate the context from (see ap_request_waitctx_t)
+ * @param module_index The module whose log level the waits' log lines
+ *        follow
+ * @return The context, in p
+ */
+AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_timer_(request_rec *r,
+                                                             apr_pool_t *p,
+                                                             int module_index);
+
+/** ap_request_waitctx_timer_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_waitctx_timer(r, p) \
+    ap_request_waitctx_timer_(r, p, APLOG_MODULE_INDEX)
+
+/**
+ * Release a wait context once its target is given up: the MPM stops keeping
+ * its descriptor registered (ap_mpm_release_pfd()), when the wait in
+ * flight completes if any, and the context can't wait anymore (a new one
+ * is needed, e.g. the next ap_request_waitctx_client()).
+ * @param ctx The context
+ * @remark It must be called before the target's descriptor is closed or
+ *         used by another connection, from the thread processing the
+ *         request (the handler, or a continuation).
+ */
+AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
+
+/**
+ * Wait for a target without holding the thread when possible. Unless it's
+ * ready already (input pending in the client connection's filters,
+ * ap_check_input_pending(); no output pending, ap_check_output_pending()),
+ * or within the context's delay (polled), the MPM waits for it.
+ * @param ctx The context of the target
+ * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection, ignored by
+ *        a timer
+ * @param flags AP_REQUEST_WAIT_DRAINED or 0
+ * @param fn Called once the asynchronous wait completes
+ * @param baton For fn
+ * @return SUSPENDED if waiting asynchronously (return SUSPENDED up, fn is
+ *         called later, never inline), OK if ready now or with an error the
+ *         next I/O will report (go on), or DECLINED if the request can't
+ *         wait asynchronously (ap_request_can_suspend(), or the MPM
+ *         refusing the wait): go on blocking (or sleep for a timer).
+ * @remark From the second wait in a direction, the MPM keeps the target's
+ *         descriptor registered (AP_MPM_WAIT_KEEP_PFDS).
+ * @remark Input that the filters keep after the caller's last read returned
+ *         EAGAIN (e.g. mod_ssl's part of a line) is pending but not readable:
+ *         such a wait answers OK once, then waits.
+ * @remark ap_request_waitctx_ready() tells which directions are ready.
+ */
+AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *ctx,
+                                ap_wait_direction_e direction,
+                                unsigned int flags,
+                                ap_request_continuation_fn *fn, void *baton);
+
+/**
+ * The directions found ready by the last wait of a context: when it
+ * answered OK, or for its continuation.
+ * @param ctx The context
+ * @return AP_WAIT_IN and/or AP_WAIT_OUT, or 0 (e.g. after a timeout); both
+ *         for a timer whose delay elapsed
+ */
+AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ctx);
+
 /**
  * Kill the current request
  * @param type Why the request is dying

@@ -117,8 +117,8 @@ AP_CORE_DECLARE(void) ap_random_parent_after_fork(void);
  */
 AP_CORE_DECLARE(int) ap_h1_set_keepalive(request_rec *r, ap_bucket_response *resp);
 
-/* Set up the requests' asynchronous processing, at post-config */
-AP_CORE_DECLARE(void) ap_request_async_post_config(apr_pool_t *p,
+/* Set up the requests' asynchronous processing, at post-config (ptemp) */
+AP_CORE_DECLARE(void) ap_request_async_post_config(apr_pool_t *ptemp,
                                                    server_rec *s);
 
 #ifdef __cplusplus

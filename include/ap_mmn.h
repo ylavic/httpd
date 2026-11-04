@@ -784,8 +784,15 @@
  *                         process_score->shutdown, ->backlog and
  *                         ->workers_live to scoreboard.h;
  *                         AP_SHUTDOWN_CONN_* to http_connection.h;
- *                         ap_request_finish_suspended() and
- *                         ap_request_can_suspend() to http_request.h;
+ *                         ap_request_finish_suspended(),
+ *                         ap_request_can_suspend(), ap_wait_direction_e,
+ *                         AP_REQUEST_WAIT_DRAINED,
+ *                         AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT,
+ *                         ap_request_waitctx_t, ap_request_continuation_fn,
+ *                         ap_request_waitctx_client(),
+ *                         ap_request_waitctx_timer(),
+ *                         ap_request_waitctx_release(), ap_request_wait()
+ *                         and ap_request_waitctx_ready() to http_request.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
  *                         ap_proxy_handler_done(), proxy_req_conf->async,
@@ -810,8 +817,8 @@
  *                         proxy_worker_shared to mod_proxy.h;
  *                         ap_get_listen_buckets_ratio() to ap_listen.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
- *                         ap_request_async_t and core_request_config->async
- *                         to http_core.h
+ *                         ap_request_async_t (with its waits) and
+ *                         core_request_config->async to http_core.h
  * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and
  *                         proxy_conn_rec->holder to mod_proxy.h
  */
