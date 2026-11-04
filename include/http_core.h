@@ -398,6 +398,10 @@ typedef enum {
 /** The state of a request's waits, core's own (opaque) */
 struct ap_request_waitset;
 
+/** The state of a request's body reads (ap_request_read_body()), core's
+ *  own (opaque) */
+struct ap_request_body;
+
 /**
  * @brief The asynchronous state of a top-level request, allocated by
  * ap_process_async_request(): core's own, may change; modules use the
@@ -487,6 +491,11 @@ typedef struct {
      * redirected requests)
      */
     ap_request_async_t *async;
+
+    /** The state of the request's body reads (ap_request_read_body()), on
+     * first use
+     */
+    struct ap_request_body *body;
 } core_request_config;
 
 /* Standard entries that are guaranteed to be accessible via

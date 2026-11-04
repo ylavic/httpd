@@ -1533,6 +1533,240 @@ cleanup:
     return rc;
 }
 
+/*
+ * The request body reader (ap_request_read_body(), ap_request_wait_body()):
+ * nonblocking reads when the request can suspend, the waits for the client
+ * through the core's request waits, their outcome answered by the next read.
+ * Nothing is allocated per read or wait: the state and its brigade are made
+ * once per request.
+ */
+
+/* The state of a request's body reads (core_request_config->body) */
+struct ap_request_body {
+    request_rec *r;
+    apr_bucket_brigade *tmp_bb;      /* what a read gets, before the caller's
+                                      * brigade */
+    ap_request_continuation_fn *fn;  /* the caller's, for the wait in flight */
+    void *baton;
+    apr_status_t interrupted;        /* the last wait was (the MPM failed to
+                                      * wait: APR_EGENERAL), else
+                                      * APR_SUCCESS */
+    unsigned int timed_out :1,       /* the last wait timed out */
+                 drained   :1,       /* the last read said EAGAIN */
+                 block     :1;       /* a wait declined: read blocking */
+};
+
+static struct ap_request_body *request_body_get(request_rec *r)
+{
+    core_request_config *req_cfg;
+    struct ap_request_body *body;
+
+    req_cfg = ap_get_core_module_config(r->request_config);
+    body = (req_cfg) ? req_cfg->body : NULL;
+    if (!body) {
+        body = apr_pcalloc(r->pool, sizeof(*body));
+        body->r = r;
+        body->tmp_bb = apr_brigade_create(r->pool,
+                                          r->connection->bucket_alloc);
+        if (req_cfg) {
+            req_cfg->body = body;
+        }
+    }
+    return body;
+}
+
+AP_DECLARE(int) ap_request_read_body_(request_rec *r, apr_bucket_brigade *bb,
+                                      apr_off_t readbytes, unsigned int flags,
+                                      int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    apr_bucket_brigade *tmp_bb = body->tmp_bb;
+    int block, status;
+    apr_status_t rv;
+
+    if (readbytes <= 0) {
+        readbytes = AP_IOBUFSIZE;
+    }
+    block = ((flags & AP_REQUEST_BODY_BLOCK)
+             || body->block
+             || !ap_request_can_suspend(r));
+
+    /* A nonblocking read sends the 100 Continue without blocking too, else
+     * the client and we would wait for each other.
+     */
+    if (!block && r->expecting_100) {
+        r->expecting_100 |= AP_EXPECT_100_NONBLOCK;
+    }
+    rv = ap_get_brigade(r->input_filters, tmp_bb, AP_MODE_READBYTES,
+                        (block) ? APR_BLOCK_READ : APR_NONBLOCK_READ,
+                        readbytes);
+    if (r->expecting_100) {
+        r->expecting_100 &= ~AP_EXPECT_100_NONBLOCK;
+    }
+
+    if (!block && (APR_STATUS_IS_EAGAIN(rv)
+                   || (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(tmp_bb)))) {
+        apr_brigade_cleanup(tmp_bb);
+        if (body->timed_out) {
+            /* The wait for the client timed out and there is still nothing
+             * to read (the time left to read, a deadline of mod_reqtimeout's
+             * would have failed the read)
+             */
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_INFO, 0, r,
+                          APLOGNO() "timeout reading the request body "
+                          "(async)");
+            status = HTTP_REQUEST_TIME_OUT;
+            goto failed;
+        }
+        if (body->interrupted != APR_SUCCESS) {
+            /* The wait was interrupted: the MPM failed to wait */
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR,
+                          body->interrupted, r, APLOGNO()
+                          "reading the request body interrupted: "
+                          "the wait failed (async)");
+            status = HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+        body->drained = APR_STATUS_IS_EAGAIN(rv);
+        return AGAIN;
+    }
+    if (rv != APR_SUCCESS) {
+        apr_brigade_cleanup(tmp_bb);
+        status = ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, rv, r,
+                      APLOGNO() "reading the request body failed (%d)",
+                      status);
+        goto failed;
+    }
+
+    /* A blocking read always returns something, a filter not doing so is
+     * a bug
+     */
+    if (APR_BRIGADE_EMPTY(tmp_bb)) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "a blocking read of the request body "
+                      "returned nothing (an input filter's bug)");
+    }
+    AP_DEBUG_ASSERT(!APR_BRIGADE_EMPTY(tmp_bb));
+
+    body->timed_out = 0;
+    body->interrupted = APR_SUCCESS;
+    body->drained = 0;
+    if (flags & AP_REQUEST_BODY_SETASIDE) {
+        rv = ap_save_brigade(NULL, &bb, &tmp_bb, r->pool);
+        if (rv != APR_SUCCESS) {
+            apr_brigade_cleanup(tmp_bb);
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, rv, r,
+                          APLOGNO() "setting the request body aside failed");
+            status = HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+    }
+    else {
+        APR_BRIGADE_CONCAT(bb, tmp_bb);
+    }
+    return OK;
+
+failed:
+    r->connection->keepalive = AP_CONN_CLOSE;
+    return status;
+}
+
+/* The continuation of ap_request_wait_body(): its outcome is answered by the
+ * next read, then the caller's continuation runs.
+ */
+static void request_body_wait_continuation(request_rec *r,
+                                           apr_status_t status,
+                                           void *baton)
+{
+    struct ap_request_body *body = baton;
+    ap_request_continuation_fn *fn = body->fn;
+    void *fn_baton = body->baton;
+
+    body->fn = NULL;
+    body->baton = NULL;
+    if (APR_STATUS_IS_TIMEUP(status)) {
+        body->timed_out = 1;
+    }
+    else if (status != APR_SUCCESS) {
+        body->interrupted = status;
+    }
+    fn(r, status, fn_baton);
+}
+
+AP_DECLARE(int) ap_request_wait_body_(request_rec *r,
+                                      ap_request_continuation_fn *fn,
+                                      void *baton, int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    conn_rec *c = r->connection;
+    ap_request_waitctx_t *ctx;
+    unsigned int flags;
+    int pending, rc;
+
+    if (body->fn != NULL) {
+        /* A second wait while one is pending: refuse it before touching
+         * the pending one's continuation
+         */
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "waiting for the request body while a wait "
+                      "for it is pending: declined");
+        AP_DEBUG_ASSERT(body->fn == NULL);
+        return DECLINED;
+    }
+    if (body->block || !ap_request_can_suspend(r)) {
+        body->block = 1;
+        return DECLINED;
+    }
+
+    /* The client's context is shared by the request's waits for the client:
+     * the defaults of the body's wait (the time left to read, no poll)
+     */
+    ctx = ap_request_waitctx_client_(r, module_index);
+    ctx->timeout = AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
+    ctx->delay = 0;
+
+    /* With output pending (e.g. the 100 Continue), the client may wait for
+     * it before sending more: wait for either direction, the wait's check
+     * writing what it can.
+     */
+    flags = (body->drained) ? AP_REQUEST_WAIT_DRAINED : 0;
+    pending = (ap_check_output_pending(c) == AGAIN);
+    body->fn = fn;
+    body->baton = baton;
+    if (pending) {
+        unsigned int directions = AP_WAIT_IN | AP_WAIT_OUT;
+        rc = ap_request_wait_any(&ctx, 1, &directions, flags,
+                                 request_body_wait_continuation, body);
+    }
+    else {
+        rc = ap_request_wait(ctx, AP_WAIT_IN, flags,
+                             request_body_wait_continuation, body);
+    }
+    if (rc == SUSPENDED) {
+        return SUSPENDED;
+    }
+    body->fn = NULL;
+    body->baton = NULL;
+
+    if (rc == DECLINED) {
+        body->block = 1;
+        if (pending) {
+            /* The blocking reads don't write what's pending for the client,
+             * which may wait for it: flush it now (an error is the next
+             * read's)
+             */
+            apr_bucket_brigade *tmp_bb = body->tmp_bb;
+            APR_BRIGADE_INSERT_TAIL(tmp_bb,
+                                    apr_bucket_flush_create(c->bucket_alloc));
+            (void)ap_pass_brigade(c->output_filters, tmp_bb);
+            apr_brigade_cleanup(tmp_bb);
+        }
+        return DECLINED;
+    }
+    return OK;
+}
+
 /* Here we deal with getting the request message body from the client.
  * Whether or not the request contains a body is signaled by the presence
  * of a non-zero Content-Length or by a Transfer-Encoding: chunked.

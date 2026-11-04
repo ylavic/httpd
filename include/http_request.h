@@ -672,6 +672,77 @@ AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
  */
 AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ctx);
 
+/** Flag for ap_request_read_body(): set the buckets read aside in the
+ *  request's pool (they may be transient otherwise) */
+#define AP_REQUEST_BODY_SETASIDE (1u << 0)
+/** Flag for ap_request_read_body(): read blocking even if the request can
+ *  suspend, for a caller that can't return SUSPENDED (e.g. a filter) */
+#define AP_REQUEST_BODY_BLOCK    (1u << 1)
+
+/**
+ * Read some of the request body, without blocking when the request can
+ * suspend (ap_request_can_suspend()) unless AP_REQUEST_BODY_BLOCK is given,
+ * blocking otherwise.
+ * @param r The request
+ * @param bb The brigade to append what's read to
+ * @param readbytes The most bytes to read (e.g. AP_IOBUFSIZE)
+ * @param flags AP_REQUEST_BODY_SETASIDE and/or AP_REQUEST_BODY_BLOCK, or 0
+ * @param module_index The module whose log level the log lines follow
+ * @return OK with what was read appended to bb (an EOS bucket last once the
+ *         body is complete, at every read after that too); AGAIN when
+ *         nothing can be read now: wait (ap_request_wait_body()) and read
+ *         again (from its continuation if it suspends), never returned when
+ *         the read blocks; or an error, the connection then closing
+ *         (AP_CONN_CLOSE): 400 (malformed or cut), 408 (the client timed
+ *         out: the read after a wait that timed out found nothing, or
+ *         mod_reqtimeout's deadline), 413 (LimitRequestBody), 500 (the read
+ *         after an interrupted wait found nothing: the MPM failed to wait),
+ *         AP_FILTER_ERROR (a filter answered already, e.g. httpd 2.4's
+ *         HTTP_IN for LimitRequestBody).
+ * @remark Sends the 100 Continue the client waits for, without blocking
+ *         when the read doesn't (AP_EXPECT_100_NONBLOCK): AGAIN while it's
+ *         pending, the wait then waiting for the client to take it.
+ * @remark Without AP_REQUEST_BODY_SETASIDE the buckets may be transient
+ *         (e.g. mod_ssl's): use or set them aside before the next read.
+ * @remark r->read_length (ap_get_client_block()'s count) is not updated:
+ *         a module that reads the body and replays it to the next handlers
+ *         (an input filter serving what it read) keeps it readable by
+ *         ap_should_client_block()'s users.
+ * @remark A caller mixing its own ap_get_brigade() calls with these reads
+ *         reads the same body (nothing is counted here).
+ */
+AP_DECLARE(int) ap_request_read_body_(request_rec *r, apr_bucket_brigade *bb,
+                                      apr_off_t readbytes, unsigned int flags,
+                                      int module_index);
+
+/** ap_request_read_body_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_read_body(r, bb, readbytes, flags) \
+    ap_request_read_body_(r, bb, readbytes, flags, APLOG_MODULE_INDEX)
+
+/**
+ * Wait for more of the request body after ap_request_read_body() returned
+ * AGAIN: for the client to send more, and to take the output pending for
+ * it if any (e.g. the 100 Continue), with the time left to read, on the
+ * client's wait context (ap_request_waitctx_client(), whose timeout and
+ * delay are reset to their defaults).
+ * @param r The request
+ * @param fn Called once the asynchronous wait completes
+ * @param baton For fn
+ * @param module_index The module whose log level the log lines follow
+ * @return SUSPENDED: return SUSPENDED up, fn is called later (never
+ *         inline) and reads again whatever its status (that read answers a
+ *         timeout or an interruption); OK: read again now; DECLINED: the
+ *         request can't wait asynchronously, read again, blocking from now
+ *         on (what's pending for the client is flushed first).
+ */
+AP_DECLARE(int) ap_request_wait_body_(request_rec *r,
+                                      ap_request_continuation_fn *fn,
+                                      void *baton, int module_index);
+
+/** ap_request_wait_body_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_request_wait_body(r, fn, baton) \
+    ap_request_wait_body_(r, fn, baton, APLOG_MODULE_INDEX)
+
 /**
  * Kill the current request
  * @param type Why the request is dying
