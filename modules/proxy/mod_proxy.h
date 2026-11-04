@@ -1700,8 +1700,8 @@ typedef enum {
  * The continuation of a wait of ap_proxy_wait(), called from a thread
  * processing the request: the core's (ap_request_continuation_fn), with
  * status APR_SUCCESS if the socket is ready, APR_TIMEUP if the wait timed
- * out, or another error if it was interrupted (e.g. the MPM is stopping),
- * and the baton given to ap_proxy_wait().
+ * out, or APR_EGENERAL if the MPM failed to wait, and the baton given to
+ * ap_proxy_wait().
  */
 typedef ap_request_continuation_fn ap_proxy_wait_continuation_fn;
 
@@ -1814,8 +1814,8 @@ PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
  * is over, called by the MPM's thread waking it up.
  * @param tunnel  the tunnel
  * @param status  OK if completion is full, HTTP_GATEWAY_TIME_OUT if idle for
- *                longer than the timeout, DONE if the wait ended otherwise
- *                (e.g. the MPM stopping), or an HTTP_ error
+ *                longer than the timeout, HTTP_INTERNAL_SERVER_ERROR if the
+ *                MPM failed to wait, or another HTTP_ error
  * @param baton   the baton given to ap_proxy_tunnel_run_ex()
  */
 typedef void (ap_proxy_tunnel_done_fn)(proxy_tunnel_rec *tunnel, int status,

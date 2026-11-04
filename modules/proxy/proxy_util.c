@@ -6850,41 +6850,36 @@ PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r)
 /* The state of a tunnel run by ap_proxy_tunnel_run_ex() */
 typedef struct {
     proxy_tunnel_rec *tunnel;
-    apr_pool_t *pool; /* for the MPM's waits, cleared at each */
+    ap_request_waitctx_t *ctxs[2]; /* the client's and the origin's (the
+                                     * core's waits), NULL once released */
     apr_interval_time_t timeout;
     ap_proxy_tunnel_done_fn *done;
     void *baton;
-    int kept; /* the MPM keeps the pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
 } proxy_tunnel_async_t;
 
 /* The tunnel's sockets are kept registered in the MPM across its waits
- * (both live as long as the tunnel), until released here: before they are
- * given up, i.e. before the done callback (which releases the backend
- * connection) or tunneling synchronously.
+ * (both live as long as the tunnel), until their contexts are released
+ * here: before they are given up, i.e. before the done callback (which
+ * releases the backend connection) or tunneling synchronously.
  */
 static void proxy_tunnel_async_release(proxy_tunnel_async_t *ta)
 {
-    if (ta->kept) {
-        proxy_tunnel_rec *tunnel = ta->tunnel;
-        apr_status_t rv;
+    int i;
 
-        rv = ap_mpm_release_pfds(tunnel->pfds);
-        if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, tunnel->r, APLOGNO()
-                          "proxy: %s: tunnel: releasing the MPM's pollfds "
-                          "failed", tunnel->scheme);
+    for (i = 0; i < 2; i++) {
+        if (ta->ctxs[i]) {
+            ap_request_waitctx_release(ta->ctxs[i]);
+            ta->ctxs[i] = NULL;
         }
-        ta->kept = 0;
     }
 }
 
-static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
-                                            ap_mpm_wait_result_e why,
-                                            const apr_array_header_t *pfds,
+static void proxy_tunnel_async_continuation(request_rec *r,
+                                            apr_status_t status,
                                             void *baton);
 
 /* Whether each side waits for POLLIN/POLLOUT only after its last read/flush
- * ended on EAGAIN (AP_MPM_WAIT_DRAINED), not after a yield.
+ * ended on EAGAIN (AP_REQUEST_WAIT_DRAINED), not after a yield.
  */
 static int proxy_tunnel_drained(proxy_tunnel_rec *tunnel)
 {
@@ -6903,6 +6898,71 @@ static int proxy_tunnel_drained(proxy_tunnel_rec *tunnel)
     return 1;
 }
 
+/* The tunnel's pfds with the events found ready by the last wait (the
+ * contexts' ready directions), for ap_proxy_tunnel_step().
+ */
+static apr_array_header_t *proxy_tunnel_async_ready(proxy_tunnel_async_t *ta)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    apr_pollfd_t *pfds[2];
+    int i;
+
+    pfds[0] = tunnel->client->pfd;
+    pfds[1] = tunnel->origin->pfd;
+    for (i = 0; i < 2; i++) {
+        unsigned int ready = ap_request_waitctx_ready(ta->ctxs[i]);
+
+        pfds[i]->rtnevents = 0;
+        if ((ready & AP_WAIT_IN) && (pfds[i]->reqevents & APR_POLLIN)) {
+            pfds[i]->rtnevents |= APR_POLLIN;
+        }
+        if ((ready & AP_WAIT_OUT) && (pfds[i]->reqevents & APR_POLLOUT)) {
+            pfds[i]->rtnevents |= APR_POLLOUT;
+        }
+    }
+    return tunnel->pfds;
+}
+
+/* Wait for what the tunnel's sides need (their pfds' reqevents), with the
+ * core's waits on the client's and the origin's contexts at once.
+ */
+static int proxy_tunnel_async_wait(proxy_tunnel_async_t *ta)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    ap_request_waitctx_t *ctxs[2];
+    unsigned int directions[2];
+    const apr_pollfd_t *pfds[2];
+    int i, n = 0;
+
+    pfds[0] = tunnel->client->pfd;
+    pfds[1] = tunnel->origin->pfd;
+    for (i = 0; i < 2; i++) {
+        unsigned int d = 0;
+
+        if (pfds[i]->reqevents & APR_POLLIN) {
+            d |= AP_WAIT_IN;
+        }
+        if (pfds[i]->reqevents & APR_POLLOUT) {
+            d |= AP_WAIT_OUT;
+        }
+        if (d) {
+            /* The timeout is how long either side can stay idle */
+            ta->ctxs[i]->timeout = (ta->timeout >= 0) ? ta->timeout : -1;
+            ta->ctxs[i]->delay = 0;
+            ctxs[n] = ta->ctxs[i];
+            directions[n] = d;
+            n++;
+        }
+    }
+    if (!n) {
+        return DECLINED;
+    }
+    return ap_request_wait_any(ctxs, n, directions,
+                               proxy_tunnel_drained(tunnel)
+                               ? AP_REQUEST_WAIT_DRAINED : 0,
+                               proxy_tunnel_async_continuation, ta);
+}
+
 /* Step the tunnel with what's ready, then wait in the MPM for what it needs,
  * or when the MPM can't wait tunnel synchronously from now on. Returns
  * SUSPENDED, or the tunnel's status once done.
@@ -6912,35 +6972,30 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
 {
     proxy_tunnel_rec *tunnel = ta->tunnel;
     request_rec *r = tunnel->r;
-    apr_status_t rv;
     int status;
 
-    status = ap_proxy_tunnel_step(tunnel, ready);
-    if (status != SUSPENDED) {
-        return status;
-    }
+    for (;;) {
+        status = ap_proxy_tunnel_step(tunnel, ready);
+        if (status != SUSPENDED) {
+            return status;
+        }
 
-    if (ta->pool) {
-        apr_pool_clear(ta->pool);
+        status = proxy_tunnel_async_wait(ta);
+        if (status == SUSPENDED) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                          "proxy: %s: tunnel: waiting (async)",
+                          tunnel->scheme);
+            return SUSPENDED;
+        }
+        if (status != OK) {
+            break;
+        }
+        /* Ready already in the connections' filters (pending input or no
+         * pending output anymore): step again with that.
+         */
+        ready = proxy_tunnel_async_ready(ta);
     }
-    else {
-        apr_pool_create(&ta->pool, r->pool);
-        apr_pool_tag(ta->pool, "proxy_tunnel_async");
-    }
-    rv = ap_mpm_register_wait(r->connection, ta->pool, tunnel->pfds,
-                              ta->timeout, NULL,
-                              AP_MPM_WAIT_KEEP_PFDS
-                              | (proxy_tunnel_drained(tunnel)
-                                 ? AP_MPM_WAIT_DRAINED : 0),
-                              proxy_tunnel_async_continuation, ta);
-    if (rv == APR_SUCCESS) {
-        ta->kept = 1;
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                      "proxy: %s: tunnel: waiting (async)",
-                      tunnel->scheme);
-        return SUSPENDED;
-    }
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
                   "proxy: %s: can't tunnel asynchronously", tunnel->scheme);
 
     proxy_tunnel_async_release(ta);
@@ -6948,12 +7003,11 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
     return ap_proxy_tunnel_run(tunnel);
 }
 
-/* The continuation of the MPM's wait: step the tunnel again until it's over,
- * then call the done callback.
+/* The continuation of the tunnel's waits: step the tunnel again until it's
+ * over, then call the done callback.
  */
-static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
-                                            ap_mpm_wait_result_e why,
-                                            const apr_array_header_t *pfds,
+static void proxy_tunnel_async_continuation(request_rec *r,
+                                            apr_status_t rv,
                                             void *baton)
 {
     proxy_tunnel_async_t *ta = baton;
@@ -6961,34 +7015,22 @@ static void proxy_tunnel_async_continuation(conn_rec *c, request_rec *r,
     int status;
 
     AP_DEBUG_ASSERT(tunnel->r == r);
-    switch (why) {
-    case AP_MPM_WAIT_READY:
-        status = proxy_tunnel_async_pump(ta, pfds);
+    if (rv == APR_SUCCESS) {
+        status = proxy_tunnel_async_pump(ta, proxy_tunnel_async_ready(ta));
         if (status == SUSPENDED) {
             return; /* continued later */
         }
-        break;
-    case AP_MPM_WAIT_TIMEOUT:
+    }
+    else if (APR_STATUS_IS_TIMEUP(rv)) {
         status = HTTP_GATEWAY_TIME_OUT;
-        break;
-    case AP_MPM_WAIT_ERROR:
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "proxy: %s: tunneling failed (async)", tunnel->scheme);
         status = HTTP_INTERNAL_SERVER_ERROR;
-        break;
-    default:
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
-                      "proxy: %s: tunneling interrupted (async, %i)",
-                      tunnel->scheme, (int)why);
-        status = DONE;
-        break;
     }
 
     proxy_tunnel_async_release(ta);
-    if (ta->pool) {
-        apr_pool_destroy(ta->pool);
-        ta->pool = NULL;
-    }
     ta->done(tunnel, status, ta->baton);
 }
 
@@ -7001,9 +7043,12 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
     proxy_tunnel_async_t *ta;
 
     /* Not asynchronous if not asked (!done), nor if the request can't be
-     * suspended.
+     * suspended, nor if the client's side isn't the request's connection's
+     * socket (the core's client context).
      */
-    if (!done || !ap_request_can_suspend(r)) {
+    if (!done || !ap_request_can_suspend(r)
+        || tunnel->client->pfd->desc_type != APR_POLL_SOCKET
+        || tunnel->client->pfd->desc.s != ap_get_conn_socket(r->connection)) {
         tunnel->timeout = timeout;
         return ap_proxy_tunnel_run(tunnel);
     }
@@ -7013,6 +7058,8 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
     ta->timeout = timeout;
     ta->done = done;
     ta->baton = baton;
+    ta->ctxs[0] = ap_request_waitctx_client(r);
+    ta->ctxs[1] = ap_request_waitctx_conn(r, r->pool, tunnel->origin->c);
     return proxy_tunnel_async_pump(ta, NULL);
 }
 
