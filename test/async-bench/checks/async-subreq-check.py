@@ -11,7 +11,9 @@ subrequests (DECLINED to a static file), a subrequest reaching its timeout
 requests running subrequests, and a graceful stop during subrequests. "sync"
 runs them with AsyncRequests Off (the subrequests block: the same responses,
 the threads held), "async" with the waits in the MPM (no thread held while a
-subrequest waits).
+subrequest waits). Then mod_include's include virtual of a proxied URL, which
+stays blocking in both modes (a thread held: mod_include runs its subrequests
+from a filter, which can't suspend), with the same output.
 
 mod_aptest is built from ../../pyhttpd/mod_aptest with the install's apxs
 into WORKDIR unless MOD_APTEST_SO is given.
@@ -41,6 +43,7 @@ PORT, BACKEND = 18455, 18456
 THREADS = 4
 BACKEND_MS = 100        # the proxied subrequests' backend delay
 SUSPEND_MS = 300        # AptestSuspend's wait in a subrequest
+INC_MS = 300            # the backend delay of mod_include's subrequest
 TIMEOUT_MS = 300        # the subrequests' timeout of the timeout case
 
 apxs = os.path.join(prefix, "bin", "apxs")
@@ -59,6 +62,7 @@ FILES = {
     "s/file.txt": b"static file\n",
     "scd/file.txt": b"static file after subrequests\n",
     "long/file.txt": b"long\n",
+    "inc/index.shtml": b'before\n<!--#include virtual="/p/x?d=%d" -->\nafter\n' % INC_MS,
 }
 for name, data in FILES.items():
     os.makedirs(os.path.dirname(os.path.join(docs, name)), exist_ok=True)
@@ -83,6 +87,7 @@ LoadModule unixd_module modules/mod_unixd.so
 LoadModule authz_core_module modules/mod_authz_core.so
 LoadModule log_config_module modules/mod_log_config.so
 LoadModule status_module modules/mod_status.so
+LoadModule include_module modules/mod_include.so
 LoadModule proxy_module modules/mod_proxy.so
 LoadModule proxy_http_module modules/mod_proxy_http.so
 LoadModule aptest_module {aptest}
@@ -136,6 +141,10 @@ ProxyPass "/p/" "http://127.0.0.1:{backend}/p/"
 </Location>
 <Location "/long/">
     AptestSubreq "/p/x?d=3000" 1 captured declined
+</Location>
+<Location "/inc/">
+    Options +Includes
+    SetOutputFilter INCLUDES
 </Location>
 <Location "/server-status">
     SetHandler server-status
@@ -456,6 +465,22 @@ for mode in os.environ.get("MODES", "sync async").split():
               and res[3][0] == 200 and res[3][1] == BACKEND_BODY)
         case("4 pipelined requests, some running subrequests, in order", "-",
              repr([r[0] if r else None for r in res]), None, ok)
+
+        # mod_include's include virtual of a proxied URL: blocking in both
+        # modes (from the INCLUDES filter), the same output
+        st, body, hdr, t = get("/inc/index.shtml")
+        case("include virtual of a proxied URL (mod_include, blocking)", st, body, None,
+             st == 200 and body == b"before\n" + BACKEND_BODY + b"\nafter\n")
+        # (one thread left for mod_status' requests)
+        wait_idle()
+        n = THREADS - 1
+        smp = Sampler([INC_MS / 3000.0, INC_MS / 2000.0])
+        res, t = parallel(n, lambda i: get("/inc/index.shtml?i=%d" % i))
+        busy = smp.held()
+        ok = all(r[0] == 200 and r[1] == b"before\n" + BACKEND_BODY + b"\nafter\n"
+                 for r in res) and busy == n
+        report.append("%s: %d include virtual of a proxied URL at once: %ss, workers held %s "
+                      "(blocking, phase B's): %s" % (mode, n, t, busy, verdict(ok)))
 
         # Many clients on THREADS threads (as many as don't wait for a worker
         # longer than Timeout when blocking): no worker held while the
