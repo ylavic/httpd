@@ -404,7 +404,8 @@ struct ap_request_body;
 
 /**
  * @brief The asynchronous state of a top-level request, allocated by
- * ap_process_async_request(): core's own, may change; modules use the
+ * ap_process_async_request(), or of a subrequest, allocated by
+ * ap_run_sub_req_async(): core's own, may change; modules use the
  * ap_request_*() functions (http_request.h).
  */
 typedef struct ap_request_async_t {
@@ -436,6 +437,15 @@ typedef struct ap_request_async_t {
     /** Its handlers suspended it (a run returned SUSPENDED), until it's
      * resumed or ends */
     unsigned int suspended :1;
+    /** A subrequest's deadline (ap_run_sub_req_async()) was reached */
+    unsigned int deadline_reached :1;
+    /** For a subrequest run by ap_run_sub_req_async(): its done function
+     * (ap_sub_req_done_fn) and baton, its deadline (zero for none), and the
+     * module whose log level its log lines follow */
+    void (*done)(request_rec *rsub, int status, void *baton);
+    void *done_baton;
+    apr_time_t deadline;
+    int module_index;
 } ap_request_async_t;
 
 /**
@@ -493,7 +503,8 @@ typedef struct {
     int suppress_charset;
 
     /** The asynchronous state of a top-level request processed by
-     * ap_process_async_request(), NULL otherwise (subrequests, internally
+     * ap_process_async_request() or of a subrequest run by
+     * ap_run_sub_req_async(), NULL otherwise (other subrequests, internally
      * redirected requests)
      */
     ap_request_async_t *async;

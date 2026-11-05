@@ -147,6 +147,9 @@ AP_DECLARE(int) ap_run_sub_req(request_rec *r);
 /**
  * Free the memory associated with a subrequest
  * @param r The subrequest to finish
+ * @remark A subrequest run by ap_run_sub_req_async() that hasn't completed
+ *         (suspended) isn't destroyed (an error is logged): its memory goes
+ *         with its main request's.
  */
 AP_DECLARE(void) ap_destroy_sub_req(request_rec *r);
 
@@ -347,6 +350,9 @@ void ap_process_async_request(request_rec *r);
  *         dereference r afterwards.
  * @remark The next handlers don't run, unlike with
  *         ap_request_resume_suspended() and DECLINED.
+ * @remark For a subrequest run by ap_run_sub_req_async(), the end is
+ *         ap_run_sub_req()'s (no ap_die(), the connection still the main
+ *         request's), then its done function is called.
  */
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
 
@@ -374,6 +380,10 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status);
  *         to the MPM (called by this function once the request is done).
  *         ap_request_finish_suspended() ends the request with status at
  *         once, the next handlers not run.
+ * @remark For a subrequest run by ap_run_sub_req_async(), once its
+ *         handlers are done its end is ap_run_sub_req()'s (no ap_die(), the
+ *         connection still the main request's), then its done function is
+ *         called.
  */
 AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
                                               int module_index);
@@ -387,14 +397,77 @@ AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
  * Whether the request can be suspended now, i.e. a module can wait
  * asynchronously and return SUSPENDED from the current hook: the MPM can
  * wait (AP_MPMQ_CAN_REGISTER_WAIT), the request is a top-level one processed
- * by ap_process_async_request(), neither a subrequest nor (for now)
- * internally redirected or on a secondary connection (HTTP/2 stream), it
- * is in a phase that can suspend (the handlers for now), and AsyncRequests
- * isn't off for it.
+ * by ap_process_async_request() or a subrequest run by
+ * ap_run_sub_req_async(), neither (for now) internally redirected nor on a
+ * secondary connection (HTTP/2 stream), it is in a phase that can suspend
+ * (the handlers for now), and AsyncRequests isn't off for it.
  * @param r The request
  * @return non-zero if it can
  */
 AP_DECLARE(int) ap_request_can_suspend(request_rec *r);
+
+/**
+ * The function called once a subrequest run by ap_run_sub_req_async()
+ * completes asynchronously, by the thread processing the request then (a
+ * continuation of the subrequest's last wait).
+ * @param rsub The subrequest, which done may read (its status, headers_out,
+ *        what an output filter of the caller captured) then destroy
+ *        (ap_destroy_sub_req())
+ * @param status Its final status, as ap_run_sub_req() returns it, or
+ *        HTTP_GATEWAY_TIME_OUT if its timeout was reached
+ * @param baton The baton given to ap_run_sub_req_async()
+ * @remark done goes on with the main request, which is suspended: it runs
+ *         another subrequest or waits (then returns, the main request still
+ *         suspended), or continues the main request's handlers until they
+ *         end it (ap_request_resume_suspended(),
+ *         ap_request_finish_suspended()). A main request left neither waiting
+ *         nor continued is abandoned: the MPM closes the connection.
+ * @remark done isn't called if the connection is closed first (e.g. killed
+ *         by an immediate stop): keep nothing outside the requests' pools
+ *         that only done would free.
+ */
+typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
+
+/**
+ * Run a subrequest as ap_run_sub_req() does, letting it suspend (e.g.
+ * mod_proxy waiting for its backend) without holding the thread when its
+ * main request can suspend (ap_request_can_suspend()).
+ * @param rsub The subrequest (ap_sub_req_lookup_*() or similar), not run
+ * @param timeout The longest the subrequest may run from now on, its waits
+ *        capped to what's left: once reached, the wait in flight completes
+ *        with APR_TIMEUP and done gets HTTP_GATEWAY_TIME_OUT whatever the
+ *        subrequest's own status; zero or negative for none. Only the
+ *        asynchronous waits are capped (not a subrequest running blocking).
+ * @param done Called once the subrequest completes asynchronously
+ * @param baton For done
+ * @param module_index The module whose log level the log lines follow (a
+ *        subrequest run blocking, its timeout reached)
+ * @return SUSPENDED if the subrequest suspended: the caller returns
+ *         SUSPENDED up (its main request suspends) and done is called
+ *         later, never inline; otherwise the subrequest's final status as
+ *         ap_run_sub_req() returns it (it completed, done isn't called).
+ *         Never DECLINED: when the main request can't suspend, or the
+ *         subrequest can't be run asynchronously (logged), the subrequest
+ *         runs blocking (ap_run_sub_req()).
+ * @remark Only from a handler of the main request (or a continuation of
+ *         it, e.g. the done function of a previous subrequest), which
+ *         returns SUSPENDED up: not from a filter, which can't (for now
+ *         this isn't detected, the subrequest's wait would be lost; a call
+ *         while a wait of the main request is in flight is refused, logged,
+ *         and runs blocking). One subrequest at a time per request (one
+ *         wait per connection).
+ * @remark Don't destroy rsub (refused, logged), nor pass output for the main
+ *         request, until done is called. The subrequest may run on other
+ *         threads than the caller's, as continuations do.
+ */
+AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
+                                      apr_interval_time_t timeout,
+                                      ap_sub_req_done_fn *done, void *baton,
+                                      int module_index);
+
+/** ap_run_sub_req_async_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_run_sub_req_async(rsub, timeout, done, baton) \
+    ap_run_sub_req_async_(rsub, timeout, done, baton, APLOG_MODULE_INDEX)
 
 /** The directions of a request's wait (ap_request_wait()), as bits */
 typedef enum {

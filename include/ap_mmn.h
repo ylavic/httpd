@@ -804,8 +804,10 @@
  *                         ap_request_wait_body_(), ap_request_body_run_(),
  *                         ap_request_discard_body_() (and their macros
  *                         without the trailing "_"),
- *                         ap_request_body_sink_fn and
- *                         ap_request_body_done_fn to http_request.h;
+ *                         ap_request_body_sink_fn,
+ *                         ap_request_body_done_fn, ap_sub_req_done_fn and
+ *                         ap_run_sub_req_async_() (and its macro without
+ *                         the trailing "_") to http_request.h;
  *                         ap_h1_header_in_filter_handle to mod_core.h;
  *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
  *                         ap_proxy_handler_done(), proxy_req_conf->async,
@@ -836,8 +838,9 @@
  *                         ap_invoke_handler_resume() to http_config.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
  *                         ap_request_async_t (with its top, waits,
- *                         handler_pos, handler, old_handler, ended, running
- *                         and suspended),
+ *                         handler_pos, handler, old_handler, ended, running,
+ *                         suspended, deadline_reached, done, done_baton,
+ *                         deadline and module_index),
  *                         core_request_config->async,
  *                         core_request_config->body (struct
  *                         ap_request_body) and

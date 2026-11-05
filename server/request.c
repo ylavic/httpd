@@ -2595,6 +2595,21 @@ AP_DECLARE(int) ap_run_sub_req(request_rec *r)
 
 AP_DECLARE(void) ap_destroy_sub_req(request_rec *r)
 {
+    core_request_config *req_cfg;
+
+    /* A subrequest run by ap_run_sub_req_async() that hasn't completed is
+     * still used (its continuations): its pool goes with the main request's
+     */
+    req_cfg = ap_get_core_module_config(r->request_config);
+    if (req_cfg && req_cfg->async && req_cfg->async->r == r
+        && req_cfg->async->phase != AP_REQUEST_PHASE_DONE) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "subrequest destroyed before it completed "
+                      "(ap_run_sub_req_async()): ignored");
+        AP_DEBUG_ASSERT(0);
+        return;
+    }
+
     /* Reclaim the space */
     apr_pool_destroy(r->pool);
 }

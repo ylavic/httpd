@@ -449,9 +449,10 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
     core_dir_config *d;
     ap_request_async_t *async;
 
-    if (!request_can_wait || r->main || r->prev || r->connection->master) {
+    if (!request_can_wait || r->prev || r->connection->master) {
         return 0;
     }
+    /* A subrequest has one if run by ap_run_sub_req_async() */
     async = request_async_get(r);
     if (!async || async->phase != AP_REQUEST_PHASE_HANDLER) {
         return 0;
@@ -607,6 +608,7 @@ typedef struct request_waitctx_t {
                                       * target: this context, or for a
                                       * subrequest's client context the
                                       * top-level request's (one socket) */
+    struct request_waitctx_t *kept_next; /* in its subrequest's kept list */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
     apr_interval_time_t timeout;  /* of the wait in flight, resolved */
     unsigned int ready;           /* AP_WAIT_* of the last wait */
@@ -630,6 +632,8 @@ typedef struct request_waitctx_t {
 struct ap_request_waitset {
     request_rec *r;
     request_waitctx_t *client;   /* the client's context, if created */
+    request_waitctx_t *kept;     /* a subrequest's contexts whose pfd the
+                                   * MPM may keep (released at its end) */
     /* The wait in flight, in the top-level request's state only */
     request_rec *waiter;          /* the request that waits (its first
                                    * context's), given to fn */
@@ -640,6 +644,8 @@ struct ap_request_waitset {
     int nctxs, nalloc;            /* ctxs used, allocated (all three) */
     apr_interval_time_t timeout;  /* of the wait in flight */
     int timer_expires;            /* the timeout is a timer's */
+    ap_request_async_t *deadline; /* the timeout is this subrequest's
+                                   * deadline (ap_run_sub_req_async()) */
     ap_request_continuation_fn *fn;
     void *baton;
     int ending;                   /* r->pool is being destroyed */
@@ -684,6 +690,46 @@ static struct ap_request_waitset *request_waitctx_tree(request_waitctx_t *ctx)
     return (async) ? async->top->waitset : NULL;
 }
 
+/* A context whose pfd the MPM may keep from now on: a subrequest's is listed
+ * to be released at the subrequest's end, the MPM releasing what it keeps
+ * only at the top-level request's (the top-level request's contexts and the
+ * client's socket aren't listed)
+ */
+static void request_waitctx_keep(request_waitctx_t *ctx)
+{
+    ap_request_async_t *async;
+
+    if (ctx->kept) {
+        return;
+    }
+    ctx->kept = 1;
+    async = request_async_get(ctx->pub.r);
+    if (async && async->top != async) {
+        struct ap_request_waitset *w = request_waitset_get(async);
+        ctx->kept_next = w->kept;
+        w->kept = ctx;
+    }
+}
+
+/* The MPM keeps the context's pfd no more */
+static void request_waitctx_unkeep(request_waitctx_t *ctx)
+{
+    ap_request_async_t *async;
+    request_waitctx_t **pctx;
+
+    ctx->kept = 0;
+    async = request_async_get(ctx->pub.r);
+    if (async && async->top != async && async->waitset) {
+        for (pctx = &async->waitset->kept; *pctx; pctx = &(*pctx)->kept_next) {
+            if (*pctx == ctx) {
+                *pctx = ctx->kept_next;
+                break;
+            }
+        }
+    }
+    ctx->kept_next = NULL;
+}
+
 static void request_waitctx_release_pfd(request_waitctx_t *ctx);
 
 /* The pool of a context (but the client's) is being cleaned up: the context
@@ -724,7 +770,7 @@ static apr_status_t request_waitctx_cleanup(void *data)
         }
         ctx->waiting = 0;
         ctx->released = 1;
-        ctx->kept = 0;
+        request_waitctx_unkeep(ctx);
         return APR_SUCCESS;
     }
 
@@ -857,7 +903,7 @@ static void request_waitctx_release_pfd(request_waitctx_t *ctx)
     if (!ctx->kept) {
         return;
     }
-    ctx->kept = 0;
+    request_waitctx_unkeep(ctx);
     rv = ap_mpm_release_pfd(&ctx->pfd);
     if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
         ap_log_rerror(WAITCTX_LOG_MARK(ctx), APLOG_DEBUG,
@@ -1009,6 +1055,11 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
         break;
     case AP_MPM_WAIT_TIMEOUT:
         rv = (w->timer_expires) ? APR_SUCCESS : APR_TIMEUP;
+        if (w->deadline) {
+            /* A subrequest's deadline: it gets HTTP_GATEWAY_TIME_OUT */
+            w->deadline->deadline_reached = 1;
+            rv = APR_TIMEUP;
+        }
         break;
     default:
         rv = APR_EGENERAL;
@@ -1046,7 +1097,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
         if ((ctx->kind == REQUEST_WAITCTX_TIMER
              && why == AP_MPM_WAIT_TIMEOUT
-             && ctx->timeout == w->timeout)
+             && ctx->timeout == w->timeout && !w->deadline)
             || (ctx->kind == REQUEST_WAITCTX_NOTIFIER
                 && why == AP_MPM_WAIT_NOTIFIED)) {
             ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
@@ -1068,6 +1119,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     }
     w->nctxs = 0;
     w->waiter = NULL;
+    w->deadline = NULL;
 
     /* fn ends the request (r can't be touched afterwards), or it's suspended
      * again (fn waits again), or abandoned (the MPM closes the connection).
@@ -1088,6 +1140,8 @@ typedef struct {
     apr_interval_time_t timeout;  /* the smallest, negative for none */
     apr_interval_time_t delay;    /* the smallest of the pfds', if any */
     int timer_expires;            /* the timeout is a timer's */
+    ap_request_async_t *deadline; /* the timeout is this subrequest's
+                                   * deadline */
     int keep;                     /* the MPM can keep the pfds registered */
 } request_waitreg_plan_t;
 
@@ -1113,6 +1167,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
     plan->notifier = NULL;
     plan->timeout = -1;
     plan->delay = -1;
+    plan->deadline = NULL;
     plan->keep = 1;
 
     if (w->nalloc < nctxs) {
@@ -1286,7 +1341,7 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
                 ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits++;
             }
             if (mpm_flags & AP_MPM_WAIT_KEEP_PFDS) {
-                ctx->sock->kept = 1;
+                request_waitctx_keep(ctx->sock);
             }
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
@@ -1299,6 +1354,7 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
     w->nctxs = nctxs;
     w->timeout = plan->timeout;
     w->timer_expires = plan->timer_expires;
+    w->deadline = plan->deadline;
     w->fn = fn;
     w->baton = baton;
 }
@@ -1320,6 +1376,41 @@ static int request_wait_used_notifier(ap_request_waitctx_t *const *ctxs,
     return -1;
 }
 
+/* Cap the wait to the nearest deadline of the waiting subrequest and of its
+ * main requests run by ap_run_sub_req_async(), if any: its timeout (and
+ * delay) to what's left of it, zero once reached (the MPM times out at once).
+ */
+static void request_waitreg_deadline(ap_request_async_t *async,
+                                     request_waitreg_plan_t *plan)
+{
+    apr_time_t deadline = 0;
+    apr_interval_time_t left;
+    ap_request_async_t *which = NULL;
+
+    for (; async && async != async->top;
+         async = request_async_get(async->r->main)) {
+        if (async->deadline && (!deadline || async->deadline < deadline)) {
+            deadline = async->deadline;
+            which = async;
+        }
+    }
+    if (!which) {
+        return;
+    }
+    left = deadline - apr_time_now();
+    if (left < 0) {
+        left = 0;
+    }
+    if (plan->timeout < 0 || left < plan->timeout) {
+        plan->timeout = left;
+        plan->timer_expires = 0;
+        plan->deadline = which;
+    }
+    if (plan->delay > left) {
+        plan->delay = left;
+    }
+}
+
 /* Wait for the targets of nctxs contexts, the first ready completing the
  * wait (ap_request_wait(), ap_request_wait_any() if any).
  */
@@ -1330,6 +1421,7 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
                         int any)
 {
     request_rec *r = ctxs[0]->r;
+    ap_request_async_t *async;
     struct ap_request_waitset *w;
     request_waitreg_plan_t plan;
     unsigned int mpm_flags = 0;
@@ -1340,12 +1432,14 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
         return DECLINED;
     }
     /* The wait in flight of r's tree */
-    w = request_waitset_get(request_async_get(r)->top);
+    async = request_async_get(r);
+    w = request_waitset_get(async->top);
 
     rc = request_waitreg_prepare(w, ctxs, nctxs, directions, any, &plan);
     if (rc != AGAIN) {
         return rc;
     }
+    request_waitreg_deadline(async, &plan);
 
     /* Ready within the delay: no need to wait. Anything but a timeout lets
      * the caller do its I/O as usual (readiness, an error the I/O will
@@ -1507,6 +1601,148 @@ void ap_process_async_request(request_rec *r)
     async_request_end(r, async, access_status, ASYNC_REQUEST_END_FIRST);
 }
 
+/*
+ * Subrequests run by ap_run_sub_req_async(): they run within the runs of
+ * their top-level request, a subrequest that suspended continuing from the
+ * continuations of its waits (its handlers resumed or finished) until its
+ * end, after which its done function goes on with its main request.
+ */
+
+/* Enter a run of the top-level request of a request's tree, unless one is
+ * running (from the continuation of a module's own MPM wait,
+ * ap_mpm_register_wait(), rather than of a request's wait): *ended is set
+ * if the top-level request ends in it. Returns whether entered.
+ */
+static int async_request_enter_top(ap_request_async_t *async, int *ended)
+{
+    ap_request_async_t *top = async->top;
+
+    if (top->running) {
+        return 0;
+    }
+    async_request_enter(top->r, top);
+    top->ended = ended;
+    return 1;
+}
+
+/* The end of a subrequest's run as ap_run_sub_req()'s: its final status */
+static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
+                               int status)
+{
+    request_waitctx_t *ctx;
+
+    async->phase = AP_REQUEST_PHASE_DONE;
+    async->suspended = 0;
+    if (status == DONE) {
+        status = OK;
+    }
+    if (async->deadline_reached) {
+        ap_log_rerror(__FILE__, __LINE__, async->module_index, APLOG_INFO, 0,
+                      rsub, APLOGNO() "subrequest's timeout reached: %i "
+                      "(its status %i)", HTTP_GATEWAY_TIME_OUT, status);
+        status = HTTP_GATEWAY_TIME_OUT;
+    }
+    ap_finalize_sub_req_protocol(rsub);
+
+    /* The MPM keeps descriptors until the top-level request's end: release
+     * what the subrequest's waits left kept (e.g. a module not releasing its
+     * context with its target)
+     */
+    if (async->waitset) {
+        while ((ctx = async->waitset->kept) != NULL) {
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_TRACE2, 0, rsub, "releasing the %s wait "
+                          "context left by the subrequest",
+                          request_waitctx_kind_names[ctx->kind]);
+            ctx->released = 1;
+            request_waitctx_release_pfd(ctx);
+        }
+    }
+    return status;
+}
+
+/* The end of a subrequest that suspended, in a run of its top-level request:
+ * its done function goes on with the main request
+ */
+static void async_subreq_end(request_rec *rsub, ap_request_async_t *async,
+                             int status)
+{
+    status = async_subreq_finish(rsub, async, status);
+    async->done(rsub, status, async->done_baton);
+    /* don't dereference rsub from here! (done may destroy it) */
+}
+
+AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
+                                      apr_interval_time_t timeout,
+                                      ap_sub_req_done_fn *done, void *baton,
+                                      int module_index)
+{
+    request_rec *r = rsub->main;
+    core_request_config *req_cfg;
+    ap_request_async_t *main_async, *async;
+    int status;
+
+    req_cfg = ap_get_core_module_config(rsub->request_config);
+    if (!r || !done || !req_cfg || req_cfg->async) {
+        /* Not a subrequest, run already, or sharing another request's
+         * config: a bug of the caller
+         */
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, rsub,
+                      APLOGNO() "can't run the subrequest asynchronously "
+                      "(%s): running it blocking",
+                      (!r) ? "not a subrequest"
+                           : (!done) ? "no done function"
+                                     : "run already");
+        return ap_run_sub_req(rsub);
+    }
+    if (!ap_request_can_suspend(r)) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE2, 0, rsub,
+                      "subrequest run blocking: its main request can't "
+                      "suspend");
+        return ap_run_sub_req(rsub);
+    }
+    main_async = request_async_get(r);
+    if (main_async->top->waitset && main_async->top->waitset->nctxs) {
+        /* A wait of the tree in flight: called by a filter, or after a
+         * SUSPENDED dropped (one wait per connection)
+         */
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, rsub,
+                      APLOGNO() "can't run the subrequest asynchronously "
+                      "while a wait of its request is in flight (called by "
+                      "a filter?): running it blocking");
+        return ap_run_sub_req(rsub);
+    }
+
+    async = apr_pcalloc(rsub->pool, sizeof(*async));
+    async->r = rsub;
+    async->top = main_async->top;
+    async->phase = AP_REQUEST_PHASE_NONE;
+    async->done = done;
+    async->done_baton = baton;
+    async->module_index = module_index;
+    if (timeout > 0) {
+        async->deadline = apr_time_now() + timeout;
+    }
+    req_cfg->async = async;
+
+    /* As ap_run_sub_req() */
+    status = DECLINED;
+    if (!(rsub->filename && rsub->finfo.filetype != APR_NOFILE)) {
+        status = ap_run_quick_handler(rsub, 0);
+    }
+    if (status == DECLINED) {
+        status = ap_invoke_handler(rsub);
+    }
+    if (status == SUSPENDED) {
+        /* Its continuations go on with it, then done */
+        async->suspended = 1;
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE5, 0, rsub,
+                      "subrequest suspended");
+        return SUSPENDED;
+    }
+    return async_subreq_finish(rsub, async, status);
+}
+
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
 {
     ap_request_async_t *async = request_async_get(r);
@@ -1520,6 +1756,20 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
             ap_time_process_request(r->connection->sbh, START_PREQUEST);
         }
         async_request_end(r, NULL, status, ASYNC_REQUEST_END_NOLOCK);
+        return;
+    }
+
+    if (async->top != async) {
+        /* A subrequest: done goes on with the main request, within the run
+         * of the continuation (entered here if a module's own MPM wait's)
+         */
+        ap_request_async_t *top = async->top;
+        int ended = 0, entered = async_request_enter_top(async, &ended);
+
+        async_subreq_end(r, async, status);
+        if (entered && !ended) {
+            async_request_leave(top->r, top, 0);
+        }
         return;
     }
 
@@ -1537,7 +1787,8 @@ AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
                                               int module_index)
 {
     ap_request_async_t *async = request_async_get(r);
-    int entered = 0;
+    ap_request_async_t *top;
+    int entered, ended = 0;
 
     if (status == SUSPENDED) {
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
@@ -1571,22 +1822,32 @@ AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
      * or from the continuation of a module's own MPM wait
      * (ap_mpm_register_wait())
      */
-    if (!async->running) {
-        async_request_enter(r, async);
-        entered = 1;
-    }
+    top = async->top;
+    entered = async_request_enter_top(async, &ended);
 
     status = ap_invoke_handler_resume(r, status);
     if (status == SUSPENDED) {
         /* Suspended again by the next handlers: the run that entered leaves
-         * (the continuation of the request's wait, or this one)
+         * (the continuation of the request's wait, or this one); a
+         * subrequest's own flag (the run's is the top-level request's)
          */
+        if (async != top) {
+            async->suspended = 1;
+        }
         if (entered) {
-            async_request_leave(r, async, 0);
+            async_request_leave(top->r, top, 0);
         }
         return;
     }
 
+    if (async != top) {
+        /* A subrequest: done goes on with the main request */
+        async_subreq_end(r, async, status);
+        if (entered && !ended) {
+            async_request_leave(top->r, top, 0);
+        }
+        return;
+    }
     async_request_end(r, async, status, 0);
 }
 
