@@ -1158,8 +1158,9 @@ PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
  * Whether a request can be suspended to wait asynchronously
  * (ap_proxy_wait()): unless ProxyAsyncDelay is -1, when the core can suspend
  * it (ap_request_can_suspend(): the MPM can wait, AsyncRequests is not Off,
- * and it's neither a subrequest nor an internally redirected request, whose
- * caller goes on once the handler returns, nor an HTTP/2 stream's).
+ * and it's neither a subrequest run by ap_run_sub_req() nor an internally
+ * redirected request, whose caller goes on once the handler returns, nor an
+ * HTTP/2 stream's; a subrequest run by ap_run_sub_req_async() can be).
  * @param r  the request
  * @return   non-zero if it can
  */
@@ -1171,7 +1172,9 @@ PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r);
  * returned status (ap_proxy_handler_resume()), then unless suspended again
  * resume the handler chain as if proxy_handler() had returned that status
  * (ap_request_resume_suspended(): with DECLINED the next handlers run,
- * otherwise the request ends and its connection goes back to the MPM).
+ * otherwise the request ends and its connection goes back to the MPM, or
+ * for a subrequest run by ap_run_sub_req_async() its caller's done function
+ * goes on with its main request).
  * @param r       the request
  * @param status  the scheme handler's status
  * @remark Call it once per suspension, from the continuation of the
@@ -1828,9 +1831,9 @@ typedef void (ap_proxy_tunnel_done_fn)(proxy_tunnel_rec *tunnel, int status,
  * Run the tunnel, asynchronously if possible: forward what's ready
  * (ap_proxy_tunnel_step()), then let the MPM wait for either side
  * (ap_mpm_register_wait()), and so on until it's over, without holding a
- * thread meanwhile. Otherwise (no done callback, the MPM can't wait, or the
- * tunnel is for an HTTP/2 stream's connection) the whole tunneling happens
- * now, as with ap_proxy_tunnel_run().
+ * thread meanwhile. Otherwise (no done callback, the MPM can't wait, the
+ * request is a subrequest, or the tunnel is for an HTTP/2 stream's
+ * connection) the whole tunneling happens now, as with ap_proxy_tunnel_run().
  * @param tunnel   tunnel to run
  * @param timeout  the time either side can stay idle (negative for none)
  * @param done     called once an asynchronous tunnel is over, or NULL to

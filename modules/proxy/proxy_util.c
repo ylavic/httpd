@@ -7046,10 +7046,11 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
     proxy_tunnel_async_t *ta;
 
     /* Not asynchronous if not asked (!done), nor if the request can't be
-     * suspended, nor if the client's side isn't the request's connection's
-     * socket (the core's client context).
+     * suspended, nor for a subrequest (it can't take the client's socket
+     * over from its main request), nor if the client's side isn't the
+     * request's connection's socket (the core's client context).
      */
-    if (!done || !ap_request_can_suspend(r)
+    if (!done || !ap_request_can_suspend(r) || r->main
         || tunnel->client->pfd->desc_type != APR_POLL_SOCKET
         || tunnel->client->pfd->desc.s != ap_get_conn_socket(r->connection)) {
         tunnel->timeout = timeout;

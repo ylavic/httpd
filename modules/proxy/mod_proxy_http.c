@@ -3230,6 +3230,8 @@ static int proxy_http_request_preread(request_rec *r, proxy_dir_conf *dconf,
         const char *te, *cl;
 
         if (!ap_proxy_request_can_suspend(r)
+            || r->main              /* the body isn't the subrequest's
+                                     * (its kept_body is read already) */
             || r->expecting_100     /* the client waits for 100 */
             || !ap_request_has_body(r)
             || apr_table_get(r->headers_in, "Upgrade")
