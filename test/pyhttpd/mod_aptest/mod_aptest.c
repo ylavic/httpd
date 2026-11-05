@@ -40,6 +40,11 @@
 #define APTEST_HAS_BODY 1
 #endif
 
+/* ap_run_sub_req_async() */
+#ifdef ap_run_sub_req_async
+#define APTEST_HAS_SUBREQ 1
+#endif
+
 /* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
 typedef struct {
     int set;
@@ -60,6 +65,12 @@ typedef struct {
     int body_mode;                  /* APTEST_BODY_* (AptestBody) */
     int body_block;                 /* read from an output filter, blocking */
     apr_off_t body_limit;           /* for "discard" */
+    const char *subreq_uri;         /* AptestSubreq's (see "the
+                                     * subrequests' handler") */
+    int subreq_n;
+    int subreq_capture;             /* "captured", else "passed" */
+    int subreq_declined;            /* "declined", else "ok" */
+    apr_interval_time_t subreq_timeout; /* "timeout <ms>", else 0 */
 } aptest_dir_conf;
 
 /* AptestBody's modes */
@@ -110,6 +121,20 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
         conf->body_mode = base->body_mode;
         conf->body_block = base->body_block;
         conf->body_limit = base->body_limit;
+    }
+    if (add->subreq_uri) {
+        conf->subreq_uri = add->subreq_uri;
+        conf->subreq_n = add->subreq_n;
+        conf->subreq_capture = add->subreq_capture;
+        conf->subreq_declined = add->subreq_declined;
+        conf->subreq_timeout = add->subreq_timeout;
+    }
+    else {
+        conf->subreq_uri = base->subreq_uri;
+        conf->subreq_n = base->subreq_n;
+        conf->subreq_capture = base->subreq_capture;
+        conf->subreq_declined = base->subreq_declined;
+        conf->subreq_timeout = base->subreq_timeout;
     }
     return conf;
 }
@@ -247,6 +272,46 @@ static const char *aptest_set_body(cmd_parms *cmd, void *dconf,
 }
 #endif /* APTEST_HAS_BODY */
 
+#ifdef APTEST_HAS_SUBREQ
+static const char *aptest_set_subreq(cmd_parms *cmd, void *dconf,
+                                     int argc, char *const argv[])
+{
+    aptest_dir_conf *conf = dconf;
+    apr_int64_t n;
+    int i;
+
+    if (argc < 3 || !apr_isdigit(*argv[1])
+        || (strcmp(argv[2], "passed") != 0
+            && strcmp(argv[2], "captured") != 0)) {
+        return "AptestSubreq <uri> <n> passed|captured [ok|declined] "
+               "[timeout <ms>]";
+    }
+    conf->subreq_uri = argv[0];
+    conf->subreq_n = (int)apr_atoi64(argv[1]);
+    conf->subreq_capture = (*argv[2] == 'c');
+    conf->subreq_declined = 0;
+    conf->subreq_timeout = 0;
+    for (i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "ok") == 0) {
+            conf->subreq_declined = 0;
+        }
+        else if (strcmp(argv[i], "declined") == 0) {
+            conf->subreq_declined = 1;
+        }
+        else if (strcmp(argv[i], "timeout") == 0 && i + 1 < argc
+                 && apr_isdigit(*argv[i + 1])) {
+            n = apr_atoi64(argv[++i]);
+            conf->subreq_timeout = apr_time_from_msec(n);
+        }
+        else {
+            return apr_pstrcat(cmd->pool, "AptestSubreq: unknown option ",
+                               argv[i], NULL);
+        }
+    }
+    return NULL;
+}
+#endif /* APTEST_HAS_SUBREQ */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
@@ -263,6 +328,11 @@ static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestBody", aptest_set_body, NULL, OR_ALL,
                    "how the \"aptest-body\" handler reads the request body: "
                    "pull [block], sink [block] or discard <limit>"),
+#endif
+#ifdef APTEST_HAS_SUBREQ
+    AP_INIT_TAKE_ARGV("AptestSubreq", aptest_set_subreq, NULL, OR_ALL,
+                      "the subrequests run before the handlers: <uri> <n> "
+                      "passed|captured [ok|declined] [timeout <ms>]"),
 #endif
     {NULL}
 };
@@ -1507,7 +1577,8 @@ static apr_status_t aptest_replay_filter(ap_filter_t *f,
  * checking the body before them would, then waits: the response header
  * "AP-Test-Read<1|2>" gives the length read and the waits for it, a read
  * failing is the handler's result. A request that can't suspend
- * (ap_request_can_suspend(), e.g. AsyncRequests Off or a subrequest) reads
+ * (ap_request_can_suspend(), e.g. AsyncRequests Off or a subrequest not run
+ * by ap_run_sub_req_async()) reads
  * and sleeps for ms holding the thread, then returns the result as a
  * synchronous module would. The response header "AP-Test-Suspend<1|2>"
  * says "async" or "sync" for each handler that acted (the timer's wait).
@@ -1675,6 +1746,183 @@ static int aptest_suspend2(request_rec *r)
 }
 #endif /* APTEST_HAS_RESUME */
 
+#ifdef APTEST_HAS_SUBREQ
+/*
+ * The subrequests' handler: a handler function at APR_HOOK_REALLY_FIRST
+ * acting on any request whose location configures "AptestSubreq <uri> <n>
+ * passed|captured [ok|declined] [timeout <ms>]", whatever its handler. It
+ * runs n subrequests of uri in turn with ap_run_sub_req_async(), the next
+ * one from the done function of the previous one when it suspended (e.g.
+ * mod_proxy waiting for its backend), then:
+ *  - "ok" (the default): answers a line "aptest-subreq: <summary>";
+ *  - "declined": the next handlers run (e.g. the default handler).
+ * The subrequests' output is "passed" to the client (before the request's
+ * own), or "captured" by an output filter of the subrequest
+ * ("APTEST_CAPTURE", which passes nothing on, as guardian's does). The
+ * timeout caps each subrequest (HTTP_GATEWAY_TIME_OUT once reached). The
+ * summary, "n=<n> async=<suspended> statuses=<s1,s2,...>" plus for captured
+ * output " captured=<bytes>:<md5 prefix>", is also the response header
+ * "AP-Test-Subreq" when the output is captured (the header isn't sent yet).
+ * A request that can't suspend (AsyncRequests Off) runs the subrequests
+ * blocking: the same responses, async=0.
+ */
+typedef struct {
+    request_rec *r;
+    const aptest_dir_conf *conf;
+    int i;                      /* subrequests run */
+    int nasync;                 /* of which suspended */
+    apr_off_t captured;         /* bytes captured */
+    apr_md5_ctx_t md5;          /* of the bytes captured */
+    char statuses[128];         /* "s1,s2,..." (truncated) */
+    apr_size_t slen;
+    apr_bucket_brigade *bb;     /* the answer, made once */
+} aptest_subreq_t;
+
+static ap_filter_rec_t *aptest_capture_handle;
+
+/* Capture a subrequest's output: counted and digested, passed nowhere */
+static apr_status_t aptest_capture_filter(ap_filter_t *f,
+                                          apr_bucket_brigade *bb)
+{
+    aptest_subreq_t *s = f->ctx;
+    apr_bucket *e;
+    const char *data;
+    apr_size_t len;
+    apr_status_t rv;
+
+    for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+         e = APR_BUCKET_NEXT(e)) {
+        if (APR_BUCKET_IS_METADATA(e)) {
+            continue;
+        }
+        rv = apr_bucket_read(e, &data, &len, APR_BLOCK_READ);
+        if (rv != APR_SUCCESS) {
+            apr_brigade_cleanup(bb);
+            return rv;
+        }
+        apr_md5_update(&s->md5, data, len);
+        s->captured += len;
+    }
+    apr_brigade_cleanup(bb);
+    return APR_SUCCESS;
+}
+
+/* A subrequest done (inline or from done): its status recorded (its
+ * response's for OK, as mod_include reads it), destroyed
+ */
+static void aptest_subreq_record(aptest_subreq_t *s, request_rec *rsub,
+                                 int status)
+{
+    if (status == OK) {
+        status = rsub->status;
+    }
+    if (s->slen + 8 < sizeof(s->statuses)) {
+        s->slen += apr_snprintf(s->statuses + s->slen,
+                                sizeof(s->statuses) - s->slen, "%s%d",
+                                s->slen ? "," : "", status);
+    }
+    ap_destroy_sub_req(rsub);
+}
+
+/* The handler's result once the subrequests are done */
+static int aptest_subreq_result(aptest_subreq_t *s)
+{
+    request_rec *r = s->r;
+    unsigned char digest[APR_MD5_DIGESTSIZE];
+    char summary[256];
+    apr_size_t len;
+
+    len = apr_snprintf(summary, sizeof(summary), "n=%d async=%d statuses=%s",
+                       s->i, s->nasync, s->statuses);
+    if (s->conf->subreq_capture) {
+        apr_md5_final(digest, &s->md5);
+        apr_snprintf(summary + len, sizeof(summary) - len,
+                     " captured=%" APR_OFF_T_FMT ":%02x%02x%02x%02x",
+                     s->captured, digest[0], digest[1], digest[2], digest[3]);
+        apr_table_set(r->headers_out, "AP-Test-Subreq", summary);
+    }
+    if (s->conf->subreq_declined) {
+        return DECLINED;
+    }
+    if (s->conf->subreq_capture) {
+        ap_set_content_type(r, "text/plain");
+    }
+    s->bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+    apr_brigade_printf(s->bb, NULL, NULL, "aptest-subreq: %s\n", summary);
+    if (ap_pass_brigade(r->output_filters, s->bb) != APR_SUCCESS) {
+        apr_brigade_cleanup(s->bb);
+        return AP_FILTER_ERROR;
+    }
+    apr_brigade_cleanup(s->bb);
+    return OK;
+}
+
+static void aptest_subreq_done(request_rec *rsub, int status, void *baton);
+
+/* Run the next subrequests: the handler's result, or SUSPENDED (done goes
+ * on)
+ */
+static int aptest_subreq_run(aptest_subreq_t *s)
+{
+    request_rec *r = s->r;
+    request_rec *rsub;
+    int rc;
+
+    while (s->i < s->conf->subreq_n) {
+        s->i++;
+        if (s->conf->subreq_capture) {
+            rsub = ap_sub_req_lookup_uri(s->conf->subreq_uri, r, NULL);
+            ap_add_output_filter_handle(aptest_capture_handle, s, rsub,
+                                        rsub->connection);
+        }
+        else {
+            rsub = ap_sub_req_lookup_uri(s->conf->subreq_uri, r,
+                                         r->output_filters);
+        }
+        if (rsub->status != HTTP_OK) {
+            aptest_subreq_record(s, rsub, rsub->status);
+            continue;
+        }
+        rc = ap_run_sub_req_async(rsub, s->conf->subreq_timeout,
+                                  aptest_subreq_done, s);
+        if (rc == SUSPENDED) {
+            s->nasync++;
+            return SUSPENDED;
+        }
+        aptest_subreq_record(s, rsub, rc);
+    }
+    return aptest_subreq_result(s);
+}
+
+static void aptest_subreq_done(request_rec *rsub, int status, void *baton)
+{
+    aptest_subreq_t *s = baton;
+    int rc;
+
+    aptest_subreq_record(s, rsub, status);
+    rc = aptest_subreq_run(s);
+    if (rc != SUSPENDED) {
+        ap_request_resume_suspended(s->r, rc);
+    }
+}
+
+static int aptest_subreq(request_rec *r)
+{
+    const aptest_dir_conf *conf;
+    aptest_subreq_t *s;
+
+    conf = ap_get_module_config(r->per_dir_config, &aptest_module);
+    if (!conf || !conf->subreq_uri) {
+        return DECLINED;
+    }
+    s = apr_pcalloc(r->pool, sizeof(*s));
+    s->r = r;
+    s->conf = conf;
+    apr_md5_init(&s->md5);
+    return aptest_subreq_run(s);
+}
+#endif /* APTEST_HAS_SUBREQ */
+
 /* Install this module into the apache2 infrastructure.
  */
 static void aptest_hooks(apr_pool_t *pool)
@@ -1704,6 +1952,13 @@ static void aptest_hooks(apr_pool_t *pool)
         ap_hook_handler(aptest_suspend1, NULL, NULL, APR_HOOK_REALLY_FIRST);
         ap_hook_handler(aptest_suspend2, NULL, before_proxy, APR_HOOK_FIRST);
     }
+#endif
+#ifdef APTEST_HAS_SUBREQ
+    ap_hook_handler(aptest_subreq, NULL, NULL, APR_HOOK_REALLY_FIRST);
+    aptest_capture_handle = ap_register_output_filter("APTEST_CAPTURE",
+                                                      aptest_capture_filter,
+                                                      NULL,
+                                                      AP_FTYPE_RESOURCE);
 #endif
 
 }
