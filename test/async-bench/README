@@ -158,6 +158,22 @@ checks/async-reqbody-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   AsyncRequests Off (the reads block: the same responses), "async" also
   checks that no worker is held (mod_status). Ports 18449-18454.
 
+checks/async-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Subrequests run asynchronously (ap_run_sub_req_async()) through
+  mod_aptest's AptestSubreq handler acting before the others (mod_aptest
+  built as for async-wait-check), their output passed to the client or
+  captured by an output filter of the subrequest: proxied subrequests
+  (backend's -addr on port 18456) suspended while mod_proxy waits, 1, 3 and
+  8 per request (8 streamed ones: the backend's descriptor kept by the MPM,
+  never more than EVENT_KEPT_MAX), subrequests suspended by AptestSuspend
+  then resumed to a static file, a nested subrequest, DECLINED to a static
+  file after the subrequests, a subrequest reaching its timeout (504 to the
+  caller, "async" only: blocking subrequests have no deadline), pipelined
+  requests behind requests running subrequests, many clients on few threads,
+  the error log and a graceful stop during subrequests. "sync" is
+  AsyncRequests Off (the subrequests block: the same responses), "async"
+  also checks that no worker is held (mod_status). Ports 18455-18456.
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
