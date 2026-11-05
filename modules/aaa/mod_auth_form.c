@@ -1237,11 +1237,26 @@ static int authenticate_form_logout_handler(request_rec * r)
  * as an internal redirect.
  *
  */
+/**
+ * The end of the request replayed as a subrequest that suspended (e.g.
+ * proxied): the handler's, as if ap_run_sub_req() had returned status.
+ */
+static void authenticate_form_redirect_done(request_rec *rr, int status,
+                                            void *baton)
+{
+    request_rec *r = baton;
+
+    r->status = status;
+    ap_request_finish_suspended(r, (status == HTTP_OK || status == OK)
+                                   ? OK : status);
+}
+
 static int authenticate_form_redirect_handler(request_rec * r)
 {
 
     request_rec *rr = NULL;
     const char *sent_method = NULL, *sent_mimetype = NULL;
+    int status;
 
     if (strcmp(r->handler, FORM_REDIRECT_HANDLER)) {
         return DECLINED;
@@ -1256,8 +1271,16 @@ static int authenticate_form_redirect_handler(request_rec * r)
           "internal redirect to method '%s' and body mimetype '%s' for the "
                       "uri: %s", sent_method, sent_mimetype, r->uri);
 
+        /* Without holding the thread if it suspends: done ends the request
+         * then
+         */
         rr = ap_sub_req_method_uri(sent_method, r->uri, r, r->output_filters);
-        r->status = ap_run_sub_req(rr);
+        status = ap_run_sub_req_async(rr, 0, authenticate_form_redirect_done,
+                                      r);
+        if (status == SUSPENDED) {
+            return SUSPENDED;
+        }
+        r->status = status;
 
     }
     else {
