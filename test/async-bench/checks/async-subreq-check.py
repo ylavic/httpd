@@ -8,7 +8,9 @@ mod_aptest's AptestSuspend then resumed to the next handler (a static file),
 a nested subrequest (a subrequest running its own), the next handler after the
 subrequests (DECLINED to a static file), a subrequest reaching its timeout
 (504 to the caller), many clients on few threads, pipelined requests behind
-requests running subrequests, and a graceful stop during subrequests. "sync"
+requests running subrequests, mod_auth_form's replay of a login form's
+request as a subrequest (here suspended by AptestSuspend), and a graceful
+stop during subrequests. "sync"
 runs them with AsyncRequests Off (the subrequests block: the same responses,
 the threads held), "async" with the waits in the MPM (no thread held while a
 subrequest waits). Then mod_include's include virtual of a proxied URL, which
@@ -62,12 +64,18 @@ FILES = {
     "s/file.txt": b"static file\n",
     "scd/file.txt": b"static file after subrequests\n",
     "long/file.txt": b"long\n",
+    "af/file.txt": b"replayed after the login form\n",
     "inc/index.shtml": b'before\n<!--#include virtual="/p/x?d=%d" -->\nafter\n' % INC_MS,
 }
 for name, data in FILES.items():
     os.makedirs(os.path.dirname(os.path.join(docs, name)), exist_ok=True)
     with open(os.path.join(docs, name), "wb") as f:
         f.write(data)
+
+r = subprocess.run([os.path.join(prefix, "bin", "htpasswd"), "-cb",
+                    os.path.join(work, "htpasswd"), "u", "p"], capture_output=True, text=True)
+if r.returncode != 0:
+    raise SystemExit("htpasswd failed:\n" + r.stdout + r.stderr)
 
 backend = subprocess.Popen([os.path.join(here, "..", "backend"),
                             "-addr", "127.0.0.1:%d" % BACKEND])
@@ -81,7 +89,7 @@ ServerRoot "{prefix}"
 Listen 127.0.0.1:{port}
 PidFile "{work}/httpd.pid"
 ErrorLog "{work}/error_log"
-LogLevel warn aptest:info mpm_event:trace4 proxy:trace5 proxy_http:trace5
+LogLevel warn aptest:info mpm_event:trace4 proxy:trace5 proxy_http:trace5 auth_form:trace5
 LoadModule mpm_event_module modules/mod_mpm_event.so
 LoadModule unixd_module modules/mod_unixd.so
 LoadModule authz_core_module modules/mod_authz_core.so
@@ -90,6 +98,13 @@ LoadModule status_module modules/mod_status.so
 LoadModule include_module modules/mod_include.so
 LoadModule proxy_module modules/mod_proxy.so
 LoadModule proxy_http_module modules/mod_proxy_http.so
+LoadModule session_module modules/mod_session.so
+LoadModule session_cookie_module modules/mod_session_cookie.so
+LoadModule request_module modules/mod_request.so
+LoadModule authn_core_module modules/mod_authn_core.so
+LoadModule authn_file_module modules/mod_authn_file.so
+LoadModule authz_user_module modules/mod_authz_user.so
+LoadModule auth_form_module modules/mod_auth_form.so
 LoadModule aptest_module {aptest}
 ServerName localhost
 DocumentRoot "{work}/htdocs"
@@ -145,6 +160,16 @@ ProxyPass "/p/" "http://127.0.0.1:{backend}/p/"
 <Location "/inc/">
     Options +Includes
     SetOutputFilter INCLUDES
+</Location>
+<Location "/af/">
+    AptestSuspend {suspend_ms} declined
+    AuthType form
+    AuthName af
+    AuthFormProvider file
+    AuthUserFile "{work}/htpasswd"
+    Session On
+    SessionCookieName session path=/
+    Require valid-user
 </Location>
 <Location "/server-status">
     SetHandler server-status
@@ -215,6 +240,25 @@ def get(path, timeout=30):
                 round(time.monotonic() - t0, 2))
     except (http.client.HTTPException, OSError) as e:
         return type(e).__name__, b"", None, round(time.monotonic() - t0, 2)
+    finally:
+        c.close()
+
+
+FORM = (b"httpd_username=u&httpd_password=p&httpd_method=GET"
+        b"&httpd_mimetype=text/plain&httpd_body=")
+
+
+def post_form(path, timeout=30):
+    """status, body, the time taken of a login form posted to path"""
+    t0 = time.monotonic()
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=timeout)
+    try:
+        c.request("POST", path, body=FORM,
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = c.getresponse()
+        return r.status, r.read(), round(time.monotonic() - t0, 2)
+    except (http.client.HTTPException, OSError) as e:
+        return type(e).__name__, b"", round(time.monotonic() - t0, 2)
     finally:
         c.close()
 
@@ -465,6 +509,28 @@ for mode in os.environ.get("MODES", "sync async").split():
               and res[3][0] == 200 and res[3][1] == BACKEND_BODY)
         case("4 pipelined requests, some running subrequests, in order", "-",
              repr([r[0] if r else None for r in res]), None, ok)
+
+        # mod_auth_form: a login form posted to a protected location, its
+        # request replayed (GET) as a subrequest by the redirect handler, here
+        # suspended by AptestSuspend (as the main request is first), then
+        # resumed to the static file: one request, then 16 clients at once
+        before = log()
+        st, body, t = post_form("/af/file.txt")
+        case("mod_auth_form's replay of the login form's request", st, body, None,
+             st == 200 and body == FILES["af/file.txt"])
+        wait_idle()
+        n = 16 if is_async else THREADS
+        smp = Sampler([SUSPEND_MS / 2000.0, 1.5 * SUSPEND_MS / 1000.0])
+        res, t = parallel(n, lambda i: post_form("/af/file.txt?i=%d" % i))
+        busy = smp.held()
+        replays = log()[len(before):].count("subrequest suspended")
+        ok = all(r[0] == 200 and r[1] == FILES["af/file.txt"] for r in res)
+        if is_async:
+            ok = ok and busy is not None and busy <= 1 and replays == n + 1
+        else:
+            ok = ok and replays == 0
+        report.append("%s: %d login forms replayed by mod_auth_form at once: %ss, workers held "
+                      "%s, replays suspended %d: %s" % (mode, n, t, busy, replays, verdict(ok)))
 
         # mod_include's include virtual of a proxied URL: blocking in both
         # modes (from the INCLUDES filter), the same output
