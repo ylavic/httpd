@@ -407,12 +407,17 @@ struct ap_request_body;
  * ap_process_async_request(): core's own, may change; modules use the
  * ap_request_*() functions (http_request.h).
  */
-typedef struct {
+typedef struct ap_request_async_t {
     /** The request */
     request_rec *r;
+    /** The top-level request's state (this one for the top-level request):
+     * its runs and its wait in flight are those of every request of its tree
+     * (one MPM wait per connection) */
+    struct ap_request_async_t *top;
     /** Its phase */
     ap_request_phase_e phase;
-    /** The state of its waits (ap_request_wait()), on first use */
+    /** The state of its waits (ap_request_wait()), on first use: its client
+     * context, and in the top-level request's state the wait in flight */
     struct ap_request_waitset *waitset;
     /** Where its handler chain suspended (ap_invoke_handler()), once it did:
      * the index of the handler that returned SUSPENDED */
@@ -423,9 +428,10 @@ typedef struct {
     const char *old_handler;
     /** Set by the end of the request for the run in progress, if any (a
      * flag of the thread running it, which can't touch the request once
-     * ended) */
+     * ended); the top-level request's */
     int *ended;
-    /** A thread runs the request (its first run, or a continuation) */
+    /** A thread runs the request (its first run, or a continuation); the
+     * top-level request's */
     unsigned int running :1;
     /** Its handlers suspended it (a run returned SUSPENDED), until it's
      * resumed or ends */

@@ -462,7 +462,8 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
 
 /*
  * The runs of a top-level request: the first one (ap_process_async_request()),
- * then once suspended one per continuation of its waits, each entered with
+ * then once suspended one per continuation of its waits (its subrequests'
+ * included, which run within its runs), each entered with
  * async_request_enter() and left with async_request_leave() if the request
  * suspends again, or ended with async_request_end(). A run is probed
  * (PROCESS_REQUEST ENTRY and RETURN), timed on the worker running it
@@ -565,7 +566,8 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
 
 /*
  * Requests' waits (ap_request_wait()): a wait context per target, the state
- * of the request's waits in its ap_request_async_t.
+ * of the request's waits in its ap_request_async_t, the wait in flight in
+ * its top-level request's (a subrequest's waits are its tree's).
  */
 
 /* The kinds of targets */
@@ -594,13 +596,17 @@ typedef struct {
 } request_waitctx_dir_t;
 
 /* A wait context: the public part first */
-typedef struct {
+typedef struct request_waitctx_t {
     ap_request_waitctx_t pub;
     request_waitctx_kind_e kind;
     apr_pool_t *pool;             /* allocated from (the constructor's) */
     conn_rec *c;                  /* whose filters are checked, if any */
     apr_pollfd_t pfd;             /* the target's descriptor, if any */
     ap_mpm_notifier_t *notifier;  /* the target's notifier, if any */
+    struct request_waitctx_t *sock; /* whose dirs and kept count for the
+                                      * target: this context, or for a
+                                      * subrequest's client context the
+                                      * top-level request's (one socket) */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
     apr_interval_time_t timeout;  /* of the wait in flight, resolved */
     unsigned int ready;           /* AP_WAIT_* of the last wait */
@@ -617,10 +623,16 @@ typedef struct {
 
 #define REQUEST_WAITCTX_DIR(direction) (((direction) & AP_WAIT_OUT) ? 1 : 0)
 
-/* The state of a request's waits (ap_request_async_t->waitset) */
+/* The state of a request's waits (ap_request_async_t->waitset): its client
+ * context, and for the top-level request the wait in flight of its tree
+ * (whichever request of the tree waits: one MPM wait per connection)
+ */
 struct ap_request_waitset {
     request_rec *r;
     request_waitctx_t *client;   /* the client's context, if created */
+    /* The wait in flight, in the top-level request's state only */
+    request_rec *waiter;          /* the request that waits (its first
+                                   * context's), given to fn */
     apr_array_header_t *pfds;     /* of the wait, reused */
     int *pfd_ctxs;                /* the index in ctxs of each pfd's context */
     request_waitctx_t **ctxs;    /* of the wait in flight */
@@ -633,9 +645,9 @@ struct ap_request_waitset {
     int ending;                   /* r->pool is being destroyed */
 };
 
-/* The request's pool is being destroyed (its pre-cleanups run before its
- * subpools are destroyed): the contexts' cleanups know that the request
- * ends with them.
+/* The top-level request's pool is being destroyed (its pre-cleanups run
+ * before its subpools are destroyed): the contexts' cleanups know that the
+ * requests end with them.
  */
 static apr_status_t request_waitset_cleanup(void *data)
 {
@@ -653,22 +665,34 @@ static struct ap_request_waitset *request_waitset_get(ap_request_async_t *async)
         request_rec *r = async->r;
         w = apr_pcalloc(r->pool, sizeof(*w));
         w->r = r;
-        w->pfds = apr_array_make(r->pool, 2, sizeof(apr_pollfd_t));
-        apr_pool_pre_cleanup_register(r->pool, w, request_waitset_cleanup);
+        if (async->top == async) {
+            w->pfds = apr_array_make(r->pool, 2, sizeof(apr_pollfd_t));
+            apr_pool_pre_cleanup_register(r->pool, w, request_waitset_cleanup);
+        }
         async->waitset = w;
     }
     return w;
 }
 
+/* The state of the waits of the tree of a context's request (its top-level
+ * request's), if any yet
+ */
+static struct ap_request_waitset *request_waitctx_tree(request_waitctx_t *ctx)
+{
+    ap_request_async_t *async = request_async_get(ctx->pub.r);
+
+    return (async) ? async->top->waitset : NULL;
+}
+
 static void request_waitctx_release_pfd(request_waitctx_t *ctx);
 
 /* The pool of a context (but the client's) is being cleaned up: the context
- * is released, unless the request ends with the pool (the MPM dropped what
- * it kept for the request when it resumed or closed the connection).
- * Destroying the pool while a wait on the context is in flight is a bug of
- * the caller: the context is detached from the wait (which completes
- * without it), its descriptor left to its own pool's cleanup if the MPM
- * keeps it (it can't be released while waited for).
+ * is released, unless the top-level request ends with the pool (the MPM
+ * dropped what it kept for the request when it resumed or closed the
+ * connection). Destroying the pool while a wait on the context is in flight
+ * is a bug of the caller: the context is detached from the wait (which
+ * completes without it), its descriptor left to its own pool's cleanup if
+ * the MPM keeps it (it can't be released while waited for).
  */
 static apr_status_t request_waitctx_cleanup(void *data)
 {
@@ -679,8 +703,9 @@ static apr_status_t request_waitctx_cleanup(void *data)
     int i;
 
     async = request_async_get(r);
-    w = (async) ? async->waitset : NULL;
-    if (ctx->pool == r->pool || (w && w->ending)) {
+    w = (async) ? async->top->waitset : NULL;
+    if (ctx->pool == ((async) ? async->top->r : r)->pool
+        || (w && w->ending)) {
         ctx->released = 1;
         ctx->kept = 0;
         return APR_SUCCESS;
@@ -727,6 +752,7 @@ static request_waitctx_t *request_waitctx_make(request_rec *r,
     ctx->kind = kind;
     ctx->pool = p;
     ctx->pfd.p = p;
+    ctx->sock = ctx;
     if (kind != REQUEST_WAITCTX_CLIENT) {
         apr_pool_pre_cleanup_register(p, ctx, request_waitctx_cleanup);
     }
@@ -748,6 +774,13 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_client_(request_rec *r,
         ctx->pfd.desc_type = APR_POLL_SOCKET;
         ctx->pfd.desc.s = ap_get_conn_socket(r->connection);
         if (w) {
+            /* A subrequest's waits for the client count with the top-level
+             * request's (the same socket, kept by the MPM once)
+             */
+            if (async->top != async) {
+                ctx->sock = (request_waitctx_t *)
+                    ap_request_waitctx_client_(async->top->r, module_index);
+            }
             w->client = ctx;
         }
     }
@@ -891,7 +924,7 @@ static unsigned int request_waitctx_check_ready(request_waitctx_t *ctx,
         return 0;
     }
     if (directions & AP_WAIT_IN) {
-        request_waitctx_dir_t *d = &ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)];
+        request_waitctx_dir_t *d = &ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)];
 
         /* Input kept by the filters after the caller's last read said EAGAIN
          * (e.g. mod_ssl's part of a line) is pending but not readable: after
@@ -955,7 +988,8 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
                                          void *baton)
 {
     struct ap_request_waitset *w = baton;
-    request_rec *r = w->r;
+    request_rec *r = w->r; /* the top-level request, whose run this is */
+    request_rec *waiter = w->waiter;
     ap_request_async_t *async = request_async_get(r);
     ap_request_continuation_fn *fn = w->fn;
     void *fn_baton = w->baton;
@@ -964,6 +998,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
     AP_DEBUG_ASSERT(mpm_r == r);
     AP_DEBUG_ASSERT(async != NULL && !async->running);
+    AP_DEBUG_ASSERT(waiter != NULL);
     async_request_enter(r, async);
     switch (why) {
     case AP_MPM_WAIT_READY:
@@ -1023,23 +1058,25 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
         if (rv == APR_EGENERAL) {
             ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                          APLOG_DEBUG, 0, r, APLOGNO()
+                          APLOG_DEBUG, 0, waiter, APLOGNO()
                           "waiting for the %s%s interrupted (async, %i)",
                           name, dir, (int)why);
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                      APLOG_TRACE5, rv, r,
+                      APLOG_TRACE5, rv, waiter,
                       "done waiting for the %s%s (async)", name, dir);
     }
     w->nctxs = 0;
+    w->waiter = NULL;
 
     /* fn ends the request (r can't be touched afterwards), or it's suspended
      * again (fn waits again), or abandoned (the MPM closes the connection).
+     * The waiter may be a subrequest, whose end doesn't end r.
      */
     if (async) {
         async->ended = &ended;
     }
-    fn(r, rv, fn_baton);
+    fn(waiter, rv, fn_baton);
     if (!ended) {
         async_request_leave(r, async, 0);
     }
@@ -1091,8 +1128,11 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
         apr_interval_time_t t;
 
-        AP_DEBUG_ASSERT(ctx->pub.r == r && !ctx->released && !ctx->waiting);
-        if (ctx->pub.r != r || ctx->released || ctx->waiting) {
+        /* Contexts of requests of the same tree (w's) */
+        AP_DEBUG_ASSERT(request_waitctx_tree(ctx) == w
+                        && !ctx->released && !ctx->waiting);
+        if (request_waitctx_tree(ctx) != w || ctx->released
+            || ctx->waiting) {
             return DECLINED;
         }
         if (ctx->notifier) {
@@ -1146,13 +1186,15 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             pfd->reqevents = 0;
             if (directions[i] & AP_WAIT_IN) {
                 pfd->reqevents |= APR_POLLIN;
-                if (!any && !ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
+                if (!any
+                    && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
                     plan->keep = 0;
                 }
             }
             if (directions[i] & AP_WAIT_OUT) {
                 pfd->reqevents |= APR_POLLOUT;
-                if (!any && !ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
+                if (!any
+                    && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
                     plan->keep = 0;
                 }
             }
@@ -1208,7 +1250,7 @@ static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
         const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
 
         ap_log_rerror(WAITCTX_LOG_MARK(first),
-                      APLOG_TRACE2, rv, w->r,
+                      APLOG_TRACE2, rv, first->pub.r,
                       "polling the %s failed, going on",
                       request_waitctx_kind_names[first->kind]);
     }
@@ -1238,20 +1280,22 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
         }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             if (directions[i] & AP_WAIT_IN) {
-                ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits++;
+                ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits++;
             }
             if (directions[i] & AP_WAIT_OUT) {
-                ctx->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits++;
+                ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits++;
             }
             if (mpm_flags & AP_MPM_WAIT_KEEP_PFDS) {
-                ctx->kept = 1;
+                ctx->sock->kept = 1;
             }
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                      APLOG_TRACE5, 0, w->r, "waiting for the %s%s (async)",
+                      APLOG_TRACE5, 0, ctx->pub.r,
+                      "waiting for the %s%s (async)",
                       request_waitctx_kind_names[ctx->kind],
                       request_waitctx_dir_name(ctx, directions[i]));
     }
+    w->waiter = ctxs[0]->r;
     w->nctxs = nctxs;
     w->timeout = plan->timeout;
     w->timer_expires = plan->timer_expires;
@@ -1295,7 +1339,8 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     if (!ap_request_can_suspend(r)) {
         return DECLINED;
     }
-    w = request_waitset_get(request_async_get(r));
+    /* The wait in flight of r's tree */
+    w = request_waitset_get(request_async_get(r)->top);
 
     rc = request_waitreg_prepare(w, ctxs, nctxs, directions, any, &plan);
     if (rc != AGAIN) {
@@ -1409,6 +1454,7 @@ void ap_process_async_request(request_rec *r)
     if (req_cfg && !r->main && !r->prev) {
         async = apr_pcalloc(r->pool, sizeof(*async));
         async->r = r;
+        async->top = async;
         async->phase = AP_REQUEST_PHASE_NONE;
         req_cfg->async = async;
     }

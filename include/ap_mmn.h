@@ -835,9 +835,9 @@
  *                         ap_run_handler_from() and
  *                         ap_invoke_handler_resume() to http_config.h; and
  *                         ap_core_input_drained(), ap_request_phase_e,
- *                         ap_request_async_t (with its waits, handler_pos,
- *                         handler, old_handler, ended, running and
- *                         suspended),
+ *                         ap_request_async_t (with its top, waits,
+ *                         handler_pos, handler, old_handler, ended, running
+ *                         and suspended),
  *                         core_request_config->async,
  *                         core_request_config->body (struct
  *                         ap_request_body) and
