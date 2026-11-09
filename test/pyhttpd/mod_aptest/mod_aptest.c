@@ -45,6 +45,13 @@
 #define APTEST_HAS_SUBREQ 1
 #endif
 
+/* ap_mpm_register_wait()'s flags: per pfd (an array) or for the wait */
+#if AP_MODULE_MAGIC_AT_LEAST(20260601, 10)
+#define APTEST_WAIT_NO_FLAGS NULL
+#else
+#define APTEST_WAIT_NO_FLAGS 0
+#endif
+
 /* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
 typedef struct {
     int set;
@@ -580,7 +587,8 @@ static int aptest_queue(request_rec *r)
                 pfd->desc.f = in;
                 pfd->reqevents = APR_POLLIN;
                 if (ap_mpm_register_wait(r->connection, p, pfds, q->suspend,
-                                         NULL, 0, aptest_queue_continuation,
+                                         NULL, APTEST_WAIT_NO_FLAGS,
+                                         aptest_queue_continuation,
                                          q) == APR_SUCCESS) {
                     return SUSPENDED;
                 }

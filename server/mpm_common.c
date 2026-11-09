@@ -123,9 +123,11 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_wait,
                             (conn_rec *c, apr_pool_t *p,
                              const apr_array_header_t *pfds,
                              apr_interval_time_t timeout,
-                             ap_mpm_notifier_t *notifier, unsigned int flags,
+                             ap_mpm_notifier_t *notifier,
+                             const unsigned int *pfds_flags,
                              ap_mpm_continuation_fn_t *fn, void *baton),
-                            (c, p, pfds, timeout, notifier, flags, fn, baton),
+                            (c, p, pfds, timeout, notifier, pfds_flags, fn,
+                             baton),
                             APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_timeouts,
                             (const apr_array_header_t *timeouts), (timeouts),
@@ -653,12 +655,12 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
                                               const apr_array_header_t *pfds,
                                               apr_interval_time_t timeout,
                                               ap_mpm_notifier_t *notifier,
-                                              unsigned int flags,
+                                              const unsigned int *pfds_flags,
                                               ap_mpm_continuation_fn_t *fn,
                                               void *baton)
 {
-    return ap_run_mpm_register_wait(c, p, pfds, timeout, notifier, flags,
-                                    fn, baton);
+    return ap_run_mpm_register_wait(c, p, pfds, timeout, notifier,
+                                    pfds_flags, fn, baton);
 }
 
 AP_DECLARE(apr_status_t) ap_mpm_register_timeouts(

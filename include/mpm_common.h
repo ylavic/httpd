@@ -448,7 +448,8 @@ AP_DECLARE_HOOK(apr_status_t, mpm_resume_suspended, (conn_rec*))
 AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
                 (conn_rec *c, apr_pool_t *p, const apr_array_header_t *pfds,
                  apr_interval_time_t timeout, ap_mpm_notifier_t *notifier,
-                 unsigned int flags, ap_mpm_continuation_fn_t *fn, void *baton))
+                 const unsigned int *pfds_flags, ap_mpm_continuation_fn_t *fn,
+                 void *baton))
 
 /** Declare the timeouts of the waits (see ap_mpm_register_timeouts())
  * @ingroup hooks

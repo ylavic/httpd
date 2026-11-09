@@ -853,6 +853,10 @@
  *                         mpm_notifier_attach, mpm_notifier_notified and
  *                         mpm_notifier_detach hooks to mpm_common.h
  * 20260601.9  (2.5.1-dev) Add ap_request_wait_cancel() to http_request.h
+ * 20260601.10 (2.5.1-dev) ap_mpm_register_wait() and the mpm_register_wait
+ *                         hook take AP_MPM_WAIT_KEEP_PFDS and
+ *                         AP_MPM_WAIT_DRAINED per pfd (pfds_flags) instead
+ *                         of flags for the whole wait
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -860,7 +864,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 9     /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 10    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

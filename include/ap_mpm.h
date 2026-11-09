@@ -249,7 +249,8 @@ typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
  * MPM), possibly none (NULL or empty)
  * @param timeout The timeout of the wait, or -1 for none
  * @param notifier The notifier of the wait (ap_mpm_notifier_create()), or NULL
- * @param flags AP_MPM_WAIT_* flags, or 0
+ * @param pfds_flags The AP_MPM_WAIT_* flags of each pfd (pfds_flags[i] for
+ * the i-th of @a pfds, as many), or NULL for none
  * @param fn The continuation called by the MPM when the wait completes
  * @param baton The baton passed to @a fn
  * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
@@ -269,7 +270,7 @@ AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
                                               const apr_array_header_t *pfds,
                                               apr_interval_time_t timeout,
                                               ap_mpm_notifier_t *notifier,
-                                              unsigned int flags,
+                                              const unsigned int *pfds_flags,
                                               ap_mpm_continuation_fn_t *fn,
                                               void *baton);
 
@@ -289,27 +290,29 @@ AP_DECLARE(apr_status_t) ap_mpm_register_timeouts(
         const apr_array_header_t *timeouts);
 
 /**
- * Flag for ap_mpm_register_wait(): keep the pfds registered in the MPM once
- * the wait completes (armed, or their readiness remembered), for the next
- * waits on them, until ap_mpm_release_pfds() or ap_mpm_release_pfd(), or
- * the connection is resumed (ap_mpm_resume_suspended(), the request is done)
- * or closed. Meanwhile the owner of a socket or file (pipe) must release it
- * before giving it up (closing it, or letting another connection use it),
- * mod_proxy does for its backend connections; a kept descriptor whose pool is
- * cleaned up is released then too, but not if it's closed otherwise
- * (apr_socket_close(), apr_file_close()).
- * An MPM that can't keep them ignores the flag (each wait registers its pfds).
+ * Flag of a pfd for ap_mpm_register_wait() (pfds_flags): keep it registered
+ * in the MPM once the wait completes (armed, or its readiness remembered),
+ * for the next waits on it, until ap_mpm_release_pfds() or
+ * ap_mpm_release_pfd(), or the connection is resumed
+ * (ap_mpm_resume_suspended(), the request is done) or closed. Meanwhile the
+ * owner of a socket or file (pipe) must release it before giving it up
+ * (closing it, or letting another connection use it), mod_proxy does for its
+ * backend connections; a kept descriptor whose pool is cleaned up is released
+ * then too, but not if it's closed otherwise (apr_socket_close(),
+ * apr_file_close()). A pfd kept already stays kept for the next waits, with
+ * or without the flag. An MPM that can't keep pfds ignores the flag (each
+ * wait registers its pfds).
  */
 #define AP_MPM_WAIT_KEEP_PFDS (1u << 0)
 
 /**
- * Flag for ap_mpm_register_wait(), with AP_MPM_WAIT_KEEP_PFDS: the caller
- * drained its pfds before waiting, i.e. it waits for each event only after
- * the operation it waits for (read, write) failed with EAGAIN since the last
- * wait, so a kept pfd that fired for the last wait needs no check for a
- * readiness the caller would have consumed. Without it, an MPM that doesn't
- * re-arm the kept pfds checks them (the caller may have stopped reading or
- * writing before EAGAIN, and no new event would come).
+ * Flag of a pfd for ap_mpm_register_wait() (pfds_flags), with
+ * AP_MPM_WAIT_KEEP_PFDS: the caller drained it before waiting, i.e. it waits
+ * for each event only after the operation it waits for (read, write) failed
+ * with EAGAIN since the last wait, so a kept pfd that fired for the last wait
+ * needs no check for a readiness the caller would have consumed. Without it,
+ * an MPM that doesn't re-arm the kept pfds checks it (the caller may have
+ * stopped reading or writing before EAGAIN, and no new event would come).
  */
 #define AP_MPM_WAIT_DRAINED (1u << 1)
 

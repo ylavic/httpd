@@ -905,6 +905,9 @@ struct user_wait {
     event_conn_state_t *cs;
     apr_array_header_t *pfds; /* pfds_buf[pfds_cur] */
     apr_array_header_t *pfds_buf[2]; /* alternated by the waits (cs->p) */
+    apr_array_header_t *pfds_flags; /* AP_MPM_WAIT_* of each pfd (cs->p),
+                                     * AP_MPM_WAIT_KEEP_PFDS only if
+                                     * kept_pfds_enabled() */
     unsigned int pfds_cur;
     listener_poll_type pt_buf[2]; /* pfds_buf[i]'s client_data, so that an
                                    * event fired for the previous wait is
@@ -927,8 +930,6 @@ struct user_wait {
     struct user_continuation continuation; /* fn and baton (ap_mpm_register_wait()), if any */
     ap_mpm_notifier_t *notifier; /* the wait's notifier, if any */
     int wait_notified; /* completes with AP_MPM_WAIT_NOTIFIED (listener only) */
-    int keep; /* keep its pfds registered (AP_MPM_WAIT_KEEP_PFDS) */
-    int drained; /* its user drained the pfds (AP_MPM_WAIT_DRAINED) */
 };
 /* The wait of a timeout queue's entry */
 #define TO_ENTRY_WAIT(e) ((struct user_wait *)(e)->owner)
@@ -3088,6 +3089,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                         apr_pool_t *p,
                                         const apr_array_header_t *user_pfds,
+                                        const unsigned int *user_flags,
                                         apr_interval_time_t timeout,
                                         ap_mpm_notifier_t *notifier);
 static apr_status_t arm_user_wait(event_conn_state_t *cs,
@@ -3290,15 +3292,20 @@ static struct kept_pfd *make_kept_pfd(event_conn_state_t *cs,
  * still ready). The wait is set before the state, read by the events after.
  * With rtnevents, a readiness remembered for reqevents is taken instead
  * (*rtnevents set, the pfd left disarmed): the caller completes the wait.
+ * Whether the wait's user drained the pfd (AP_MPM_WAIT_DRAINED) is given by
+ * drained.
  */
 static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                                  struct user_wait *user_wait,
+                                 int drained,
                                  apr_int16_t reqevents,
                                  apr_int16_t *rtnevents)
 {
 #ifdef APR_POLLET
     int delivered = kept->delivered;
     kept->delivered = 0;
+#else
+    (void)drained;
 #endif
     kept->wait = user_wait;
 #ifdef APR_POLLET
@@ -3321,8 +3328,7 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                     return APR_SUCCESS;
                 }
             }
-            else if (state == KEPT_FIRED && delivered
-                     && user_wait->drained) {
+            else if (state == KEPT_FIRED && delivered && drained) {
                 /* Fired for the last wait only, which got its events, and
                  * its user drained it since: an edge from then on would be
                  * latched (KEPT_READY). Not if the last wait completed
@@ -3634,6 +3640,7 @@ static apr_status_t user_wait_cleanup(void *data)
 static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                         apr_pool_t *p,
                                         const apr_array_header_t *user_pfds,
+                                        const unsigned int *user_flags,
                                         apr_interval_time_t timeout,
                                         ap_mpm_notifier_t *notifier)
 {
@@ -3647,6 +3654,7 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                 cs->p);
         user_wait->pfds_buf[0] = apr_array_make(cs->p, 2, sizeof(apr_pollfd_t));
         user_wait->pfds_buf[1] = apr_array_make(cs->p, 2, sizeof(apr_pollfd_t));
+        user_wait->pfds_flags = apr_array_make(cs->p, 2, sizeof(unsigned int));
         user_wait->pt_buf[0].type = user_wait->pt_buf[1].type = PT_USER;
         user_wait->pt_buf[0].baton = user_wait->pt_buf[1].baton = user_wait;
         user_wait->cs = cs;
@@ -3660,9 +3668,15 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
     user_wait->pfds_cur ^= 1;
     pfds = user_wait->pfds_buf[user_wait->pfds_cur];
     apr_array_clear(pfds);
+    apr_array_clear(user_wait->pfds_flags);
     for (i = 0; user_pfds && i < user_pfds->nelts; i++) {
+        unsigned int flags = (user_flags) ? user_flags[i] : 0;
+        if (!kept_pfds_enabled()) {
+            flags &= ~AP_MPM_WAIT_KEEP_PFDS;
+        }
         APR_ARRAY_PUSH(pfds, apr_pollfd_t) =
             APR_ARRAY_IDX(user_pfds, i, apr_pollfd_t);
+        APR_ARRAY_PUSH(user_wait->pfds_flags, unsigned int) = flags;
     }
     user_wait->pfds = pfds;
     user_wait->pool = p;
@@ -3674,6 +3688,38 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
     user_wait->wait_notified = 0;
     user_wait->notifier = notifier;
     return user_wait;
+}
+
+/* Trace a pfd of a wait being armed: its descriptor, its flags
+ * (AP_MPM_WAIT_*), and whether it's kept (new or already) or not
+ */
+static void trace_user_wait_pfd(event_conn_state_t *cs, int i,
+                                const apr_pollfd_t *pfd, unsigned int flags,
+                                const char *how)
+{
+    int fd = -1;
+
+    if (!APLOG_C_IS_LEVEL(cs->c, APLOG_TRACE7)) {
+        return;
+    }
+    if (pfd->desc_type == APR_POLL_SOCKET) {
+        apr_os_sock_t sd;
+        if (apr_os_sock_get(&sd, pfd->desc.s) == APR_SUCCESS) {
+            fd = (int)sd;
+        }
+    }
+    else if (pfd->desc_type == APR_POLL_FILE) {
+        apr_os_file_t fh;
+        if (apr_os_file_get(&fh, pfd->desc.f) == APR_SUCCESS) {
+            fd = (int)fh;
+        }
+    }
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE7, 0, cs->c,
+                  "wait of connection %" CS_FMT ": pollfd %i (fd %d, events "
+                  "0x%x, flags 0x%x%s%s) %s",
+                  CS_ARG(cs), i, fd, (unsigned int)pfd->reqevents, flags,
+                  (flags & AP_MPM_WAIT_KEEP_PFDS) ? " keep" : "",
+                  (flags & AP_MPM_WAIT_DRAINED) ? " drained" : "", how);
 }
 
 /* Put the user pollfds of a wait into the listener pollset, with its timer */
@@ -3727,6 +3773,8 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 
     for (i = 0; i < pfds->nelts; i++) {
         apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, i, apr_pollfd_t);
+        unsigned int flags = APR_ARRAY_IDX(user_wait->pfds_flags, i,
+                                           unsigned int);
         pfd->rtnevents = 0;
         if (pfd->reqevents) {
             struct kept_pfd *kept = NULL;
@@ -3740,13 +3788,23 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 #endif
 
             /* A kept pfd is registered by its record, this copy only gets
-             * the rtnevents (and user_wait_cleanup() skips it)
+             * the rtnevents (and user_wait_cleanup() skips it). A pfd kept
+             * already stays kept whatever its flags, which only tell whether
+             * a new one is kept.
              */
             if (cs->nkept) {
                 kept = find_kept_pfd(cs, pfd);
             }
-            if (!kept && user_wait->keep) {
+            if (kept) {
+                trace_user_wait_pfd(cs, i, pfd, flags, "kept already");
+            }
+            else if (flags & AP_MPM_WAIT_KEEP_PFDS) {
                 kept = make_kept_pfd(cs, pfd);
+                trace_user_wait_pfd(cs, i, pfd, flags,
+                                    (kept) ? "kept" : "not kept (can't)");
+            }
+            else {
+                trace_user_wait_pfd(cs, i, pfd, flags, "not kept");
             }
             if (kept) {
                 apr_int16_t events = pfd->reqevents, *rtnevents = NULL;
@@ -3764,7 +3822,9 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
                 }
 #endif
                 pfd->client_data = NULL;
-                rc = arm_kept_pfd(kept, user_wait, events, rtnevents);
+                rc = arm_kept_pfd(kept, user_wait,
+                                  !!(flags & AP_MPM_WAIT_DRAINED),
+                                  events, rtnevents);
                 if (rc != APR_SUCCESS) {
                     final_rc = rc;
                 }
@@ -4041,7 +4101,7 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
                                         const apr_array_header_t *pfds,
                                         apr_interval_time_t timeout,
                                         ap_mpm_notifier_t *notifier,
-                                        unsigned int flags,
+                                        const unsigned int *pfds_flags,
                                         ap_mpm_continuation_fn_t *fn, void *baton)
 {
     event_conn_state_t *cs;
@@ -4073,16 +4133,13 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
         }
     }
 
-    user_wait = make_user_wait(cs, p, pfds, timeout, notifier);
+    user_wait = make_user_wait(cs, p, pfds, pfds_flags, timeout, notifier);
     if (notifier) {
         /* Read by event_notify() once armed (under notifiers_mutex) */
         notifier->wait = user_wait;
     }
     user_wait->continuation.fn = fn;
     user_wait->continuation.baton = baton;
-    user_wait->keep = ((flags & AP_MPM_WAIT_KEEP_PFDS)
-                       && kept_pfds_enabled());
-    user_wait->drained = !!(flags & AP_MPM_WAIT_DRAINED);
     cs->pending_wait = user_wait;
     return APR_SUCCESS;
 }

@@ -480,7 +480,9 @@ typedef enum {
  * since its last wait, so a target that the MPM keeps registered across the
  * waits needs no check for a readiness the caller would have consumed
  * (AP_MPM_WAIT_DRAINED). Without it the MPM checks such targets, which is
- * always correct.
+ * always correct. A target of several pending waits of the request (e.g.
+ * both directions of a socket) counts as drained only if all of them said
+ * so.
  */
 #define AP_REQUEST_WAIT_DRAINED (1u << 0)
 

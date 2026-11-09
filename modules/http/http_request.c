@@ -656,7 +656,9 @@ typedef struct request_waitreg_t {
     unsigned int *directions;     /* of ctxs */
     int *pfd_index;               /* each context's pfd in w->pfds for the
                                    * MPM wait (or the delay's poll), or -1 */
-    int nctxs, nalloc;            /* ctxs used, allocated (all three) */
+    unsigned int *keep;           /* of ctxs: whether the MPM may keep each
+                                   * context's pfd */
+    int nctxs, nalloc;            /* ctxs used, allocated (all four) */
     apr_interval_time_t timeout;  /* the smallest of its contexts', capped
                                    * by a deadline, negative for none */
     apr_time_t expiry;            /* when it times out, from its first MPM
@@ -667,7 +669,6 @@ typedef struct request_waitreg_t {
     void *baton;
     apr_status_t status;          /* of its completion, for fn */
     unsigned int timer_expires :1, /* its timeout is a timer's */
-                 keep          :1, /* the MPM may keep its pfds */
                  drained       :1, /* AP_MPM_WAIT_DRAINED for its pfds */
                  registered    :1, /* in an MPM wait already (expiry set) */
                  completed     :1; /* its continuation to be called */
@@ -687,6 +688,8 @@ struct ap_request_waitset {
     request_waitreg_t *spare;        /* done, for the next ones */
     apr_array_header_t *pfds;     /* of the MPM wait, or of a new wait's
                                    * delay (poll), reused */
+    apr_array_header_t *pfds_flags; /* AP_MPM_WAIT_* of each of pfds for the
+                                     * MPM wait, reused */
     apr_time_t expiry;            /* when the MPM wait times out, zero for
                                    * never */
     ap_mpm_notifier_t *notifier;  /* the notifier given to the MPM for the
@@ -736,6 +739,7 @@ static struct ap_request_waitset *request_waitset_get(ap_request_async_t *async)
         w->r = r;
         if (async->top == async) {
             w->pfds = apr_array_make(r->pool, 2, sizeof(apr_pollfd_t));
+            w->pfds_flags = apr_array_make(r->pool, 2, sizeof(unsigned int));
             apr_pool_pre_cleanup_register(r->pool, w, request_waitset_cleanup);
         }
         async->waitset = w;
@@ -773,6 +777,7 @@ static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int 
                                    g->nalloc * sizeof(*g->directions));
         g->pfd_index = apr_palloc(w->r->pool,
                                   g->nalloc * sizeof(*g->pfd_index));
+        g->keep = apr_palloc(w->r->pool, g->nalloc * sizeof(*g->keep));
     }
     g->next = NULL;
     g->waiter = NULL;
@@ -784,7 +789,6 @@ static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int 
     g->baton = NULL;
     g->status = APR_SUCCESS;
     g->timer_expires = 0;
-    g->keep = 1;
     g->drained = 0;
     g->registered = 0;
     g->completed = 0;
@@ -1400,11 +1404,14 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
 /* The pfd of the MPM wait for a context's descriptor: one per descriptor
  * (e.g. both directions of the client's socket waited for by two waits),
- * its events those of all the contexts. Returns its index in w->pfds.
+ * its events those of all the contexts, its flags (w->pfds_flags) those that
+ * all of them give: kept if the MPM may keep it for each, drained if each
+ * one's wait drained it. Returns its index in w->pfds.
  */
 static int request_waitset_pfd(struct ap_request_waitset *w,
                                const request_waitctx_t *ctx,
-                               unsigned int directions)
+                               unsigned int directions,
+                               unsigned int flags)
 {
     apr_pollfd_t *pfd = NULL;
     int k;
@@ -1425,6 +1432,10 @@ static int request_waitset_pfd(struct ap_request_waitset *w,
         pfd->reqevents = 0;
         pfd->rtnevents = 0;
         pfd->client_data = NULL;
+        APR_ARRAY_PUSH(w->pfds_flags, unsigned int) = flags;
+    }
+    else {
+        APR_ARRAY_IDX(w->pfds_flags, k, unsigned int) &= flags;
     }
     if (directions & AP_WAIT_IN) {
         pfd->reqevents |= APR_POLLIN;
@@ -1438,11 +1449,12 @@ static int request_waitset_pfd(struct ap_request_waitset *w,
 /* Give the pending waits of a tree to the MPM, as one wait (one per
  * connection): their pfds (one per descriptor), the tree's notifier if some
  * wait for a notifier, the earliest of their timeouts (counted from their
- * first MPM wait), the descriptors kept if all the waits allow it (and drained
- * if all were). Called at the end of a run of the tree
- * (async_request_leave()). A wait with nothing left to complete it is dropped.
- * If the MPM refuses (e.g. a module's own wait registered in this run), the
- * waits stay pending, for the next run's end.
+ * first MPM wait), each descriptor kept if the MPM may keep it for every
+ * context on it, and drained if all the waits on it drained it (and it's
+ * kept). Called at the end of a run of the tree (async_request_leave()). A
+ * wait with nothing left to complete it is dropped. If the MPM refuses (e.g. a
+ * module's own wait registered in this run), the waits stay pending, for the
+ * next run's end.
  */
 static void request_waitset_register(struct ap_request_waitset *w)
 {
@@ -1450,11 +1462,11 @@ static void request_waitset_register(struct ap_request_waitset *w)
     request_waitreg_t **pg, *g;
     apr_interval_time_t timeout = -1;
     apr_time_t now = apr_time_now();
-    unsigned int mpm_flags = 0;
-    int keep = 1, drained = 1, notifiers = 0, nwaits = 0, i;
+    int keep = 0, notifiers = 0, nwaits = 0, i, k;
     apr_status_t rv;
 
     apr_array_clear(w->pfds);
+    apr_array_clear(w->pfds_flags);
     pg = &w->waits;
     while ((g = *pg) != NULL) {
         apr_interval_time_t left = -1;
@@ -1471,8 +1483,19 @@ static void request_waitset_register(struct ap_request_waitset *w)
                 nnotifiers++;
             }
             else if (REQUEST_WAITCTX_HAS_PFD(ctx) && !ctx->released) {
-                g->pfd_index[i] = request_waitset_pfd(w, ctx,
-                                                      g->directions[i]);
+                /* A readiness the MPM saw for the last wait of a kept pfd
+                 * was consumed since if the wait's caller said so (or its
+                 * delay's poll found none)
+                 */
+                unsigned int flags = 0;
+                if (g->keep[i]) {
+                    flags |= AP_MPM_WAIT_KEEP_PFDS;
+                    if (g->drained) {
+                        flags |= AP_MPM_WAIT_DRAINED;
+                    }
+                }
+                g->pfd_index[i] = request_waitset_pfd(w, ctx, g->directions[i],
+                                                      flags);
                 npfds++;
             }
         }
@@ -1496,10 +1519,6 @@ static void request_waitset_register(struct ap_request_waitset *w)
         if (left >= 0 && (timeout < 0 || left < timeout)) {
             timeout = left;
         }
-        if (npfds) {
-            keep &= g->keep;
-            drained &= g->drained;
-        }
         notifiers += nnotifiers;
         nwaits++;
         pg = &g->next;
@@ -1509,14 +1528,9 @@ static void request_waitset_register(struct ap_request_waitset *w)
     }
     w->expiry = (timeout >= 0) ? now + timeout : 0;
 
-    /* A readiness the MPM saw for the last wait of a kept pfd was consumed
-     * since if each wait's caller said so (or its delay's poll found none).
-     */
-    if (w->pfds->nelts && keep) {
-        mpm_flags = AP_MPM_WAIT_KEEP_PFDS;
-        if (drained) {
-            mpm_flags |= AP_MPM_WAIT_DRAINED;
-        }
+    for (k = 0; k < w->pfds_flags->nelts && !keep; k++) {
+        keep = !!(APR_ARRAY_IDX(w->pfds_flags, k, unsigned int)
+                  & AP_MPM_WAIT_KEEP_PFDS);
     }
     if (notifiers) {
         /* Its previous wait is done, notified still if one of the
@@ -1530,7 +1544,8 @@ static void request_waitset_register(struct ap_request_waitset *w)
         }
     }
     rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, timeout,
-                              (notifiers) ? w->notifier : NULL, mpm_flags,
+                              (notifiers) ? w->notifier : NULL,
+                              (const unsigned int *)w->pfds_flags->elts,
                               request_waitset_continuation, w);
     if (rv != APR_SUCCESS) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
@@ -1546,10 +1561,12 @@ static void request_waitset_register(struct ap_request_waitset *w)
     }
     w->in_mpm = 1;
 
-    if (mpm_flags & AP_MPM_WAIT_KEEP_PFDS) {
+    if (keep) {
         for (g = w->waits; g; g = g->next) {
             for (i = 0; i < g->nctxs; i++) {
-                if (g->pfd_index[i] >= 0) {
+                k = g->pfd_index[i];
+                if (k >= 0 && (APR_ARRAY_IDX(w->pfds_flags, k, unsigned int)
+                               & AP_MPM_WAIT_KEEP_PFDS)) {
                     request_waitctx_keep(g->ctxs[i]->sock);
                 }
             }
@@ -1568,12 +1585,13 @@ typedef struct {
 /* Check the contexts of a new wait, and whether some are ready in their
  * connections' filters already, then build the wait: its contexts, the
  * smallest timeout (and whether it's a timer's), whether the MPM can keep
- * its descriptors; the descriptors to poll for the delay in w->pfds (each
- * context's index in g->pfd_index), the notifiers and the smallest delay in
- * plan. The MPM keeps the descriptors registered from their second wait in
- * the same direction, or from the first for several targets (repeated waits
- * by nature). Returns DECLINED for a context that can't wait (released, or
- * pending in another wait), OK if some are ready, else AGAIN.
+ * each of its descriptors (g->keep); the descriptors to poll for the delay
+ * in w->pfds (each context's index in g->pfd_index), the notifiers and the
+ * smallest delay in plan. The MPM keeps the descriptors registered from
+ * their second wait in the same direction, or from the first for several
+ * targets (repeated waits by nature). Returns DECLINED for a context that
+ * can't wait (released, or pending in another wait), OK if some are ready,
+ * else AGAIN.
  */
 static int request_waitreg_prepare(struct ap_request_waitset *w,
                                    request_waitreg_t *g,
@@ -1610,6 +1628,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         g->ctxs[i] = ctx;
         g->directions[i] = directions[i];
         g->pfd_index[i] = -1;
+        g->keep[i] = 1;
         if (ctx->notifier) {
             /* Attached to the tree's notifier by
              * request_waitreg_attach_notifiers()
@@ -1658,14 +1677,14 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
                 pfd->reqevents |= APR_POLLIN;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
-                    g->keep = 0;
+                    g->keep[i] = 0;
                 }
             }
             if (directions[i] & AP_WAIT_OUT) {
                 pfd->reqevents |= APR_POLLOUT;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
-                    g->keep = 0;
+                    g->keep[i] = 0;
                 }
             }
             pfd->rtnevents = 0;
