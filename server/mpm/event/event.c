@@ -989,14 +989,28 @@ struct kept_anchor {
  * event_notify()), from any thread; it's created before it's given to
  * ap_mpm_register_wait() so that it can be notified before. Once that wait
  * is done, a re-arm (event_notifier_rearm()) makes it new again for the next
- * wait. Protected by notifiers_mutex.
+ * wait. A notifier attached to another one, its parent
+ * (event_notifier_attach()), serves a wait through it: notifying it notifies
+ * the parent, which is given to the waits, until it's detached
+ * (event_notifier_detach()), its wait done then. Protected by
+ * notifiers_mutex.
  */
 struct ap_mpm_notifier_t {
     APR_RING_ENTRY(ap_mpm_notifier_t) link;  /* in notified_user_waits */
     struct user_wait *wait;                  /* its wait (once used) */
-    unsigned int used     :1, /* given to ap_mpm_register_wait() */
-                 done     :1, /* its wait completed, or dropped unarmed */
-                 notified :1, /* ap_mpm_notify() was called */
+    struct ap_mpm_notifier_t *parent;        /* attached to, if any */
+    /* in its parent's attached */
+    APR_RING_ENTRY(ap_mpm_notifier_t) attached_link;
+    /* the notifiers attached to it, as a parent */
+    APR_RING_HEAD(notifier_attached_t, ap_mpm_notifier_t) attached;
+    /* ap_mpm_notify() was called: set and cleared under notifiers_mutex,
+     * read without it by event_notifier_notified() (atomics)
+     */
+    apr_uint32_t notified;
+    unsigned int used     :1, /* given to ap_mpm_register_wait(), or
+                               * attached */
+                 done     :1, /* its wait completed, or dropped unarmed, or
+                               * detached */
                  armed    :1, /* its wait armed (pollset or timer) */
                  queued   :1; /* in notified_user_waits */
 };
@@ -3783,7 +3797,7 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         int wake = 0;
         apr_thread_mutex_lock(notifiers_mutex);
         notifier->armed = 1;
-        if (notifier->notified) {
+        if (apr_atomic_read32(&notifier->notified)) {
             APR_RING_INSERT_TAIL(notified_user_waits, notifier,
                                  ap_mpm_notifier_t, link);
             notifier->queued = 1;
@@ -3830,12 +3844,14 @@ static apr_status_t event_notifier_create(ap_mpm_notifier_t **notifier,
         return APR_ENOTIMPL; /* not a connection of this MPM */
     }
     *notifier = apr_pcalloc(p, sizeof(**notifier));
+    APR_RING_INIT(&(*notifier)->attached, ap_mpm_notifier_t, attached_link);
     return APR_SUCCESS;
 }
 
 /* Re-arm a notifier for another wait (ap_mpm_notifier_rearm()), once its
  * previous wait is done (or none was registered): new again, a notification
- * made until now dropped. Refused while its wait is registered or armed.
+ * made until now dropped. Refused while its wait is registered or armed, or
+ * while it's attached. A parent stays notified if a notifier attached to it is.
  */
 static apr_status_t event_notifier_rearm(ap_mpm_notifier_t *notifier)
 {
@@ -3846,14 +3862,96 @@ static apr_status_t event_notifier_rearm(ap_mpm_notifier_t *notifier)
         rv = APR_EBUSY; /* its wait is in flight */
     }
     else {
-        AP_DEBUG_ASSERT(!notifier->armed && !notifier->queued);
+        ap_mpm_notifier_t *n;
+
+        AP_DEBUG_ASSERT(!notifier->armed && !notifier->queued
+                        && !notifier->parent);
         notifier->used = 0;
         notifier->done = 0;
-        notifier->notified = 0;
+        apr_atomic_set32(&notifier->notified, 0);
         notifier->wait = NULL;
+        for (n = APR_RING_FIRST(&notifier->attached);
+             n != APR_RING_SENTINEL(&notifier->attached, ap_mpm_notifier_t,
+                                    attached_link);
+             n = APR_RING_NEXT(n, attached_link)) {
+            if (apr_atomic_read32(&n->notified)) {
+                apr_atomic_set32(&notifier->notified, 1);
+                break;
+            }
+        }
     }
     apr_thread_mutex_unlock(notifiers_mutex);
     return rv;
+}
+
+static int event_notify(ap_mpm_notifier_t *notifier);
+
+/* Attach a notifier to a parent (ap_mpm_notifier_attach()): it serves a wait
+ * through the parent from now on, as if given to it, until detached. A
+ * notification made before counts, as for a wait.
+ */
+static apr_status_t event_notifier_attach(ap_mpm_notifier_t *notifier,
+                                          ap_mpm_notifier_t *parent)
+{
+    apr_status_t rv = APR_SUCCESS;
+    int notified = 0;
+
+    if (notifier == parent) {
+        return APR_EINVAL;
+    }
+    apr_thread_mutex_lock(notifiers_mutex);
+    if (notifier->used) {
+        rv = APR_EBUSY; /* served a wait (or serves one), not re-armed */
+    }
+    else if (parent->parent
+             || !APR_RING_EMPTY(&notifier->attached, ap_mpm_notifier_t,
+                                attached_link)) {
+        rv = APR_EINVAL; /* one level only */
+    }
+    else {
+        notifier->used = 1;
+        notifier->parent = parent;
+        APR_RING_INSERT_TAIL(&parent->attached, notifier, ap_mpm_notifier_t,
+                             attached_link);
+        notified = apr_atomic_read32(&notifier->notified);
+    }
+    apr_thread_mutex_unlock(notifiers_mutex);
+
+    if (notified) {
+        /* Notified before it was attached: pass the notification on to
+         * the parent's wait (event_notify() takes notifiers_mutex)
+         */
+        (void)event_notify(parent);
+    }
+    return rv;
+}
+
+/* Whether a notifier was notified since its creation or last re-arm
+ * (ap_mpm_notifier_notified())
+ */
+static apr_status_t event_notifier_notified(ap_mpm_notifier_t *notifier)
+{
+    /* Without notifiers_mutex: the answer can be stale as soon as it's
+     * read anyway, and a later notification marks the parent notified
+     * too, which stays notified across its re-arm for the next wait.
+     */
+    return (apr_atomic_read32(&notifier->notified)) ? APR_SUCCESS
+                                                    : APR_EAGAIN;
+}
+
+/* Detach a notifier from its parent (ap_mpm_notifier_detach()): the wait it
+ * served is done, it can be re-armed.
+ */
+static apr_status_t event_notifier_detach(ap_mpm_notifier_t *notifier)
+{
+    apr_thread_mutex_lock(notifiers_mutex);
+    if (notifier->parent) {
+        APR_RING_REMOVE(notifier, attached_link);
+        notifier->parent = NULL;
+        notifier->done = 1;
+    }
+    apr_thread_mutex_unlock(notifiers_mutex);
+    return APR_SUCCESS;
 }
 
 /* Notify a wait (ap_mpm_notify()), from any thread: an armed wait is queued
@@ -3862,6 +3960,9 @@ static apr_status_t event_notifier_rearm(ap_mpm_notifier_t *notifier)
  * the wait has completed, user_wait_cleanup() has disarmed it so nothing is
  * done, but for the notification recorded, which a re-arm drops
  * (event_notifier_rearm()).
+ *
+ * A notifier attached to a parent (event_notifier_attach()) notifies the
+ * parent.
  *
  * A polling worker completes an armed wait itself (EVENT_WORKER_NOTIFY): it
  * claims it under notifiers_mutex, so that it can't complete otherwise
@@ -3877,7 +3978,12 @@ static int event_notify(ap_mpm_notifier_t *notifier)
 #endif
 
     apr_thread_mutex_lock(notifiers_mutex);
-    notifier->notified = 1;
+    apr_atomic_set32(&notifier->notified, 1);
+    if (notifier->parent) {
+        /* Attached: it serves its parent's wait */
+        notifier = notifier->parent;
+        apr_atomic_set32(&notifier->notified, 1);
+    }
     if (notifier->armed && !notifier->queued) {
 #ifdef EVENT_WORKER_NOTIFY
         if (worker_thread_polls) {
@@ -9675,6 +9781,12 @@ static void event_hooks(apr_pool_t * p)
     ap_hook_mpm_notify(event_notify, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_mpm_notifier_rearm(event_notifier_rearm, NULL, NULL,
                                APR_HOOK_MIDDLE);
+    ap_hook_mpm_notifier_attach(event_notifier_attach, NULL, NULL,
+                                APR_HOOK_MIDDLE);
+    ap_hook_mpm_notifier_notified(event_notifier_notified, NULL, NULL,
+                                  APR_HOOK_MIDDLE);
+    ap_hook_mpm_notifier_detach(event_notifier_detach, NULL, NULL,
+                                APR_HOOK_MIDDLE);
 
     ap_hook_pre_connection(event_pre_connection, NULL, NULL, APR_HOOK_REALLY_FIRST);
     ap_hook_protocol_switch(event_protocol_switch, NULL, NULL, APR_HOOK_REALLY_FIRST);

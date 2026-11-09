@@ -381,6 +381,47 @@ AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier);
  */
 AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier);
 
+/**
+ * Attach a notifier to another one, its parent, which is given to the waits
+ * (ap_mpm_register_wait()) instead of it: one wait for several notifiers.
+ * Notifying it (ap_mpm_notify()) notifies the parent, until it's detached
+ * (ap_mpm_notifier_detach()); meanwhile it serves a wait as if given to it
+ * (it can't be re-armed nor attached again), the parent's waits completing
+ * for it until it's detached, whose notifications are kept: a parent re-armed
+ * while a notifier attached to it is notified is notified (its next wait
+ * completes as soon as it is armed), so no notification is lost between the
+ * parent's waits.
+ * @param notifier The notifier
+ * @param parent The parent, not attached itself
+ * @return APR_SUCCESS; APR_EBUSY if @a notifier served a wait and wasn't
+ * re-armed, or serves one; APR_EINVAL if @a parent is @a notifier, is attached
+ * itself, or @a notifier is a parent; or APR_ENOTIMPL if the MPM doesn't
+ * support it
+ * @remark A notification made before the attach counts, as for a wait.
+ * @remark It's called from the thread processing the request, as the waits
+ * are registered. Detach the notifier before its parent's pool is cleaned up.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_attach(ap_mpm_notifier_t *notifier,
+                                                ap_mpm_notifier_t *parent);
+
+/**
+ * Whether a notifier was notified since its creation or its last re-arm,
+ * e.g. which notifiers attached to a parent completed its wait.
+ * @param notifier The notifier
+ * @return non-zero if notified, zero otherwise or if the MPM doesn't support
+ * notifiers
+ */
+AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier);
+
+/**
+ * Detach a notifier from its parent (ap_mpm_notifier_attach()), the wait it
+ * served done: notifying it does nothing from now on, until it's re-armed
+ * (ap_mpm_notifier_rearm()) for another wait.
+ * @param notifier The notifier, attached or not (nothing done then)
+ * @remark It's called from the thread processing the request.
+ */
+AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier);
+
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(
         apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton);

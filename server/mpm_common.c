@@ -77,6 +77,9 @@
     APR_HOOK_LINK(mpm_notifier_create) \
     APR_HOOK_LINK(mpm_notify) \
     APR_HOOK_LINK(mpm_notifier_rearm) \
+    APR_HOOK_LINK(mpm_notifier_attach) \
+    APR_HOOK_LINK(mpm_notifier_notified) \
+    APR_HOOK_LINK(mpm_notifier_detach) \
     APR_HOOK_LINK(end_generation) \
     APR_HOOK_LINK(child_status) \
     APR_HOOK_LINK(output_pending) \
@@ -136,6 +139,16 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_create,
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm_notify,
                             (ap_mpm_notifier_t *notifier), (notifier), DECLINED)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_rearm,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_attach,
+                            (ap_mpm_notifier_t *notifier,
+                             ap_mpm_notifier_t *parent),
+                            (notifier, parent), APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_notified,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_detach,
                             (ap_mpm_notifier_t *notifier), (notifier),
                             APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, output_pending,
@@ -687,6 +700,22 @@ AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier)
 AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier)
 {
     return ap_run_mpm_notifier_rearm(notifier);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_notifier_attach(ap_mpm_notifier_t *notifier,
+                                                ap_mpm_notifier_t *parent)
+{
+    return ap_run_mpm_notifier_attach(notifier, parent);
+}
+
+AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier)
+{
+    return ap_run_mpm_notifier_notified(notifier) == APR_SUCCESS;
+}
+
+AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier)
+{
+    (void)ap_run_mpm_notifier_detach(notifier);
 }
 
 AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(apr_time_t t,

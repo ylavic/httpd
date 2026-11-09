@@ -478,6 +478,25 @@ AP_DECLARE_HOOK(int, mpm_notify, (ap_mpm_notifier_t *notifier))
 AP_DECLARE_HOOK(apr_status_t, mpm_notifier_rearm,
                 (ap_mpm_notifier_t *notifier))
 
+/** Attach a notifier to a parent (see ap_mpm_notifier_attach())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_attach,
+                (ap_mpm_notifier_t *notifier, ap_mpm_notifier_t *parent))
+
+/** Whether a notifier was notified (see ap_mpm_notifier_notified()):
+ * APR_SUCCESS if so, APR_EAGAIN if not
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_notified,
+                (ap_mpm_notifier_t *notifier))
+
+/** Detach a notifier from its parent (see ap_mpm_notifier_detach())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_detach,
+                (ap_mpm_notifier_t *notifier))
+
 /**
  * Get MPM name (e.g., "prefork" or "event")
  * @ingroup hooks
