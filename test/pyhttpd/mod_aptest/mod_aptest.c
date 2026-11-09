@@ -53,6 +53,7 @@
 /* ap_mpm_register_wait()'s flags: per pfd (an array) or for the wait */
 #if AP_MODULE_MAGIC_AT_LEAST(20260601, 10)
 #define APTEST_WAIT_NO_FLAGS NULL
+#define APTEST_HAS_PFDFLAGS 1
 #else
 #define APTEST_WAIT_NO_FLAGS 0
 #endif
@@ -100,6 +101,7 @@ typedef struct {
 #define APTEST_WAIT_NOTIFIER 4
 #define APTEST_WAIT_PFDPOOL  5
 #define APTEST_WAIT_MULTI    6
+#define APTEST_WAIT_PFDFLAGS 7
 
 static void *aptest_create_dir_conf(apr_pool_t *p, char *dir)
 {
@@ -191,9 +193,14 @@ static const char *aptest_set_wait(cmd_parms *cmd, void *dconf,
         conf->wait_uri = ms; /* the subrequest's, optional */
     }
 #endif
+#ifdef APTEST_HAS_PFDFLAGS
+    else if (strcmp(mode, "pfdflags") == 0 && !ms) {
+        conf->wait_mode = APTEST_WAIT_PFDFLAGS;
+    }
+#endif
     else {
         return "AptestWait timer <ms> | echo | digest | notifier | "
-               "pfdpool <n> | multi [<uri>]";
+               "pfdpool <n> | multi [<uri>] | pfdflags";
     }
     return NULL;
 }
@@ -337,7 +344,8 @@ static const char *aptest_set_subreq(cmd_parms *cmd, void *dconf,
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
-                   "digest, notifier, pfdpool <n> or multi [<uri>]"),
+                   "digest, notifier, pfdpool <n>, multi [<uri>] or "
+                   "pfdflags"),
 #ifdef APTEST_HAS_RESUME
     AP_INIT_TAKE_ARGV("AptestSuspend", aptest_set_suspend, NULL, OR_ALL,
                       "the first suspending handler: <ms> "
@@ -1168,6 +1176,9 @@ static int aptest_pfdpool(request_rec *r, const aptest_dir_conf *conf)
 #ifdef APTEST_HAS_MULTI
 static int aptest_multi(request_rec *r, const aptest_dir_conf *conf);
 #endif
+#ifdef APTEST_HAS_PFDFLAGS
+static int aptest_pfdflags(request_rec *r);
+#endif
 
 static int aptest_wait(request_rec *r)
 {
@@ -1193,6 +1204,11 @@ static int aptest_wait(request_rec *r)
 #ifdef APTEST_HAS_MULTI
     if (conf->wait_mode == APTEST_WAIT_MULTI) {
         return aptest_multi(r, conf);
+    }
+#endif
+#ifdef APTEST_HAS_PFDFLAGS
+    if (conf->wait_mode == APTEST_WAIT_PFDFLAGS) {
+        return aptest_pfdflags(r);
     }
 #endif
 
@@ -2274,6 +2290,258 @@ respond:
     return OK;
 }
 #endif /* APTEST_HAS_MULTI */
+
+#ifdef APTEST_HAS_PFDFLAGS
+/*
+ * The MPM's keep and drained flags per descriptor ("AptestWait pfdflags"):
+ * waits on two pipes, A and B, whose MPM waits (one per run, the union of
+ * the pending waits) give each pipe its own flags, which mpm_event traces
+ * (trace7) per pollfd as it arms them:
+ *  1. the handler waits for A (a, drained): A not kept (its first wait);
+ *  2. A written at 20ms: a's continuation (A1) reads A until EAGAIN, waits
+ *     for it again (drained) and for B (b, not drained): A kept (its second
+ *     wait) and drained, B not kept;
+ *  3. B written at 60ms: b's continuation (B1) reads B until EAGAIN and
+ *     waits for it again (not drained): A (carried) kept and drained, B kept
+ *     and not drained;
+ *  4. A written at 100ms: a's continuation (A2) reads A until EAGAIN, waits
+ *     for it again (drained) and with a new context on it (a2, its first
+ *     wait, drained), and for B with a new context (b2, with
+ *     ap_request_wait_any(): kept from the first, drained): A neither kept
+ *     nor drained (a2 doesn't allow keeping, the MPM keeps it already), B
+ *     kept but not drained (b didn't drain it);
+ *  5. A written at 140ms: a's then a2's continuations (A3, A3b): B kept,
+ *     not drained (b and b2 carried);
+ * then a timer of 300ms (F) ends the request, b's and b2's waits dropped.
+ * The response: "pfdflags: order=<the continuations called, in order>
+ * A=<fd> B=<fd>", e.g. "pfdflags: order=A1,B1,A2,A3,A3b,F A=12 B=14",
+ * "pfdflags: declined" when the request can't wait asynchronously (e.g.
+ * AsyncRequests Off), "pfdflags: none" without threads.
+ */
+typedef struct {
+    request_rec *r;
+    ap_request_waitctx_t *a, *a2, *b, *b2, *f;
+    apr_file_t *a_in, *a_out, *b_in, *b_out;
+#if APR_HAS_THREADS
+    apr_thread_t *thread;       /* writing, until joined */
+#endif
+    char order[64];             /* the continuations called, in order */
+    apr_size_t olen;
+    int failed;
+} aptest_pfdflags_t;
+
+static void aptest_pfdflags_called(aptest_pfdflags_t *m, const char *which,
+                                   apr_status_t status)
+{
+    if (m->olen + strlen(which) + 2 < sizeof(m->order)) {
+        m->olen += apr_snprintf(m->order + m->olen,
+                                sizeof(m->order) - m->olen, "%s%s",
+                                m->olen ? "," : "", which);
+    }
+    if (status != APR_SUCCESS) {
+        m->failed = 1;
+    }
+}
+
+/* Read a pipe until EAGAIN (drained) */
+static void aptest_pfdflags_drain(apr_file_t *f)
+{
+    char buf[64];
+    apr_size_t len;
+
+    do {
+        len = sizeof(buf);
+    } while (apr_file_read(f, buf, &len) == APR_SUCCESS);
+}
+
+#if APR_HAS_THREADS
+static void *APR_THREAD_FUNC aptest_pfdflags_thread(apr_thread_t *thd,
+                                                    void *data)
+{
+    aptest_pfdflags_t *m = data;
+    apr_size_t len;
+
+    apr_sleep(apr_time_from_msec(20));
+    len = 1;
+    apr_file_write(m->a_out, "a", &len);
+    apr_sleep(apr_time_from_msec(40));
+    len = 1;
+    apr_file_write(m->b_out, "b", &len);
+    apr_sleep(apr_time_from_msec(40));
+    len = 1;
+    apr_file_write(m->a_out, "a", &len);
+    apr_sleep(apr_time_from_msec(40));
+    len = 1;
+    apr_file_write(m->a_out, "a", &len);
+    apr_thread_exit(thd, APR_SUCCESS);
+    return NULL;
+}
+
+static apr_status_t aptest_pfdflags_join(void *data)
+{
+    aptest_pfdflags_t *m = data;
+    apr_status_t rv;
+
+    if (m->thread) {
+        apr_thread_join(&rv, m->thread);
+        m->thread = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+static void aptest_pfdflags_check(aptest_pfdflags_t *m, int rc)
+{
+    if (rc != SUSPENDED) {
+        m->failed = 1;
+    }
+}
+
+/* b's and b2's last waits: dropped by the request's end, never called */
+static void aptest_pfdflags_never(request_rec *r, apr_status_t status,
+                                  void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+
+    aptest_pfdflags_called(m, "X", status);
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                  "aptest-wait: pfdflags: a dropped wait's continuation "
+                  "called");
+}
+
+static void aptest_pfdflags_a3(request_rec *r, apr_status_t status,
+                               void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+
+    aptest_pfdflags_called(m, "A3", status);
+    aptest_pfdflags_drain(m->a_in);
+}
+
+static void aptest_pfdflags_a3b(request_rec *r, apr_status_t status,
+                                void *baton)
+{
+    aptest_pfdflags_called(baton, "A3b", status);
+}
+
+static void aptest_pfdflags_a2(request_rec *r, apr_status_t status,
+                               void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+    unsigned int in = AP_WAIT_IN;
+    apr_pollfd_t pfd;
+
+    aptest_pfdflags_called(m, "A2", status);
+    aptest_pfdflags_drain(m->a_in);
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_FILE;
+    pfd.desc.f = m->a_in;
+    m->a2 = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    pfd.desc.f = m->b_in;
+    m->b2 = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    aptest_pfdflags_check(m, ap_request_wait(m->a, AP_WAIT_IN,
+                                             AP_REQUEST_WAIT_DRAINED,
+                                             aptest_pfdflags_a3, m));
+    aptest_pfdflags_check(m, ap_request_wait(m->a2, AP_WAIT_IN,
+                                             AP_REQUEST_WAIT_DRAINED,
+                                             aptest_pfdflags_a3b, m));
+    aptest_pfdflags_check(m, ap_request_wait_any(&m->b2, 1, &in,
+                                                 AP_REQUEST_WAIT_DRAINED,
+                                                 aptest_pfdflags_never, m));
+}
+
+static void aptest_pfdflags_b1(request_rec *r, apr_status_t status,
+                               void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+
+    aptest_pfdflags_called(m, "B1", status);
+    aptest_pfdflags_drain(m->b_in);
+    aptest_pfdflags_check(m, ap_request_wait(m->b, AP_WAIT_IN, 0,
+                                             aptest_pfdflags_never, m));
+}
+
+static void aptest_pfdflags_a1(request_rec *r, apr_status_t status,
+                               void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+
+    aptest_pfdflags_called(m, "A1", status);
+    aptest_pfdflags_drain(m->a_in);
+    aptest_pfdflags_check(m, ap_request_wait(m->a, AP_WAIT_IN,
+                                             AP_REQUEST_WAIT_DRAINED,
+                                             aptest_pfdflags_a2, m));
+    aptest_pfdflags_check(m, ap_request_wait(m->b, AP_WAIT_IN, 0,
+                                             aptest_pfdflags_b1, m));
+}
+
+static void aptest_pfdflags_f(request_rec *r, apr_status_t status,
+                              void *baton)
+{
+    aptest_pfdflags_t *m = baton;
+    apr_os_file_t a = -1, b = -1;
+
+    aptest_pfdflags_called(m, "F", status);
+    aptest_pfdflags_join(m);
+    (void)apr_os_file_get(&a, m->a_in);
+    (void)apr_os_file_get(&b, m->b_in);
+    ap_set_content_type(r, "text/plain");
+    ap_rprintf(r, "pfdflags: order=%s A=%d B=%d%s\n", m->order, (int)a,
+               (int)b, m->failed ? " FAILED" : "");
+    ap_request_finish_suspended(r, OK);
+}
+#endif /* APR_HAS_THREADS */
+
+static int aptest_pfdflags(request_rec *r)
+{
+    const char *report = "none";
+#if APR_HAS_THREADS
+    aptest_pfdflags_t *m = apr_pcalloc(r->pool, sizeof(*m));
+    apr_pollfd_t pfd;
+
+    m->r = r;
+    if (!ap_request_can_suspend(r)) {
+        report = "declined";
+        goto respond;
+    }
+    if (apr_file_pipe_create_pools(&m->a_in, &m->a_out, APR_FULL_NONBLOCK,
+                                   r->pool, r->pool) != APR_SUCCESS
+        || apr_file_pipe_create_pools(&m->b_in, &m->b_out,
+                                      APR_FULL_NONBLOCK, r->pool,
+                                      r->pool) != APR_SUCCESS) {
+        goto respond;
+    }
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_FILE;
+    pfd.desc.f = m->a_in;
+    m->a = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    pfd.desc.f = m->b_in;
+    m->b = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    m->f = ap_request_waitctx_timer(r, r->pool);
+    m->f->timeout = apr_time_from_msec(300);
+    if (ap_request_wait(m->a, AP_WAIT_IN, AP_REQUEST_WAIT_DRAINED,
+                        aptest_pfdflags_a1, m) != SUSPENDED) {
+        report = "declined";
+        goto respond;
+    }
+    if (ap_request_wait(m->f, AP_WAIT_IN, 0, aptest_pfdflags_f,
+                        m) != SUSPENDED) {
+        return HTTP_INTERNAL_SERVER_ERROR; /* the waits dropped */
+    }
+    apr_pool_pre_cleanup_register(r->pool, m, aptest_pfdflags_join);
+    if (apr_thread_create(&m->thread, NULL, aptest_pfdflags_thread, m,
+                          r->pool) != APR_SUCCESS) {
+        m->thread = NULL;
+        return HTTP_INTERNAL_SERVER_ERROR; /* the waits dropped */
+    }
+    return SUSPENDED;
+
+respond:
+#endif
+    ap_set_content_type(r, "text/plain");
+    ap_rprintf(r, "pfdflags: %s\n", report);
+    return OK;
+}
+#endif /* APTEST_HAS_PFDFLAGS */
 
 /* Install this module into the apache2 infrastructure.
  */

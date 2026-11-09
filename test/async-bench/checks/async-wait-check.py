@@ -9,7 +9,9 @@ without the re-arm declined and logged), several waits of a request pending
 at once (a notifier, two descriptor contexts on one pipe, two timers
 completing together in the order they were made, a wait canceled, one
 dropped by the request's end; a subrequest run by a continuation while the
-others are pending: refused and run blocking), descriptor contexts made in
+others are pending: refused and run blocking), the MPM's keep and drained
+flags of each descriptor of a wait (two pipes, from mpm_event's trace7
+lines for a connection from 127.0.0.2), descriptor contexts made in
 subpools destroyed after their waits, and a graceful stop during waits. "sync" runs them with
 AsyncRequests Off (every wait blocks: the same results, the threads held),
 "async" with the waits in the MPM (no thread held while waiting); the
@@ -77,6 +79,8 @@ Listen 127.0.0.1:{tlsport}
 PidFile "{work}/httpd.pid"
 ErrorLog "{work}/error_log"
 LogLevel warn aptest:trace5 mpm_event:debug
+# The connections from 127.0.0.2 trace the MPM's waits (pfdflags)
+LogLevelOverride 127.0.0.2 warn aptest:trace5 mpm_event:trace7
 LoadModule mpm_event_module modules/mod_mpm_event.so
 LoadModule unixd_module modules/mod_unixd.so
 LoadModule authz_core_module modules/mod_authz_core.so
@@ -136,6 +140,10 @@ CustomLog "{work}/access_log" t
 <Location "/multisub">
     SetHandler aptest-wait
     AptestWait multi /subtimer
+</Location>
+<Location "/pfdflags">
+    SetHandler aptest-wait
+    AptestWait pfdflags
 </Location>
 <Location "/subtimer">
     SetHandler aptest-wait
@@ -495,6 +503,47 @@ def log_count(what):
         return f.read().count(what)
 
 
+def log_size():
+    return os.path.getsize(os.path.join(work, "error_log"))
+
+
+# mpm_event's trace7 line for each pollfd of a wait it arms
+PFD_LINE = re.compile(r"\[client 127\.0\.0\.2:\d+\] wait of connection \S+: pollfd (\d+) "
+                      r"\(fd (-?\d+), events 0x[0-9a-f]+, flags 0x([0-9a-f]+)[a-z ]*\) (.*)$")
+
+
+def mpm_waits(since):
+    """the waits mpm_event armed for the connection from 127.0.0.2, logged
+    after `since` (a size of the error_log): a list of {fd: (flags, how)}"""
+    with open(os.path.join(work, "error_log")) as f:
+        f.seek(since)
+        lines = f.read().splitlines()
+    waits = []
+    for l in lines:
+        m = PFD_LINE.search(l)
+        if not m:
+            continue
+        if m.group(1) == "0":
+            waits.append({})
+        if waits:
+            waits[-1][int(m.group(2))] = (int(m.group(3), 16), m.group(4))
+    return waits
+
+
+def get_from(path, source, timeout=30):
+    """get() from a source address"""
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=timeout,
+                                   source_address=(source, 0))
+    try:
+        c.request("GET", path, headers={"Connection": "close"})
+        r = c.getresponse()
+        return r.status, r.read()
+    except (http.client.HTTPException, OSError) as e:
+        return type(e).__name__, b""
+    finally:
+        c.close()
+
+
 def log_findings():
     with open(os.path.join(work, "error_log")) as f:
         log = f.read()
@@ -740,6 +789,35 @@ for mode in os.environ.get("MODES", "sync async").split():
                                                   b"subreq", b"final", b"declined"))
         report.append("%s: a subrequest run while other waits are pending: %s %s, "
                       "refused %d: %s" % (mode, st, shown, refused, verdict(ok)))
+
+        # The MPM's keep and drained flags per descriptor (mod_aptest's
+        # "pfdflags": pipes A and B, five MPM waits), from 127.0.0.2 whose
+        # connection traces each pollfd of the waits mpm_event arms: the
+        # flags (keep 0x1, drained 0x2) and whether it's kept
+        since = log_size()
+        never0 = log_count("a dropped wait's continuation called")
+        st, body = get_from("/pfdflags", "127.0.0.2", timeout=20)
+        never = log_count("a dropped wait's continuation called") - never0
+        if is_async:
+            m = re.match(rb"pfdflags: order=A1,B1,A2,A3,A3b,F A=(\d+) B=(\d+)\n$", body)
+            got = mpm_waits(since)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                want_waits = [{a: (0, "not kept")},
+                              {a: (3, "kept"), b: (0, "not kept")},
+                              {a: (3, "kept already"), b: (1, "kept")},
+                              {a: (0, "kept already"), b: (1, "kept already")},
+                              {b: (1, "kept already")}]
+            ok = st == 200 and m and got == want_waits and not never
+            shown = ["; ".join("%s: 0x%x %s" % ("A" if fd == a else "B" if fd == b else fd,
+                                                fl, how)
+                               for fd, (fl, how) in sorted(w.items()))
+                     for w in got] if m else got
+        else:
+            ok = st == 200 and body == b"pfdflags: declined\n" and not never
+            shown = []
+        report.append("%s: two pipes' own flags in the MPM waits: %s %s, waits %s: %s"
+                      % (mode, st, body.strip(), shown, verdict(ok)))
 
         # Descriptor contexts in subpools: PFDPOOL each, two waits, destroyed
         # (every other one released first), on 4 requests at once
