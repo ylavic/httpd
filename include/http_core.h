@@ -412,13 +412,13 @@ typedef struct ap_request_async_t {
     /** The request */
     request_rec *r;
     /** The top-level request's state (this one for the top-level request):
-     * its runs and its wait in flight are those of every request of its tree
-     * (one MPM wait per connection) */
+     * its runs and its pending waits are those of every request of its tree
+     * (one MPM wait per connection, for all of them) */
     struct ap_request_async_t *top;
     /** Its phase */
     ap_request_phase_e phase;
     /** The state of its waits (ap_request_wait()), on first use: its client
-     * context, and in the top-level request's state the wait in flight */
+     * context, and in the top-level request's state the pending waits */
     struct ap_request_waitset *waitset;
     /** Where its handler chain suspended (ap_invoke_handler()), once it did:
      * the index of the handler that returned SUSPENDED */

@@ -471,6 +471,11 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
  * (ExtendedStatus) and holds r->invoke_mtx.
  */
 
+struct ap_request_waitset;
+static void request_waitset_run_end(ap_request_async_t *top);
+static void request_waitset_drop(struct ap_request_waitset *w,
+                                 request_rec *owner, int ending);
+
 /* async_request_end() flags */
 #define ASYNC_REQUEST_END_FIRST  (1u << 0) /* in the first run, which gives
                                             * the connection back to the MPM
@@ -497,7 +502,8 @@ static void async_request_enter(request_rec *r, ap_request_async_t *async)
 }
 
 /* Leave a run after which the request is suspended (its handlers returned
- * SUSPENDED, or a continuation waits again).
+ * SUSPENDED, or a continuation waits again): the pending waits of its tree
+ * are given to the MPM, as one wait.
  */
 static void async_request_leave(request_rec *r, ap_request_async_t *async,
                                 int first)
@@ -505,6 +511,7 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
     conn_rec *c = r->connection;
 
     if (async) {
+        request_waitset_run_end(async);
         async->running = 0;
         async->suspended = 1;
         async->ended = NULL;
@@ -521,8 +528,9 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
 #endif
 }
 
-/* End the request, its handlers done with status: answer an error if any
- * (ap_die()), then end the request (its EOR bucket frees it, its
+/* End the request, its handlers done with status: drop the waits of its
+ * tree still pending (their continuations not called), answer an error if
+ * any (ap_die()), then end the request (its EOR bucket frees it, its
  * PROCESS_REQUEST RETURN probe and the end of the run's timing), then give
  * the connection back to the MPM unless in the first run.
  */
@@ -532,6 +540,9 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
     conn_rec *c = r->connection;
 
     if (async) {
+        if (async->waitset) {
+            request_waitset_drop(async->waitset, NULL, 0);
+        }
         async->phase = AP_REQUEST_PHASE_DONE;
         async->running = 0;
         async->suspended = 0;
@@ -567,8 +578,9 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
 
 /*
  * Requests' waits (ap_request_wait()): a wait context per target, the state
- * of the request's waits in its ap_request_async_t, the wait in flight in
- * its top-level request's (a subrequest's waits are its tree's).
+ * of the request's waits in its ap_request_async_t, the pending waits in
+ * its top-level request's (a subrequest's waits are its tree's), given to
+ * the MPM as one wait at the end of each run.
  */
 
 /* The kinds of targets */
@@ -596,6 +608,8 @@ typedef struct {
                         * request_waitctx_check_ready() */
 } request_waitctx_dir_t;
 
+struct request_waitreg_t;
+
 /* A wait context: the public part first */
 typedef struct request_waitctx_t {
     ap_request_waitctx_t pub;
@@ -609,11 +623,11 @@ typedef struct request_waitctx_t {
                                       * subrequest's client context the
                                       * top-level request's (one socket) */
     struct request_waitctx_t *kept_next; /* in its subrequest's kept list */
+    struct request_waitreg_t *wait;  /* the pending wait it's in, if any */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
-    apr_interval_time_t timeout;  /* of the wait in flight, resolved */
+    apr_interval_time_t timeout;  /* of its pending wait, resolved */
     unsigned int ready;           /* AP_WAIT_* of the last wait */
-    unsigned int waiting  :1,     /* in the wait in flight */
-                 kept     :1,     /* its pfd may be kept by the MPM */
+    unsigned int kept     :1,     /* its pfd may be kept by the MPM */
                  attached :1,     /* its notifier attached to the tree's
                                    * notifier (ap_mpm_notifier_attach()) */
                  released :1;     /* ap_request_waitctx_release()d */
@@ -624,33 +638,63 @@ typedef struct request_waitctx_t {
 
 #define REQUEST_WAITCTX_DIR(direction) (((direction) & AP_WAIT_OUT) ? 1 : 0)
 
+/* A pending wait of a request (ap_request_wait(), ap_request_wait_any()):
+ * its contexts and continuation, from its registration until its
+ * continuation is called (it completed), or it's dropped without it (its
+ * request ended, it was canceled, its contexts were all released). The
+ * pending waits of a tree are given to the MPM as one wait, the union of
+ * their targets, at the end of each run of the tree
+ * (request_waitset_register()), each completing on its own: a target of its
+ * own ready, its own timeout reached, or the MPM failing to wait. Allocated
+ * in the top-level request's pool and reused (no allocation per wait).
+ */
+typedef struct request_waitreg_t {
+    struct request_waitreg_t *next;  /* in w->waits, or w->spare */
+    request_rec *waiter;          /* the request that waits (its first
+                                   * context's), given to fn */
+    request_waitctx_t **ctxs;    /* its contexts, NULL once released */
+    unsigned int *directions;     /* of ctxs */
+    int *pfd_index;               /* each context's pfd in w->pfds for the
+                                   * MPM wait (or the delay's poll), or -1 */
+    int nctxs, nalloc;            /* ctxs used, allocated (all three) */
+    apr_interval_time_t timeout;  /* the smallest of its contexts', capped
+                                   * by a deadline, negative for none */
+    apr_time_t expiry;            /* when it times out, from its first MPM
+                                   * wait on, zero for never */
+    ap_request_async_t *deadline; /* its timeout is this subrequest's
+                                   * deadline (ap_run_sub_req_async()) */
+    ap_request_continuation_fn *fn;
+    void *baton;
+    apr_status_t status;          /* of its completion, for fn */
+    unsigned int timer_expires :1, /* its timeout is a timer's */
+                 keep          :1, /* the MPM may keep its pfds */
+                 drained       :1, /* AP_MPM_WAIT_DRAINED for its pfds */
+                 registered    :1, /* in an MPM wait already (expiry set) */
+                 completed     :1; /* its continuation to be called */
+} request_waitreg_t;
+
 /* The state of a request's waits (ap_request_async_t->waitset): its client
- * context, and for the top-level request the wait in flight of its tree
- * (whichever request of the tree waits: one MPM wait per connection)
+ * context, and for the top-level request the pending waits of its tree
+ * (whichever requests of the tree wait: one MPM wait per connection)
  */
 struct ap_request_waitset {
     request_rec *r;
     request_waitctx_t *client;   /* the client's context, if created */
     request_waitctx_t *kept;     /* a subrequest's contexts whose pfd the
                                    * MPM may keep (released at its end) */
-    /* The wait in flight, in the top-level request's state only */
-    request_rec *waiter;          /* the request that waits (its first
-                                   * context's), given to fn */
-    apr_array_header_t *pfds;     /* of the wait, reused */
-    int *pfd_ctxs;                /* the index in ctxs of each pfd's context */
-    request_waitctx_t **ctxs;    /* of the wait in flight */
-    unsigned int *directions;     /* of ctxs */
-    int nctxs, nalloc;            /* ctxs used, allocated (all three) */
-    apr_interval_time_t timeout;  /* of the wait in flight */
-    int timer_expires;            /* the timeout is a timer's */
-    ap_request_async_t *deadline; /* the timeout is this subrequest's
-                                   * deadline (ap_run_sub_req_async()) */
-    ap_request_continuation_fn *fn;
-    void *baton;
+    /* The pending waits, in the top-level request's state only */
+    request_waitreg_t *waits;        /* in the order of their registration */
+    request_waitreg_t *spare;        /* done, for the next ones */
+    apr_array_header_t *pfds;     /* of the MPM wait, or of a new wait's
+                                   * delay (poll), reused */
+    apr_time_t expiry;            /* when the MPM wait times out, zero for
+                                   * never */
     ap_mpm_notifier_t *notifier;  /* the notifier given to the MPM for the
                                    * notifier contexts, attached to it
-                                   * (top-level request's, on first use) */
-    int ending;                   /* r->pool is being destroyed */
+                                   * (on first use) */
+    unsigned int in_mpm :1,       /* the MPM waits (registered, until the
+                                   * continuation) */
+                 ending :1;       /* r->pool is being destroyed */
 };
 
 /* Detach a notifier context's notifier from the tree's notifier, its wait
@@ -664,23 +708,21 @@ static void request_waitctx_detach_notifier(request_waitctx_t *ctx)
     }
 }
 
+static void request_waitctx_release_pfd(request_waitctx_t *ctx);
+static void request_waitset_drop(struct ap_request_waitset *w,
+                                 request_rec *owner, int ending);
+
 /* The top-level request's pool is being destroyed (its pre-cleanups run
- * before its subpools are destroyed): the contexts' cleanups know that the
- * requests end with them.
+ * before its subpools are destroyed): the pending waits are dropped (the
+ * notifier goes with r->pool, the notifiers may outlive it), and the contexts'
+ * cleanups know that the requests end with them.
  */
 static apr_status_t request_waitset_cleanup(void *data)
 {
     struct ap_request_waitset *w = data;
-    int i;
 
     w->ending = 1;
-
-    /* The tree's notifier goes with r->pool, the notifiers may outlive it */
-    for (i = 0; i < w->nctxs; i++) {
-        if (w->ctxs[i]) {
-            request_waitctx_detach_notifier(w->ctxs[i]);
-        }
-    }
+    request_waitset_drop(w, NULL, 1);
     return APR_SUCCESS;
 }
 
@@ -709,6 +751,65 @@ static struct ap_request_waitset *request_waitctx_tree(request_waitctx_t *ctx)
     ap_request_async_t *async = request_async_get(ctx->pub.r);
 
     return (async) ? async->top->waitset : NULL;
+}
+
+/* A wait for nctxs contexts, reused or allocated in the top-level request's
+ * pool
+ */
+static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int nctxs)
+{
+    request_waitreg_t *g = w->spare;
+
+    if (g) {
+        w->spare = g->next;
+    }
+    else {
+        g = apr_pcalloc(w->r->pool, sizeof(*g));
+    }
+    if (g->nalloc < nctxs) {
+        g->nalloc = (nctxs > 2) ? nctxs : 2;
+        g->ctxs = apr_palloc(w->r->pool, g->nalloc * sizeof(*g->ctxs));
+        g->directions = apr_palloc(w->r->pool,
+                                   g->nalloc * sizeof(*g->directions));
+        g->pfd_index = apr_palloc(w->r->pool,
+                                  g->nalloc * sizeof(*g->pfd_index));
+    }
+    g->next = NULL;
+    g->waiter = NULL;
+    g->nctxs = 0;
+    g->timeout = -1;
+    g->expiry = 0;
+    g->deadline = NULL;
+    g->fn = NULL;
+    g->baton = NULL;
+    g->status = APR_SUCCESS;
+    g->timer_expires = 0;
+    g->keep = 1;
+    g->drained = 0;
+    g->registered = 0;
+    g->completed = 0;
+    return g;
+}
+
+/* A wait done, for reuse */
+static void request_waitreg_put(struct ap_request_waitset *w, request_waitreg_t *g)
+{
+    g->next = w->spare;
+    w->spare = g;
+}
+
+/* Unlink a pending wait */
+static void request_waitreg_unlink(struct ap_request_waitset *w, request_waitreg_t *g)
+{
+    request_waitreg_t **pg;
+
+    for (pg = &w->waits; *pg; pg = &(*pg)->next) {
+        if (*pg == g) {
+            *pg = g->next;
+            break;
+        }
+    }
+    g->next = NULL;
 }
 
 /* A context whose pfd the MPM may keep from now on: a subrequest's is listed
@@ -751,15 +852,43 @@ static void request_waitctx_unkeep(request_waitctx_t *ctx)
     ctx->kept_next = NULL;
 }
 
-static void request_waitctx_release_pfd(request_waitctx_t *ctx);
+/* A context leaves its pending wait, which is dropped if none is left (its
+ * continuation not called): the context is given up (released, or its pool
+ * destroyed)
+ */
+static void request_waitctx_leave(request_waitctx_t *ctx)
+{
+    request_waitreg_t *g = ctx->wait;
+    struct ap_request_waitset *w = request_waitctx_tree(ctx);
+    int i, left = 0;
+
+    for (i = 0; i < g->nctxs; i++) {
+        if (g->ctxs[i] == ctx) {
+            g->ctxs[i] = NULL;
+        }
+        else if (g->ctxs[i]) {
+            left++;
+        }
+    }
+    ctx->wait = NULL;
+    request_waitctx_detach_notifier(ctx);
+    if (!left && w) {
+        ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                      APLOG_TRACE5, 0, ctx->pub.r,
+                      "dropping the wait for the %s: no target left",
+                      request_waitctx_kind_names[ctx->kind]);
+        request_waitreg_unlink(w, g);
+        request_waitreg_put(w, g);
+    }
+}
 
 /* The pool of a context (but the client's) is being cleaned up: the context
  * is released, unless the top-level request ends with the pool (the MPM
  * dropped what it kept for the request when it resumed or closed the
- * connection). Destroying the pool while a wait on the context is in flight
- * is a bug of the caller: the context is detached from the wait (which
- * completes without it), its descriptor left to its own pool's cleanup if
- * the MPM keeps it (it can't be released while waited for).
+ * connection). Destroying the pool while a wait on the context is pending
+ * is a bug of the caller: the context leaves the wait (which completes
+ * without it, or is dropped if it was its last target), its descriptor left
+ * to its own pool's cleanup if the MPM keeps it.
  */
 static apr_status_t request_waitctx_cleanup(void *data)
 {
@@ -767,7 +896,6 @@ static apr_status_t request_waitctx_cleanup(void *data)
     request_rec *r = ctx->pub.r;
     ap_request_async_t *async;
     struct ap_request_waitset *w;
-    int i;
 
     async = request_async_get(r);
     w = (async) ? async->top->waitset : NULL;
@@ -778,19 +906,13 @@ static apr_status_t request_waitctx_cleanup(void *data)
         return APR_SUCCESS;
     }
 
-    if (ctx->waiting) {
+    if (ctx->wait) {
         ap_log_rerror(WAITCTX_LOG_MARK(ctx), APLOG_ERR,
                       0, r, APLOGNO()
                       "the pool of a %s wait context destroyed while it "
                       "waits", request_waitctx_kind_names[ctx->kind]);
         AP_DEBUG_ASSERT(0);
-        for (i = 0; w && i < w->nctxs; i++) {
-            if (w->ctxs[i] == ctx) {
-                w->ctxs[i] = NULL;
-            }
-        }
-        request_waitctx_detach_notifier(ctx);
-        ctx->waiting = 0;
+        request_waitctx_leave(ctx);
         ctx->released = 1;
         request_waitctx_unkeep(ctx);
         return APR_SUCCESS;
@@ -938,14 +1060,23 @@ static void request_waitctx_release_pfd(request_waitctx_t *ctx)
 AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *pub)
 {
     request_waitctx_t *ctx = (request_waitctx_t *)pub;
+    struct ap_request_waitset *w;
 
     if (ctx->released) {
         return;
     }
     ctx->released = 1;
 
-    /* The MPM can't release a pfd while it waits: at the continuation */
-    if (!ctx->waiting) {
+    /* The MPM can't release a pfd while it waits: when its wait completes
+     * (not from the thread processing the request then, but a pool cleanup
+     * of a connection killed meanwhile). Otherwise it leaves its pending
+     * wait, if any.
+     */
+    w = request_waitctx_tree(ctx);
+    if (!ctx->wait || !w || !w->in_mpm) {
+        if (ctx->wait) {
+            request_waitctx_leave(ctx);
+        }
         request_waitctx_release_pfd(ctx);
     }
 
@@ -1050,6 +1181,178 @@ static apr_interval_time_t request_waitctx_timeout(request_waitctx_t *ctx,
     return r->server->timeout;
 }
 
+/* request_waitreg_finish() modes */
+#define REQUEST_WAITREG_DONE     0 /* completed, its continuation to be called */
+#define REQUEST_WAITREG_DROPPED  1 /* its request ended (or a subrequest) */
+#define REQUEST_WAITREG_CANCELED 2 /* ap_request_wait_cancel() */
+#define REQUEST_WAITREG_ENDING   3 /* the top-level request's pool goes */
+
+/* A wait leaves its contexts: they can wait again (but released ones, whose
+ * pfd is released then), their notifiers detached from the tree's notifier
+ */
+static void request_waitreg_finish(request_waitreg_t *g, int mode,
+                                   ap_mpm_wait_result_e why)
+{
+    int i;
+
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_t *ctx = g->ctxs[i];
+        const char *name, *dir;
+
+        if (!ctx) {
+            continue;
+        }
+        g->ctxs[i] = NULL;
+        ctx->wait = NULL;
+        request_waitctx_detach_notifier(ctx);
+        if (mode == REQUEST_WAITREG_ENDING) {
+            continue; /* no MPM call, no log: the request is going */
+        }
+        if (ctx->released) {
+            request_waitctx_release_pfd(ctx);
+        }
+
+        name = request_waitctx_kind_names[ctx->kind];
+        dir = request_waitctx_dir_name(ctx, g->directions[i]);
+        if (mode != REQUEST_WAITREG_DONE) {
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_TRACE5, 0, g->waiter,
+                          "dropping the wait for the %s%s (%s)", name, dir,
+                          (mode == REQUEST_WAITREG_CANCELED) ? "canceled"
+                                                          : "request done");
+            continue;
+        }
+        if (g->status == APR_EGENERAL) {
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_DEBUG, 0, g->waiter, APLOGNO()
+                          "waiting for the %s%s interrupted (async, %i)",
+                          name, dir, (int)why);
+        }
+        ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                      APLOG_TRACE5, g->status, g->waiter,
+                      "done waiting for the %s%s (async)", name, dir);
+    }
+}
+
+/* Drop the pending waits of a request and its subrequests (of every request
+ * of the tree if owner is NULL), their continuations not called: the
+ * request ends (or its pool goes)
+ */
+static void request_waitset_drop(struct ap_request_waitset *w,
+                                 request_rec *owner, int ending)
+{
+    request_waitreg_t **pg = &w->waits, *g;
+
+    while ((g = *pg) != NULL) {
+        if (owner) {
+            const request_rec *rr = g->waiter;
+
+            /* Is the waiter owner, or one of its subrequests at any depth? */
+            while (rr && rr != owner) {
+                rr = rr->main;
+            }
+            if (!rr) {
+                pg = &g->next;
+                continue;
+            }
+        }
+        *pg = g->next;
+        request_waitreg_finish(g, (ending) ? REQUEST_WAITREG_ENDING
+                                        : REQUEST_WAITREG_DROPPED,
+                               AP_MPM_WAIT_READY);
+        request_waitreg_put(w, g);
+    }
+}
+
+/* Whether a wait completed with the MPM wait (why, pfds), now: a target
+ * ready (its pfd fired, its notifier notified), its timeout reached (a
+ * timer's completing with APR_SUCCESS), or the MPM failed to wait (all of
+ * them complete). Sets its status, and its contexts' readiness.
+ */
+static void request_waitreg_completion(struct ap_request_waitset *w,
+                                       request_waitreg_t *g,
+                                       ap_mpm_wait_result_e why,
+                                       const apr_array_header_t *pfds,
+                                       apr_time_t now)
+{
+    unsigned int ready = 0;
+    int i, k;
+
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_t *ctx = g->ctxs[i];
+
+        if (!ctx) {
+            continue;
+        }
+        ctx->ready = 0;
+        k = g->pfd_index[i];
+        if (why == AP_MPM_WAIT_READY && pfds && k >= 0 && k < pfds->nelts) {
+            const apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, k, apr_pollfd_t);
+            ctx->ready = ready_directions(pfd->rtnevents,
+                                          g->directions[i]);
+        }
+        if (ctx->attached && ap_mpm_notifier_notified(ctx->notifier)) {
+            ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
+        }
+        ready |= ctx->ready;
+    }
+    if (ready) {
+        g->status = APR_SUCCESS;
+    }
+    else if (g->expiry
+             && (g->expiry <= now
+                 || (why == AP_MPM_WAIT_TIMEOUT && g->expiry <= w->expiry))) {
+        /* Its own timeout: the MPM wait's (the earliest), or reached */
+        if (g->deadline) {
+            /* A subrequest's deadline: it gets HTTP_GATEWAY_TIME_OUT */
+            g->deadline->deadline_reached = 1;
+            g->status = APR_TIMEUP;
+        }
+        else if (g->timer_expires) {
+            g->status = APR_SUCCESS;
+            for (i = 0; i < g->nctxs; i++) {
+                request_waitctx_t *ctx = g->ctxs[i];
+                if (ctx && ctx->kind == REQUEST_WAITCTX_TIMER
+                    && ctx->timeout == g->timeout) {
+                    ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
+                }
+            }
+        }
+        else {
+            g->status = APR_TIMEUP;
+        }
+    }
+    else if (why != AP_MPM_WAIT_READY && why != AP_MPM_WAIT_TIMEOUT
+             && why != AP_MPM_WAIT_NOTIFIED) {
+        g->status = APR_EGENERAL; /* the MPM failed to wait */
+    }
+    else {
+        return; /* still pending */
+    }
+    g->completed = 1;
+}
+
+/* The next completed wait to dispatch, unlinked: the first registered */
+static request_waitreg_t *request_waitset_next(struct ap_request_waitset *w)
+{
+    request_waitreg_t **pg, *g;
+
+    for (pg = &w->waits; (g = *pg) != NULL; pg = &g->next) {
+        if (g->completed) {
+            *pg = g->next;
+            g->next = NULL;
+            return g;
+        }
+    }
+    return NULL;
+}
+
+/* The continuation of the MPM wait of a tree: the completed waits' own
+ * continuations are called one after the other, in the order the waits were
+ * registered, until the top-level request ends; the waits still pending
+ * (and those registered meanwhile) are given to the MPM again at the end of
+ * the run (async_request_leave()).
+ */
 static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
                                          ap_mpm_wait_result_e why,
                                          const apr_array_header_t *pfds,
@@ -1057,161 +1360,233 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 {
     struct ap_request_waitset *w = baton;
     request_rec *r = w->r; /* the top-level request, whose run this is */
-    request_rec *waiter = w->waiter;
     ap_request_async_t *async = request_async_get(r);
-    ap_request_continuation_fn *fn = w->fn;
-    void *fn_baton = w->baton;
-    apr_status_t rv;
-    int i, k, ended = 0, notified = 0;
+    request_waitreg_t *g;
+    apr_time_t now;
+    int ended = 0;
 
     AP_DEBUG_ASSERT(mpm_r == r);
     AP_DEBUG_ASSERT(async != NULL && !async->running);
-    AP_DEBUG_ASSERT(waiter != NULL);
     async_request_enter(r, async);
+    w->in_mpm = 0;
 
-    /* Which notifiers completed the wait through the tree's notifier, if
-     * any
-     */
-    for (i = 0; i < w->nctxs; i++) {
-        request_waitctx_t *ctx = w->ctxs[i];
-        if (ctx && ctx->attached && ap_mpm_notifier_notified(ctx->notifier)) {
-            ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
-            notified = 1;
-        }
-    }
-    if (notified) {
-        why = AP_MPM_WAIT_NOTIFIED;
-    }
-    switch (why) {
-    case AP_MPM_WAIT_READY:
-        rv = APR_SUCCESS;
-        break;
-    case AP_MPM_WAIT_NOTIFIED:
-        rv = APR_SUCCESS;
-        break;
-    case AP_MPM_WAIT_TIMEOUT:
-        rv = (w->timer_expires) ? APR_SUCCESS : APR_TIMEUP;
-        if (w->deadline) {
-            /* A subrequest's deadline: it gets HTTP_GATEWAY_TIME_OUT */
-            w->deadline->deadline_reached = 1;
-            rv = APR_TIMEUP;
-        }
-        break;
-    default:
-        rv = APR_EGENERAL;
-        break;
+    now = apr_time_now();
+    for (g = w->waits; g; g = g->next) {
+        request_waitreg_completion(w, g, why, pfds, now);
     }
 
-    /* The contexts' readiness is 0 since request_waitreg_prepare() found none
-     * ready. The pfds are the wait's (w->pfds), w->pfd_ctxs giving the
-     * index of each one's context.
+    /* A continuation ends the request (r and w can't be touched
+     * afterwards), or waits again, or ends a subrequest (whose pending
+     * waits are dropped), or the request is abandoned (no wait left, the
+     * MPM closes the connection). No pointer to the contexts is kept past
+     * a completed wait.
      */
-    if (why == AP_MPM_WAIT_READY && pfds) {
-        for (k = 0; k < pfds->nelts && k < w->pfds->nelts; k++) {
-            const apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, k, apr_pollfd_t);
-            i = w->pfd_ctxs[k];
-            if (w->ctxs[i]) {
-                w->ctxs[i]->ready = ready_directions(pfd->rtnevents,
-                                                     w->directions[i]);
+    while ((g = request_waitset_next(w)) != NULL) {
+        request_rec *waiter = g->waiter;
+        ap_request_continuation_fn *fn = g->fn;
+        void *fn_baton = g->baton;
+        apr_status_t rv = g->status;
+
+        request_waitreg_finish(g, REQUEST_WAITREG_DONE, why);
+        request_waitreg_put(w, g);
+        async->ended = &ended;
+        fn(waiter, rv, fn_baton);
+        if (ended) {
+            return;
+        }
+    }
+    async_request_leave(r, async, 0);
+}
+
+/* The pfd of the MPM wait for a context's descriptor: one per descriptor
+ * (e.g. both directions of the client's socket waited for by two waits),
+ * its events those of all the contexts. Returns its index in w->pfds.
+ */
+static int request_waitset_pfd(struct ap_request_waitset *w,
+                               const request_waitctx_t *ctx,
+                               unsigned int directions)
+{
+    apr_pollfd_t *pfd = NULL;
+    int k;
+
+    for (k = 0; k < w->pfds->nelts; k++) {
+        apr_pollfd_t *p = &APR_ARRAY_IDX(w->pfds, k, apr_pollfd_t);
+        if (p->desc_type == ctx->pfd.desc_type
+            && ((p->desc_type == APR_POLL_SOCKET)
+                ? p->desc.s == ctx->pfd.desc.s
+                : p->desc.f == ctx->pfd.desc.f)) {
+            pfd = p;
+            break;
+        }
+    }
+    if (!pfd) {
+        pfd = apr_array_push(w->pfds);
+        *pfd = ctx->pfd;
+        pfd->reqevents = 0;
+        pfd->rtnevents = 0;
+        pfd->client_data = NULL;
+    }
+    if (directions & AP_WAIT_IN) {
+        pfd->reqevents |= APR_POLLIN;
+    }
+    if (directions & AP_WAIT_OUT) {
+        pfd->reqevents |= APR_POLLOUT;
+    }
+    return k;
+}
+
+/* Give the pending waits of a tree to the MPM, as one wait (one per
+ * connection): their pfds (one per descriptor), the tree's notifier if some
+ * wait for a notifier, the earliest of their timeouts (counted from their
+ * first MPM wait), the descriptors kept if all the waits allow it (and drained
+ * if all were). Called at the end of a run of the tree
+ * (async_request_leave()). A wait with nothing left to complete it is dropped.
+ * If the MPM refuses (e.g. a module's own wait registered in this run), the
+ * waits stay pending, for the next run's end.
+ */
+static void request_waitset_register(struct ap_request_waitset *w)
+{
+    request_rec *r = w->r;
+    request_waitreg_t **pg, *g;
+    apr_interval_time_t timeout = -1;
+    apr_time_t now = apr_time_now();
+    unsigned int mpm_flags = 0;
+    int keep = 1, drained = 1, notifiers = 0, nwaits = 0, i;
+    apr_status_t rv;
+
+    apr_array_clear(w->pfds);
+    pg = &w->waits;
+    while ((g = *pg) != NULL) {
+        apr_interval_time_t left = -1;
+        int npfds = 0, nnotifiers = 0;
+
+        for (i = 0; i < g->nctxs; i++) {
+            request_waitctx_t *ctx = g->ctxs[i];
+
+            g->pfd_index[i] = -1;
+            if (!ctx) {
+                continue;
+            }
+            if (ctx->attached) {
+                nnotifiers++;
+            }
+            else if (REQUEST_WAITCTX_HAS_PFD(ctx) && !ctx->released) {
+                g->pfd_index[i] = request_waitset_pfd(w, ctx,
+                                                      g->directions[i]);
+                npfds++;
+            }
+        }
+        if (!g->registered) {
+            g->registered = 1;
+            if (g->timeout >= 0) {
+                g->expiry = now + g->timeout;
+                left = g->timeout; /* as given (e.g. a declared timeout) */
+            }
+        }
+        else if (g->expiry) {
+            left = (g->expiry > now) ? g->expiry - now : 0;
+        }
+        if (!npfds && !nnotifiers && !g->expiry) {
+            /* Its descriptors were released: nothing would complete it */
+            *pg = g->next;
+            request_waitreg_finish(g, REQUEST_WAITREG_DROPPED, AP_MPM_WAIT_READY);
+            request_waitreg_put(w, g);
+            continue;
+        }
+        if (left >= 0 && (timeout < 0 || left < timeout)) {
+            timeout = left;
+        }
+        if (npfds) {
+            keep &= g->keep;
+            drained &= g->drained;
+        }
+        notifiers += nnotifiers;
+        nwaits++;
+        pg = &g->next;
+    }
+    if (!nwaits) {
+        return;
+    }
+    w->expiry = (timeout >= 0) ? now + timeout : 0;
+
+    /* A readiness the MPM saw for the last wait of a kept pfd was consumed
+     * since if each wait's caller said so (or its delay's poll found none).
+     */
+    if (w->pfds->nelts && keep) {
+        mpm_flags = AP_MPM_WAIT_KEEP_PFDS;
+        if (drained) {
+            mpm_flags |= AP_MPM_WAIT_DRAINED;
+        }
+    }
+    if (notifiers) {
+        /* Its previous wait is done, notified still if one of the
+         * notifiers attached to it is
+         */
+        rv = ap_mpm_notifier_rearm(w->notifier);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "can't re-arm the request's notifier");
+            AP_DEBUG_ASSERT(0);
+        }
+    }
+    rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, timeout,
+                              (notifiers) ? w->notifier : NULL, mpm_flags,
+                              request_waitset_continuation, w);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "can't wait for the %i pending wait(s) of the request "
+                      "asynchronously", nwaits);
+        /* Only a module's own MPM wait registered in this run makes the MPM
+         * refuse (APR_EBUSY), the waits then registered at the next run's
+         * end; anything else would leave the request suspended with nothing
+         * registered to complete its waits.
+         */
+        AP_DEBUG_ASSERT(APR_STATUS_IS_EBUSY(rv));
+        return;
+    }
+    w->in_mpm = 1;
+
+    if (mpm_flags & AP_MPM_WAIT_KEEP_PFDS) {
+        for (g = w->waits; g; g = g->next) {
+            for (i = 0; i < g->nctxs; i++) {
+                if (g->pfd_index[i] >= 0) {
+                    request_waitctx_keep(g->ctxs[i]->sock);
+                }
             }
         }
     }
-
-    /* No pointer to the contexts is kept past the wait (w->ctxs cleared),
-     * one detached by its pool's cleanup is NULL already
-     */
-    for (i = 0; i < w->nctxs; i++) {
-        request_waitctx_t *ctx = w->ctxs[i];
-        const char *name, *dir;
-
-        if (!ctx) {
-            continue;
-        }
-        w->ctxs[i] = NULL;
-        name = request_waitctx_kind_names[ctx->kind];
-        dir = request_waitctx_dir_name(ctx, w->directions[i]);
-
-        if (ctx->kind == REQUEST_WAITCTX_TIMER
-            && why == AP_MPM_WAIT_TIMEOUT
-            && ctx->timeout == w->timeout && !w->deadline) {
-            ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
-        }
-        request_waitctx_detach_notifier(ctx);
-        ctx->waiting = 0;
-        if (ctx->released) {
-            request_waitctx_release_pfd(ctx);
-        }
-
-        if (rv == APR_EGENERAL) {
-            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                          APLOG_DEBUG, 0, waiter, APLOGNO()
-                          "waiting for the %s%s interrupted (async, %i)",
-                          name, dir, (int)why);
-        }
-        ap_log_rerror(WAITCTX_LOG_MARK(ctx),
-                      APLOG_TRACE5, rv, waiter,
-                      "done waiting for the %s%s (async)", name, dir);
-    }
-    w->nctxs = 0;
-    w->waiter = NULL;
-    w->deadline = NULL;
-
-    /* fn ends the request (r can't be touched afterwards), or it's suspended
-     * again (fn waits again), or abandoned (the MPM closes the connection).
-     * The waiter may be a subrequest, whose end doesn't end r.
-     */
-    if (async) {
-        async->ended = &ended;
-    }
-    fn(waiter, rv, fn_baton);
-    if (!ended) {
-        async_request_leave(r, async, 0);
-    }
 }
 
-/* What request_waitreg_prepare() found for a wait */
+/* What request_waitreg_prepare() found for a new wait, beside the wait's own
+ * fields
+ */
 typedef struct {
     int notifiers;                /* notifier contexts */
-    apr_interval_time_t timeout;  /* the smallest, negative for none */
     apr_interval_time_t delay;    /* the smallest of the pfds', if any */
-    int timer_expires;            /* the timeout is a timer's */
-    ap_request_async_t *deadline; /* the timeout is this subrequest's
-                                   * deadline */
-    int keep;                     /* the MPM can keep the pfds registered */
 } request_waitreg_plan_t;
 
-/* Check the contexts of a wait, and whether some are ready in their
- * connections' filters already, then build the wait: the descriptors to
- * poll and wait for in w->pfds (the index of each one's context in
- * w->pfd_ctxs), the notifiers, the smallest timeout and delay in plan. The
- * MPM keeps the descriptors registered from their second wait in the same
- * direction, or from the first for several targets (repeated waits by
- * nature). Returns DECLINED for a context that can't wait, OK if some are
- * ready, else AGAIN.
+/* Check the contexts of a new wait, and whether some are ready in their
+ * connections' filters already, then build the wait: its contexts, the
+ * smallest timeout (and whether it's a timer's), whether the MPM can keep
+ * its descriptors; the descriptors to poll for the delay in w->pfds (each
+ * context's index in g->pfd_index), the notifiers and the smallest delay in
+ * plan. The MPM keeps the descriptors registered from their second wait in
+ * the same direction, or from the first for several targets (repeated waits
+ * by nature). Returns DECLINED for a context that can't wait (released, or
+ * pending in another wait), OK if some are ready, else AGAIN.
  */
 static int request_waitreg_prepare(struct ap_request_waitset *w,
+                                   request_waitreg_t *g,
                                    ap_request_waitctx_t *const *ctxs, int nctxs,
                                    const unsigned int *directions, int any,
                                    request_waitreg_plan_t *plan)
 {
-    request_rec *r = w->r;
     apr_interval_time_t timer_timeout = -1;
     unsigned int ready = 0;
     int i;
 
     plan->notifiers = 0;
-    plan->timeout = -1;
     plan->delay = -1;
-    plan->deadline = NULL;
-    plan->keep = 1;
-
-    if (w->nalloc < nctxs) {
-        w->nalloc = (nctxs > 2) ? nctxs : 2;
-        w->ctxs = apr_palloc(r->pool, w->nalloc * sizeof(*w->ctxs));
-        w->directions = apr_palloc(r->pool,
-                                   w->nalloc * sizeof(*w->directions));
-        w->pfd_ctxs = apr_palloc(r->pool, w->nalloc * sizeof(*w->pfd_ctxs));
-    }
     apr_array_clear(w->pfds);
 
     for (i = 0; i < nctxs; i++) {
@@ -1219,14 +1594,26 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         apr_interval_time_t t;
 
         /* Contexts of requests of the same tree (w's) */
-        AP_DEBUG_ASSERT(request_waitctx_tree(ctx) == w
-                        && !ctx->released && !ctx->waiting);
-        if (request_waitctx_tree(ctx) != w || ctx->released
-            || ctx->waiting) {
+        if (request_waitctx_tree(ctx) != w || ctx->released || ctx->wait) {
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_ERR, 0, ctx->pub.r, APLOGNO()
+                          "can't wait for the %s: its context is %s",
+                          request_waitctx_kind_names[ctx->kind],
+                          (request_waitctx_tree(ctx) != w)
+                          ? "another request tree's"
+                          : (ctx->released) ? "released"
+                                            : "in another wait already");
+            AP_DEBUG_ASSERT(request_waitctx_tree(ctx) == w
+                            && !ctx->released && !ctx->wait);
             return DECLINED;
         }
+        g->ctxs[i] = ctx;
+        g->directions[i] = directions[i];
+        g->pfd_index[i] = -1;
         if (ctx->notifier) {
-            /* Attached to the tree's notifier by request_wait_attach() */
+            /* Attached to the tree's notifier by
+             * request_waitreg_attach_notifiers()
+             */
             plan->notifiers++;
         }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
@@ -1252,8 +1639,8 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
 
         t = request_waitctx_timeout(ctx, directions[i]);
         ctx->timeout = t;
-        if (t >= 0 && (plan->timeout < 0 || t < plan->timeout)) {
-            plan->timeout = t;
+        if (t >= 0 && (g->timeout < 0 || t < g->timeout)) {
+            g->timeout = t;
         }
         if (ctx->kind == REQUEST_WAITCTX_TIMER
             && t >= 0 && (timer_timeout < 0 || t < timer_timeout)) {
@@ -1263,7 +1650,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             apr_pollfd_t *pfd;
 
-            w->pfd_ctxs[w->pfds->nelts] = i;
+            g->pfd_index[i] = w->pfds->nelts;
             pfd = apr_array_push(w->pfds);
             *pfd = ctx->pfd;
             pfd->reqevents = 0;
@@ -1271,14 +1658,14 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
                 pfd->reqevents |= APR_POLLIN;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
-                    plan->keep = 0;
+                    g->keep = 0;
                 }
             }
             if (directions[i] & AP_WAIT_OUT) {
                 pfd->reqevents |= APR_POLLOUT;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
-                    plan->keep = 0;
+                    g->keep = 0;
                 }
             }
             pfd->rtnevents = 0;
@@ -1288,49 +1675,51 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             }
         }
     }
+    g->nctxs = nctxs;
     if (ready) {
         return OK;
     }
-    plan->timer_expires = (timer_timeout >= 0
-                           && timer_timeout == plan->timeout);
+    g->timer_expires = (timer_timeout >= 0 && timer_timeout == g->timeout);
     return AGAIN;
 }
 
-/* Poll the wait's descriptors for the delay: APR_TIMEUP if none is ready,
- * else their contexts' readiness is set, all their directions on the poll's
- * failure (e.g. EINTR, which must not fail the request): the caller's I/O
- * goes on as usual and reports an error if any.
+/* Poll the new wait's descriptors for the delay: APR_TIMEUP if none is
+ * ready, else their contexts' readiness is set, all their directions on the
+ * poll's failure (e.g. EINTR, which must not fail the request): the
+ * caller's I/O goes on as usual and reports an error if any.
  */
 static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
-                                         ap_request_waitctx_t *const *ctxs,
-                                         const unsigned int *directions,
+                                         request_waitreg_t *g,
                                          apr_interval_time_t delay)
 {
     apr_int32_t nready = 0;
     apr_status_t rv;
-    int k;
+    int i;
 
     rv = apr_poll((apr_pollfd_t *)w->pfds->elts, w->pfds->nelts, &nready,
                   delay);
     if (APR_STATUS_IS_TIMEUP(rv)) {
         return rv;
     }
-    for (k = 0; k < w->pfds->nelts; k++) {
-        int i = w->pfd_ctxs[k];
-        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_t *ctx = g->ctxs[i];
+        int k = g->pfd_index[i];
 
+        if (k < 0) {
+            continue;
+        }
         if (rv == APR_SUCCESS) {
             const apr_pollfd_t *pfd = &APR_ARRAY_IDX(w->pfds, k,
                                                      apr_pollfd_t);
             ctx->ready = ready_directions(pfd->rtnevents,
-                                          directions[i]);
+                                          g->directions[i]);
         }
         else {
-            ctx->ready = directions[i] & (AP_WAIT_IN | AP_WAIT_OUT);
+            ctx->ready = g->directions[i] & (AP_WAIT_IN | AP_WAIT_OUT);
         }
     }
     if (rv != APR_SUCCESS) {
-        const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
+        const request_waitctx_t *first = g->ctxs[0];
 
         ap_log_rerror(WAITCTX_LOG_MARK(first),
                       APLOG_TRACE2, rv, first->pub.r,
@@ -1340,48 +1729,40 @@ static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
     return rv;
 }
 
-/* The MPM took the wait: the contexts wait until request_waitset_continuation(),
- * their descriptors kept registered by the MPM if mpm_flags says so.
+/* The new wait is pending: its contexts wait until its continuation (or
+ * until it's dropped), given to the MPM at the end of the run
  */
 static void request_waitreg_commit(struct ap_request_waitset *w,
-                                   ap_request_waitctx_t *const *ctxs, int nctxs,
-                                   const unsigned int *directions,
-                                   const request_waitreg_plan_t *plan,
-                                   unsigned int mpm_flags,
+                                   request_waitreg_t *g,
                                    ap_request_continuation_fn *fn, void *baton)
 {
+    request_waitreg_t **pg;
     int i;
 
-    for (i = 0; i < nctxs; i++) {
-        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_t *ctx = g->ctxs[i];
 
-        w->ctxs[i] = ctx;
-        w->directions[i] = directions[i];
-        ctx->waiting = 1;
+        ctx->wait = g;
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
-            if (directions[i] & AP_WAIT_IN) {
+            if (g->directions[i] & AP_WAIT_IN) {
                 ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits++;
             }
-            if (directions[i] & AP_WAIT_OUT) {
+            if (g->directions[i] & AP_WAIT_OUT) {
                 ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits++;
-            }
-            if (mpm_flags & AP_MPM_WAIT_KEEP_PFDS) {
-                request_waitctx_keep(ctx->sock);
             }
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
                       APLOG_TRACE5, 0, ctx->pub.r,
                       "waiting for the %s%s (async)",
                       request_waitctx_kind_names[ctx->kind],
-                      request_waitctx_dir_name(ctx, directions[i]));
+                      request_waitctx_dir_name(ctx, g->directions[i]));
     }
-    w->waiter = ctxs[0]->r;
-    w->nctxs = nctxs;
-    w->timeout = plan->timeout;
-    w->timer_expires = plan->timer_expires;
-    w->deadline = plan->deadline;
-    w->fn = fn;
-    w->baton = baton;
+    g->waiter = g->ctxs[0]->pub.r;
+    g->fn = fn;
+    g->baton = baton;
+    for (pg = &w->waits; *pg; pg = &(*pg)->next)
+        ;
+    *pg = g;
 }
 
 /* Attach a notifier context's notifier to the tree's notifier: OK, or
@@ -1416,26 +1797,25 @@ static int request_waitctx_attach_notifier(struct ap_request_waitset *w,
     return OK;
 }
 
-/* Detach the notifiers of a wait's contexts from the tree's notifier,
- * those attached (a rollback can give them all)
+/* Detach the notifiers of a pending wait's contexts from the tree's
+ * notifier, those attached
  */
-static void request_wait_detach(ap_request_waitctx_t *const *ctxs, int nctxs)
+static void request_waitreg_detach_notifiers(request_waitreg_t *g)
 {
     int i;
 
-    for (i = 0; i < nctxs; i++) {
-        request_waitctx_detach_notifier((request_waitctx_t *)ctxs[i]);
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_detach_notifier(g->ctxs[i]);
     }
 }
 
-/* Attach the notifiers of a wait's contexts to the notifier of its tree, which
- * the MPM waits for (one notifier per MPM wait): created on first use,
- * re-armed for each wait (still notified by its attached notifiers).
- * A notifier that served a wait already is refused unless re-armed
+/* Attach the notifiers of a new wait's contexts to the notifier of its tree,
+ * which the MPM waits for (one notifier per MPM wait), created on first
+ * use. A notifier that served a wait already is refused unless re-armed
  * (ap_mpm_notifier_rearm()). Returns DECLINED if one can't be attached.
  */
-static int request_wait_attach(struct ap_request_waitset *w,
-                               ap_request_waitctx_t *const *ctxs, int nctxs)
+static int request_waitreg_attach_notifiers(struct ap_request_waitset *w,
+                                            request_waitreg_t *g)
 {
     request_rec *r = w->r;
     apr_status_t rv;
@@ -1444,42 +1824,37 @@ static int request_wait_attach(struct ap_request_waitset *w,
     if (!w->notifier) {
         rv = ap_mpm_notifier_create(&w->notifier, r->connection, r->pool);
         if (rv != APR_SUCCESS) {
+            const request_waitctx_t *first = g->ctxs[0];
+
             w->notifier = NULL;
-            ap_log_rerror(__FILE__, __LINE__, ctxs[0]->module_index,
-                          APLOG_DEBUG, rv, ctxs[0]->r, APLOGNO()
+            ap_log_rerror(WAITCTX_LOG_MARK(first),
+                          APLOG_DEBUG, rv, first->pub.r, APLOGNO()
                           "can't wait for the notifier asynchronously");
             return DECLINED;
         }
     }
-    else {
-        /* Its previous wait is done (the tree's waits are one at a time) */
-        rv = ap_mpm_notifier_rearm(w->notifier);
-        if (rv != APR_SUCCESS) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
-                          "can't re-arm the request's notifier");
-            AP_DEBUG_ASSERT(0);
-        }
-    }
 
-    for (i = 0; i < nctxs; i++) {
-        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+    for (i = 0; i < g->nctxs; i++) {
+        request_waitctx_t *ctx = g->ctxs[i];
 
         if (!ctx->notifier) {
             continue;
         }
         if (request_waitctx_attach_notifier(w, ctx) != OK) {
-            request_wait_detach(ctxs, nctxs);
+            request_waitreg_detach_notifiers(g);
             return DECLINED;
         }
     }
     return OK;
 }
 
-/* Cap the wait to the nearest deadline of the waiting subrequest and of its
- * main requests run by ap_run_sub_req_async(), if any: its timeout (and
- * delay) to what's left of it, zero once reached (the MPM times out at once).
+/* Cap a new wait to the nearest deadline of the waiting subrequest and of
+ * its main requests run by ap_run_sub_req_async(), if any: its timeout (and
+ * delay) to what's left of it, zero once reached (the MPM times out at
+ * once).
  */
 static void request_waitreg_deadline(ap_request_async_t *async,
+                                     request_waitreg_t *g,
                                      request_waitreg_plan_t *plan)
 {
     apr_time_t deadline = 0;
@@ -1500,10 +1875,10 @@ static void request_waitreg_deadline(ap_request_async_t *async,
     if (left < 0) {
         left = 0;
     }
-    if (plan->timeout < 0 || left < plan->timeout) {
-        plan->timeout = left;
-        plan->timer_expires = 0;
-        plan->deadline = which;
+    if (g->timeout < 0 || left < g->timeout) {
+        g->timeout = left;
+        g->timer_expires = 0;
+        g->deadline = which;
     }
     if (plan->delay > left) {
         plan->delay = left;
@@ -1511,7 +1886,8 @@ static void request_waitreg_deadline(ap_request_async_t *async,
 }
 
 /* Wait for the targets of nctxs contexts, the first ready completing the
- * wait (ap_request_wait(), ap_request_wait_any() if any).
+ * wait (ap_request_wait(), ap_request_wait_any() if any): a pending wait
+ * of the tree, given to the MPM with the others at the end of the run.
  */
 static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
                         const unsigned int *directions,
@@ -1523,72 +1899,70 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     ap_request_async_t *async;
     struct ap_request_waitset *w;
     request_waitreg_plan_t plan;
-    unsigned int mpm_flags = 0;
+    request_waitreg_t *g;
     int rc, polled = 0;
     apr_status_t rv;
 
     if (!ap_request_can_suspend(r)) {
         return DECLINED;
     }
-    /* The wait in flight of r's tree */
+    /* The pending waits of r's tree, not in the MPM from its runs */
     async = request_async_get(r);
     w = request_waitset_get(async->top);
+    if (w->in_mpm) {
+        /* Called while the MPM waits for the tree, i.e. from another
+         * thread than the request's
+         */
+        ap_log_rerror(__FILE__, __LINE__, ctxs[0]->module_index, APLOG_ERR,
+                      0, r, APLOGNO() "can't wait while the request's waits "
+                      "are in the MPM (called from another thread?)");
+        AP_DEBUG_ASSERT(!w->in_mpm);
+        return DECLINED;
+    }
 
-    rc = request_waitreg_prepare(w, ctxs, nctxs, directions, any, &plan);
+    g = request_waitreg_get(w, nctxs);
+    rc = request_waitreg_prepare(w, g, ctxs, nctxs, directions, any, &plan);
     if (rc != AGAIN) {
+        request_waitreg_put(w, g);
         return rc;
     }
-    request_waitreg_deadline(async, &plan);
+    request_waitreg_deadline(async, g, &plan);
 
     /* Ready within the delay: no need to wait. Anything but a timeout lets
      * the caller do its I/O as usual (readiness, an error the I/O will
      * report, or the poll's own failure).
      */
     if (w->pfds->nelts && plan.delay > 0) {
-        rv = request_waitreg_poll(w, ctxs, directions, plan.delay);
+        rv = request_waitreg_poll(w, g, plan.delay);
         if (!APR_STATUS_IS_TIMEUP(rv)) {
+            request_waitreg_put(w, g);
             return OK;
         }
         /* Not ready, so drained */
         polled = 1;
     }
 
+    /* Something must complete it (the MPM would refuse the wait) */
+    if (!w->pfds->nelts && !plan.notifiers && g->timeout < 0) {
+        const request_waitctx_t *first = g->ctxs[0];
+
+        ap_log_rerror(WAITCTX_LOG_MARK(first),
+                      APLOG_DEBUG, 0, r, APLOGNO()
+                      "can't wait for the %s asynchronously: nothing would "
+                      "complete the wait", request_waitctx_kind_names[first->kind]);
+        request_waitreg_put(w, g);
+        return DECLINED; /* the caller waits synchronously */
+    }
+    if (plan.notifiers && request_waitreg_attach_notifiers(w, g) != OK) {
+        request_waitreg_put(w, g);
+        return DECLINED; /* the caller waits synchronously */
+    }
+
     /* A readiness the MPM saw for the last wait of a kept pfd was consumed
      * since if the caller says so, or if the poll above found none.
      */
-    if (w->pfds->nelts && plan.keep) {
-        mpm_flags = AP_MPM_WAIT_KEEP_PFDS;
-        if ((flags & AP_REQUEST_WAIT_DRAINED) || polled) {
-            mpm_flags |= AP_MPM_WAIT_DRAINED;
-        }
-    }
-
-    /* The notifiers through the tree's notifier, unless a wait is in
-     * flight already (one per connection: the MPM refuses it below)
-     */
-    if (plan.notifiers && !w->nctxs
-        && request_wait_attach(w, ctxs, nctxs) != OK) {
-        return DECLINED; /* the caller waits synchronously */
-    }
-    rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, plan.timeout,
-                              (plan.notifiers) ? w->notifier : NULL, mpm_flags,
-                              request_waitset_continuation, w);
-    if (rv != APR_SUCCESS) {
-        const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
-
-        if (plan.notifiers && !w->nctxs) {
-            request_wait_detach(ctxs, nctxs);
-        }
-        ap_log_rerror(WAITCTX_LOG_MARK(first),
-                      APLOG_DEBUG, rv, r, APLOGNO()
-                      "can't wait for the %s%s asynchronously",
-                      request_waitctx_kind_names[first->kind],
-                      request_waitctx_dir_name(first, directions[0]));
-        return DECLINED; /* the caller waits synchronously */
-    }
-
-    request_waitreg_commit(w, ctxs, nctxs, directions, &plan, mpm_flags, fn,
-                           baton);
+    g->drained = ((flags & AP_REQUEST_WAIT_DRAINED) || polled);
+    request_waitreg_commit(w, g, fn, baton);
     return SUSPENDED;
 }
 
@@ -1630,6 +2004,40 @@ AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
         return DECLINED;
     }
     return request_wait(ctxs, nctxs, directions, flags, fn, baton, 1);
+}
+
+AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
+{
+    request_waitctx_t *ctx = (request_waitctx_t *)pub;
+    struct ap_request_waitset *w = request_waitctx_tree(ctx);
+    request_waitreg_t *g = ctx->wait;
+
+    if (!g || !w) {
+        return APR_NOTFOUND;
+    }
+    if (w->in_mpm) {
+        return APR_EBUSY; /* not from the thread processing the request */
+    }
+    request_waitreg_unlink(w, g);
+    request_waitreg_finish(g, REQUEST_WAITREG_CANCELED, AP_MPM_WAIT_READY);
+    request_waitreg_put(w, g);
+    return APR_SUCCESS;
+}
+
+/* Whether some waits of the tree of a request are pending */
+static int request_waitset_pending(ap_request_async_t *async)
+{
+    return (async->top->waitset && async->top->waitset->waits);
+}
+
+/* A run of the tree leaves it suspended: its pending waits to the MPM */
+static void request_waitset_run_end(ap_request_async_t *top)
+{
+    struct ap_request_waitset *w = top->waitset;
+
+    if (w && w->waits && !w->in_mpm) {
+        request_waitset_register(w);
+    }
 }
 
 void ap_process_async_request(request_rec *r)
@@ -1740,6 +2148,13 @@ static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
     }
     ap_finalize_sub_req_protocol(rsub);
 
+    /* Its waits (and its subrequests') still pending are dropped, their
+     * continuations not called
+     */
+    if (async->top->waitset) {
+        request_waitset_drop(async->top->waitset, rsub, 0);
+    }
+
     /* The MPM keeps descriptors until the top-level request's end: release
      * what the subrequest's waits left kept (e.g. a module not releasing its
      * context with its target)
@@ -1798,9 +2213,9 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
         return ap_run_sub_req(rsub);
     }
     main_async = request_async_get(r);
-    if (main_async->top->waitset && main_async->top->waitset->nctxs) {
-        /* A wait of the tree in flight: called by a filter, or after a
-         * SUSPENDED dropped (one wait per connection)
+    if (request_waitset_pending(main_async)) {
+        /* A wait of the tree pending: called by a filter, or after a
+         * SUSPENDED dropped
          */
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, rsub,
                       APLOGNO() "can't run the subrequest asynchronously "

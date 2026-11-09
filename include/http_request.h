@@ -434,7 +434,7 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  * main request can suspend (ap_request_can_suspend()).
  * @param rsub The subrequest (ap_sub_req_lookup_*() or similar), not run
  * @param timeout The longest the subrequest may run from now on, its waits
- *        capped to what's left: once reached, the wait in flight completes
+ *        capped to what's left: once reached, its pending waits complete
  *        with APR_TIMEUP and done gets HTTP_GATEWAY_TIME_OUT whatever the
  *        subrequest's own status; zero or negative for none. Only the
  *        asynchronous waits are capped (not a subrequest running blocking).
@@ -453,9 +453,8 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         it, e.g. the done function of a previous subrequest), which
  *         returns SUSPENDED up: not from a filter, which can't (for now
  *         this isn't detected, the subrequest's wait would be lost; a call
- *         while a wait of the main request is in flight is refused, logged,
- *         and runs blocking). One subrequest at a time per request (one
- *         wait per connection).
+ *         while a wait of the main request's tree is pending is refused,
+ *         logged, and runs blocking). One subrequest at a time per request.
  * @remark Don't destroy rsub (refused, logged), nor pass output for the main
  *         request, until done is called. The subrequest may run on other
  *         threads than the caller's, as continuations do.
@@ -540,6 +539,11 @@ typedef struct {
  * @remark The continuation either waits again (and returns), or continues
  *         the request until it ends it (ap_request_finish_suspended()),
  *         then doesn't touch r.
+ * @remark Other waits of the request (or of its main request and
+ *         subrequests) may be pending meanwhile, each with its own
+ *         continuation: ending the request drops them (their continuations
+ *         not called, their contexts no longer waiting), ending a
+ *         subrequest drops its own.
  */
 typedef void ap_request_continuation_fn(request_rec *r, apr_status_t status,
                                         void *baton);
@@ -672,9 +676,11 @@ AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_notifier_(request_rec *r,
 
 /**
  * Release a wait context once its target is given up: the MPM stops keeping
- * its descriptor registered (ap_mpm_release_pfd()), when the wait in
- * flight completes if any, and the context can't wait anymore (a new one
- * is needed, e.g. the next ap_request_waitctx_client()).
+ * its descriptor registered (ap_mpm_release_pfd()), and the context can't
+ * wait anymore (a new one is needed, e.g. the next
+ * ap_request_waitctx_client()). It leaves the wait it's pending in, if
+ * any, which is dropped (its continuation not called) if it has no other
+ * context.
  * @param ctx The context
  * @remark It must be called before the target's descriptor is closed or
  *         used by another connection, from the thread processing the
@@ -687,6 +693,16 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  * ready already (for a connection: input pending in its filters,
  * ap_check_input_pending(); no output pending, ap_check_output_pending()),
  * or within the context's delay (polled), the MPM waits for it.
+ *
+ * Several waits of a request, of its main request and its subrequests may
+ * be pending at once, on different contexts (e.g. both directions of a
+ * tunnel and a module's notifier), each completing on its own: when one of
+ * its targets is ready or its own timeout is reached. The MPM waits for
+ * them all at once (one wait per connection), from the end of the run that
+ * made them (the handler returning SUSPENDED, or the continuation
+ * returning); the continuations of those completed together are called one
+ * at a time, in the order their waits were made, and the others stay
+ * pending (their timeouts counted from their first MPM wait).
  * @param ctx The context of the target
  * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection or a
  *        descriptor, ignored by a timer or a notifier
@@ -705,6 +721,12 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  *         EAGAIN (e.g. mod_ssl's part of a line) is pending but not readable:
  *         such a wait answers OK once, then waits.
  * @remark ap_request_waitctx_ready() tells which directions are ready.
+ * @remark A context is in one pending wait at a time (another wait on it
+ *         is DECLINED): cancel the pending one first to wait otherwise
+ *         (ap_request_wait_cancel()). The filters of a connection are
+ *         checked when the wait is made: code reading or writing a
+ *         connection that a pending wait is for, from another continuation,
+ *         cancels and makes that wait again.
  */
 AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *ctx,
                                 ap_wait_direction_e direction,
@@ -737,6 +759,19 @@ AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
                                     unsigned int flags,
                                     ap_request_continuation_fn *fn,
                                     void *baton);
+
+/**
+ * Cancel the pending wait that a context is in, if any: the wait is
+ * dropped, its continuation not called, and its contexts can wait again
+ * (e.g. the same targets in other directions).
+ * @param ctx The context
+ * @return APR_SUCCESS if a pending wait was canceled, APR_NOTFOUND if the
+ *         context is in none, APR_EBUSY if the MPM waits for it (not called
+ *         by the thread processing the request)
+ * @remark A wait completed with others is canceled too if its continuation
+ *         hasn't been called yet.
+ */
+AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *ctx);
 
 /**
  * The directions found ready by the last wait of a context: when it
