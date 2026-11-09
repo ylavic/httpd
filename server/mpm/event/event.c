@@ -2123,9 +2123,14 @@ static void clean_child_exit(int code)
 
     if (one_process) {
         event_note_child_stopped(/* slot */ 0, 0, 0);
+        /* Run ap_terminate() as an atexit() handler. */
+        exit(code);
     }
 
-    exit(code);
+    /* A forked child does not run the atexit() handlers inherited from the
+     * parent process (e.g. OpenSSL's, registered by default).
+     */
+    _exit(code);
 }
 
 static void just_die(int sig)
@@ -7592,6 +7597,20 @@ static void join_start_thread(apr_thread_t * start_thread_id)
     }
 }
 
+/* The recycled (ptrans) pools are children of pconf, created after pruntime,
+ * so pconf destroys them before pruntime's cleanup of the queue info frees
+ * the idle ones, which then are destroyed twice (e.g. when pconf is on exit()
+ * in ONE_PROCESS mode). This pre-cleanup of pconf frees them first, when
+ * all the threads are joined.
+ */
+static apr_status_t free_idle_pools_cleanup(void *dummy)
+{
+    if (worker_queue_info) {
+        ap_queue_info_free_idle_pools(worker_queue_info);
+    }
+    return APR_SUCCESS;
+}
+
 static void child_main(int child_num_arg, int child_bucket)
 {
     apr_thread_t **threads;
@@ -7613,6 +7632,12 @@ static void child_main(int child_num_arg, int child_bucket)
      */
     apr_pool_create(&pchild, pconf);
     apr_pool_tag(pchild, "pchild");
+
+    /* Registered here, before any module's child_init() (which may create
+     * threads), since it allocates from pconf. The queue info is created
+     * later, by setup_threads_runtime().
+     */
+    apr_pool_pre_cleanup_register(pconf, NULL, free_idle_pools_cleanup);
 
 #if AP_HAS_THREAD_LOCAL
     if (!one_process) {
