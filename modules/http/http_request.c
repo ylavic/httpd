@@ -2534,12 +2534,6 @@ AP_CORE_DECLARE(void) ap_request_drop_holds(request_rec *r)
     }
 }
 
-/* Whether some waits of the tree of a request are pending */
-static int request_waitset_pending(ap_request_async_t *async)
-{
-    return (async->top->waitset && async->top->waitset->waits);
-}
-
 /* A run of the tree leaves it suspended: its pending waits to the MPM */
 static void request_waitset_run_end(ap_request_async_t *top)
 {
@@ -2785,21 +2779,11 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
                       "(AP_FILTER_HOLD_DELEGATED): running it blocking");
         return ap_run_sub_req(rsub);
     }
+    /* Other waits of the tree may be pending (e.g. a tunnel's, another
+     * subrequest's, or the producer's while a filter's delegated hold runs
+     * this one): each completes on its own
+     */
     main_async = request_async_get(r);
-    if (request_waitset_pending(main_async)) {
-        /* A wait of the tree pending: called by a filter, or after a
-         * SUSPENDED dropped
-         */
-        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, rsub,
-                      APLOGNO() "can't run the subrequest asynchronously "
-                      "while a wait of its request is in flight (called by "
-                      "a filter?): running it blocking");
-        status = ap_run_sub_req(rsub);
-        if (holder) {
-            ap_filter_hold_undo(holder);
-        }
-        return status;
-    }
 
     async = apr_pcalloc(rsub->pool, sizeof(*async));
     async->r = rsub;

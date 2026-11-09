@@ -2056,9 +2056,8 @@ static int aptest_subreq(request_rec *r)
  *  - N: a notifier context, notified by another thread 50ms later; its
  *    continuation runs a subrequest of <uri> if given (its output captured,
  *    as "aptest-subreq" does) with ap_run_sub_req_async() while the others
- *    are pending: blocking, since the core refuses to suspend a subrequest
- *    while other waits of its request are pending (logged), so the
- *    continuations of the others are called after it and late;
+ *    are pending: it suspends, its waits pending with the others, and its
+ *    done function (S) is called once it completes;
  *  - P1, P2: two descriptor contexts on the read end of the same pipe (one
  *    pfd for both in the MPM's wait), which that thread writes 20ms after
  *    the notification: they complete together, called in that order;

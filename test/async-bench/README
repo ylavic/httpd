@@ -121,7 +121,7 @@ checks/async-wait-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   together and called in the order they were made, a wait canceled, one
   dropped by the request's end; no worker held, 16 requests at once; a
   subrequest run by the notifier's continuation while the others are
-  pending: refused, logged and run blocking), the MPM's keep and drained
+  pending: suspended with them), the MPM's keep and drained
   flags of each descriptor of a wait (two pipes, five MPM waits, from
   mpm_event's trace7 lines for a connection from 127.0.0.2), 200
   descriptor contexts per request made in subpools destroyed after their

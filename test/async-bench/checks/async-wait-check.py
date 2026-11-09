@@ -9,7 +9,7 @@ without the re-arm declined and logged), several waits of a request pending
 at once (a notifier, two descriptor contexts on one pipe, two timers
 completing together in the order they were made, a wait canceled, one
 dropped by the request's end; a subrequest run by a continuation while the
-others are pending: refused and run blocking), the MPM's keep and drained
+others are pending: suspended with them), the MPM's keep and drained
 flags of each descriptor of a wait (two pipes, from mpm_event's trace7
 lines for a connection from 127.0.0.2), descriptor contexts made in
 subpools destroyed after their waits, and a graceful stop during waits. "sync" runs them with
@@ -766,24 +766,21 @@ for mode in os.environ.get("MODES", "sync async").split():
                       % (mode, t, busy, bodies, dropped, canceled, bad, verdict(ok)))
 
         # The same with the notifier's continuation running a subrequest (of
-        # a 100ms timer) while the other waits are pending: refused by the
-        # core (logged), run blocking, the request completing all the same
-        refused_line = ("can't run the subrequest asynchronously while a wait of "
-                        "its request is in flight")
+        # a 100ms timer) while the other waits are pending: suspended with
+        # them, its done function (S) called once its timer completes
+        refused_line = "can't run the subrequest asynchronously"
         refused0 = log_count(refused_line)
         never0 = log_count(bad_lines[0])
         st, body = get("/multisub", timeout=20)
         refused = log_count(refused_line) - refused0
         never = log_count(bad_lines[0]) - never0
         if is_async:
-            ok = (st == 200 and body.startswith(b"multi: order=N,")
-                  and b",F " in body and b"X" not in body.split(b" ")[1]
-                  and b" subreq=200:inline " in body and b" cancel=ok " in body
-                  and refused == 1 and not never)
+            ok = (st == 200
+                  and body == (b"multi: order=N,P1,P2,T1,T2,S,F cancel=ok notifier=ok "
+                               b"pipes=ok timers=ok subreq=200:async final=ok\n")
+                  and not refused and not never)
         else:
             ok = st == 200 and body == b"multi: declined\n" and not refused and not never
-        # (the others' continuations are called late: "pipes=FAILED", as
-        # expected, not shown)
         shown = b" ".join(f for f in body.split()
                           if f.split(b"=")[0] in (b"multi:", b"order", b"cancel",
                                                   b"subreq", b"final", b"declined"))

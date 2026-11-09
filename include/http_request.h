@@ -460,9 +460,12 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         hold after done). Not from a filter otherwise, which can't, nor
  *         from the done function of a delegated hold's subrequest (the
  *         filter runs the next one when called again): detected, logged as
- *         an error, the subrequest runs blocking. A call while a wait of
- *         the main request's tree is pending is refused, logged, and runs
- *         blocking. One subrequest at a time per request.
+ *         an error, the subrequest runs blocking.
+ * @remark Other waits of the main request's tree may be pending meanwhile
+ *         (e.g. a tunnel's, see ap_request_wait()), and several subrequests
+ *         may be suspended at once, each done called when it completes: the
+ *         main request's handlers are resumed (or it's ended) once, after
+ *         the last one it waits for.
  * @remark Don't destroy rsub (refused, logged), nor pass output for the main
  *         request, until done is called. The subrequest may run on other
  *         threads than the caller's, as continuations do.
