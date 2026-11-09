@@ -79,7 +79,8 @@ checks/async-*-check.py PREFIX WORKDIR
   (backend handshake), remote (the CONNECT exchange with a forward proxy,
   ProxyRemote, in front of the tls backend), balancer (failover,
   failonstatus/failontimeout), shutdown (graceful and hard restarts/stops
-  with suspended requests), 100 (Expect: 100-continue end-to-end, ping=, ping
+  with suspended requests), exit (httpd -X stopped with a request suspended,
+  its pools destroyed at exit), 100 (Expect: 100-continue end-to-end, ping=, ping
   timeout, final responses instead of 100, the 100 sent by httpd itself, and
   uploads waiting for the 100 not holding a worker), tunnel (Upgrade: tunnels
   exchanging data, many on few threads, the idle timeout, either side
