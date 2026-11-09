@@ -656,6 +656,9 @@ struct ap_mpm_notifier_t;
  *         ap_request_waitctx_release()): a wait on a context whose
  *         notifier served a wait and wasn't re-armed is logged as an error
  *         and answered DECLINED, the notifier never re-armed implicitly.
+ * @remark For each wait, core attaches the notifier to a notifier of its
+ *         own (ap_mpm_notifier_attach()), which the MPM waits for, until
+ *         the wait completes: several notifiers can be waited for at once.
  */
 AP_DECLARE(ap_request_waitctx_t *) ap_request_waitctx_notifier_(request_rec *r,
                                                                 apr_pool_t *p,
@@ -714,7 +717,7 @@ AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *ctx,
  * already, else SUSPENDED or DECLINED. The timeout is the smallest of the
  * contexts', the delay the smallest of those waiting for a descriptor (no
  * poll if any of them has none).
- * @param ctxs The contexts, all of the same request, at most one notifier
+ * @param ctxs The contexts, all of the same request
  * @param nctxs The number of contexts
  * @param directions For each context, AP_WAIT_IN and/or AP_WAIT_OUT (both
  *        for the same descriptor in one wait), ignored by a timer or a

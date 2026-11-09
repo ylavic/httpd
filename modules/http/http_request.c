@@ -614,9 +614,8 @@ typedef struct request_waitctx_t {
     unsigned int ready;           /* AP_WAIT_* of the last wait */
     unsigned int waiting  :1,     /* in the wait in flight */
                  kept     :1,     /* its pfd may be kept by the MPM */
-                 used     :1,     /* its notifier given to a wait (the
-                                   * MPM refuses another one until the
-                                   * notifier is re-armed) */
+                 attached :1,     /* its notifier attached to the tree's
+                                   * notifier (ap_mpm_notifier_attach()) */
                  released :1;     /* ap_request_waitctx_release()d */
 } request_waitctx_t;
 
@@ -648,8 +647,22 @@ struct ap_request_waitset {
                                    * deadline (ap_run_sub_req_async()) */
     ap_request_continuation_fn *fn;
     void *baton;
+    ap_mpm_notifier_t *notifier;  /* the notifier given to the MPM for the
+                                   * notifier contexts, attached to it
+                                   * (top-level request's, on first use) */
     int ending;                   /* r->pool is being destroyed */
 };
+
+/* Detach a notifier context's notifier from the tree's notifier, its wait
+ * done (nothing done if it isn't attached)
+ */
+static void request_waitctx_detach_notifier(request_waitctx_t *ctx)
+{
+    if (ctx->attached) {
+        ap_mpm_notifier_detach(ctx->notifier);
+        ctx->attached = 0;
+    }
+}
 
 /* The top-level request's pool is being destroyed (its pre-cleanups run
  * before its subpools are destroyed): the contexts' cleanups know that the
@@ -658,8 +671,16 @@ struct ap_request_waitset {
 static apr_status_t request_waitset_cleanup(void *data)
 {
     struct ap_request_waitset *w = data;
+    int i;
 
     w->ending = 1;
+
+    /* The tree's notifier goes with r->pool, the notifiers may outlive it */
+    for (i = 0; i < w->nctxs; i++) {
+        if (w->ctxs[i]) {
+            request_waitctx_detach_notifier(w->ctxs[i]);
+        }
+    }
     return APR_SUCCESS;
 }
 
@@ -768,6 +789,7 @@ static apr_status_t request_waitctx_cleanup(void *data)
                 w->ctxs[i] = NULL;
             }
         }
+        request_waitctx_detach_notifier(ctx);
         ctx->waiting = 0;
         ctx->released = 1;
         request_waitctx_unkeep(ctx);
@@ -1040,12 +1062,26 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     ap_request_continuation_fn *fn = w->fn;
     void *fn_baton = w->baton;
     apr_status_t rv;
-    int i, k, ended = 0;
+    int i, k, ended = 0, notified = 0;
 
     AP_DEBUG_ASSERT(mpm_r == r);
     AP_DEBUG_ASSERT(async != NULL && !async->running);
     AP_DEBUG_ASSERT(waiter != NULL);
     async_request_enter(r, async);
+
+    /* Which notifiers completed the wait through the tree's notifier, if
+     * any
+     */
+    for (i = 0; i < w->nctxs; i++) {
+        request_waitctx_t *ctx = w->ctxs[i];
+        if (ctx && ctx->attached && ap_mpm_notifier_notified(ctx->notifier)) {
+            ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
+            notified = 1;
+        }
+    }
+    if (notified) {
+        why = AP_MPM_WAIT_NOTIFIED;
+    }
     switch (why) {
     case AP_MPM_WAIT_READY:
         rv = APR_SUCCESS;
@@ -1095,13 +1131,12 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
         name = request_waitctx_kind_names[ctx->kind];
         dir = request_waitctx_dir_name(ctx, w->directions[i]);
 
-        if ((ctx->kind == REQUEST_WAITCTX_TIMER
-             && why == AP_MPM_WAIT_TIMEOUT
-             && ctx->timeout == w->timeout && !w->deadline)
-            || (ctx->kind == REQUEST_WAITCTX_NOTIFIER
-                && why == AP_MPM_WAIT_NOTIFIED)) {
+        if (ctx->kind == REQUEST_WAITCTX_TIMER
+            && why == AP_MPM_WAIT_TIMEOUT
+            && ctx->timeout == w->timeout && !w->deadline) {
             ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
         }
+        request_waitctx_detach_notifier(ctx);
         ctx->waiting = 0;
         if (ctx->released) {
             request_waitctx_release_pfd(ctx);
@@ -1136,7 +1171,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
 /* What request_waitreg_prepare() found for a wait */
 typedef struct {
-    ap_mpm_notifier_t *notifier;  /* the targets' notifier, if any */
+    int notifiers;                /* notifier contexts */
     apr_interval_time_t timeout;  /* the smallest, negative for none */
     apr_interval_time_t delay;    /* the smallest of the pfds', if any */
     int timer_expires;            /* the timeout is a timer's */
@@ -1148,7 +1183,7 @@ typedef struct {
 /* Check the contexts of a wait, and whether some are ready in their
  * connections' filters already, then build the wait: the descriptors to
  * poll and wait for in w->pfds (the index of each one's context in
- * w->pfd_ctxs), the notifier, the smallest timeout and delay in plan. The
+ * w->pfd_ctxs), the notifiers, the smallest timeout and delay in plan. The
  * MPM keeps the descriptors registered from their second wait in the same
  * direction, or from the first for several targets (repeated waits by
  * nature). Returns DECLINED for a context that can't wait, OK if some are
@@ -1164,7 +1199,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
     unsigned int ready = 0;
     int i;
 
-    plan->notifier = NULL;
+    plan->notifiers = 0;
     plan->timeout = -1;
     plan->delay = -1;
     plan->deadline = NULL;
@@ -1191,15 +1226,8 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             return DECLINED;
         }
         if (ctx->notifier) {
-            /* A wait has one notifier. One that served a wait already is
-             * refused by the MPM unless re-armed (ap_mpm_notifier_rearm()),
-             * which only the MPM knows: see request_wait().
-             */
-            AP_DEBUG_ASSERT(!plan->notifier);
-            if (plan->notifier) {
-                return DECLINED;
-            }
-            plan->notifier = ctx->notifier;
+            /* Attached to the tree's notifier by request_wait_attach() */
+            plan->notifiers++;
         }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             if (!(directions[i] & (AP_WAIT_IN | AP_WAIT_OUT))) {
@@ -1330,9 +1358,6 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
         w->ctxs[i] = ctx;
         w->directions[i] = directions[i];
         ctx->waiting = 1;
-        if (ctx->notifier) {
-            ctx->used = 1;
-        }
         if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
             if (directions[i] & AP_WAIT_IN) {
                 ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits++;
@@ -1359,21 +1384,95 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
     w->baton = baton;
 }
 
-/* The index of the notifier context among a wait's contexts whose notifier
- * served a wait already, or -1
+/* Attach a notifier context's notifier to the tree's notifier: OK, or
+ * DECLINED if it can't be (logged)
  */
-static int request_wait_used_notifier(ap_request_waitctx_t *const *ctxs,
-                                      int nctxs)
+static int request_waitctx_attach_notifier(struct ap_request_waitset *w,
+                                           request_waitctx_t *ctx)
+{
+    apr_status_t rv;
+
+    rv = ap_mpm_notifier_attach(ctx->notifier, w->notifier);
+    if (rv != APR_SUCCESS) {
+        if (APR_STATUS_IS_EBUSY(rv)) {
+            /* The notifier served a wait and wasn't re-armed, a bug of the
+             * caller (never re-armed implicitly, that would let a stale
+             * notification complete this wait)
+             */
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_ERR, rv, ctx->pub.r, APLOGNO()
+                          "can't wait for the notifier: it served a wait "
+                          "already and wasn't re-armed "
+                          "(ap_mpm_notifier_rearm())");
+        }
+        else {
+            ap_log_rerror(WAITCTX_LOG_MARK(ctx),
+                          APLOG_DEBUG, rv, ctx->pub.r, APLOGNO()
+                          "can't wait for the notifier asynchronously");
+        }
+        return DECLINED;
+    }
+    ctx->attached = 1;
+    return OK;
+}
+
+/* Detach the notifiers of a wait's contexts from the tree's notifier,
+ * those attached (a rollback can give them all)
+ */
+static void request_wait_detach(ap_request_waitctx_t *const *ctxs, int nctxs)
 {
     int i;
 
     for (i = 0; i < nctxs; i++) {
-        const request_waitctx_t *ctx = (const request_waitctx_t *)ctxs[i];
-        if (ctx->notifier && ctx->used) {
-            return i;
+        request_waitctx_detach_notifier((request_waitctx_t *)ctxs[i]);
+    }
+}
+
+/* Attach the notifiers of a wait's contexts to the notifier of its tree, which
+ * the MPM waits for (one notifier per MPM wait): created on first use,
+ * re-armed for each wait (still notified by its attached notifiers).
+ * A notifier that served a wait already is refused unless re-armed
+ * (ap_mpm_notifier_rearm()). Returns DECLINED if one can't be attached.
+ */
+static int request_wait_attach(struct ap_request_waitset *w,
+                               ap_request_waitctx_t *const *ctxs, int nctxs)
+{
+    request_rec *r = w->r;
+    apr_status_t rv;
+    int i;
+
+    if (!w->notifier) {
+        rv = ap_mpm_notifier_create(&w->notifier, r->connection, r->pool);
+        if (rv != APR_SUCCESS) {
+            w->notifier = NULL;
+            ap_log_rerror(__FILE__, __LINE__, ctxs[0]->module_index,
+                          APLOG_DEBUG, rv, ctxs[0]->r, APLOGNO()
+                          "can't wait for the notifier asynchronously");
+            return DECLINED;
         }
     }
-    return -1;
+    else {
+        /* Its previous wait is done (the tree's waits are one at a time) */
+        rv = ap_mpm_notifier_rearm(w->notifier);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "can't re-arm the request's notifier");
+            AP_DEBUG_ASSERT(0);
+        }
+    }
+
+    for (i = 0; i < nctxs; i++) {
+        request_waitctx_t *ctx = (request_waitctx_t *)ctxs[i];
+
+        if (!ctx->notifier) {
+            continue;
+        }
+        if (request_waitctx_attach_notifier(w, ctx) != OK) {
+            request_wait_detach(ctxs, nctxs);
+            return DECLINED;
+        }
+    }
+    return OK;
 }
 
 /* Cap the wait to the nearest deadline of the waiting subrequest and of its
@@ -1463,31 +1562,28 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
             mpm_flags |= AP_MPM_WAIT_DRAINED;
         }
     }
+
+    /* The notifiers through the tree's notifier, unless a wait is in
+     * flight already (one per connection: the MPM refuses it below)
+     */
+    if (plan.notifiers && !w->nctxs
+        && request_wait_attach(w, ctxs, nctxs) != OK) {
+        return DECLINED; /* the caller waits synchronously */
+    }
     rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, plan.timeout,
-                              plan.notifier, mpm_flags,
+                              (plan.notifiers) ? w->notifier : NULL, mpm_flags,
                               request_waitset_continuation, w);
     if (rv != APR_SUCCESS) {
         const request_waitctx_t *first = (const request_waitctx_t *)ctxs[0];
-        int used = request_wait_used_notifier(ctxs, nctxs);
 
-        if (APR_STATUS_IS_EBUSY(rv) && used >= 0 && !w->nctxs) {
-            /* No wait in flight: the notifier served one and wasn't
-             * re-armed, a bug of the caller (never re-armed implicitly,
-             * that would let a stale notification complete this wait)
-             */
-            ap_log_rerror(__FILE__, __LINE__, ctxs[used]->module_index,
-                          APLOG_ERR, rv, r, APLOGNO()
-                          "can't wait for the notifier: it served a wait "
-                          "already and wasn't re-armed "
-                          "(ap_mpm_notifier_rearm())");
+        if (plan.notifiers && !w->nctxs) {
+            request_wait_detach(ctxs, nctxs);
         }
-        else {
-            ap_log_rerror(WAITCTX_LOG_MARK(first),
-                          APLOG_DEBUG, rv, r, APLOGNO()
-                          "can't wait for the %s%s asynchronously",
-                          request_waitctx_kind_names[first->kind],
-                          request_waitctx_dir_name(first, directions[0]));
-        }
+        ap_log_rerror(WAITCTX_LOG_MARK(first),
+                      APLOG_DEBUG, rv, r, APLOGNO()
+                      "can't wait for the %s%s asynchronously",
+                      request_waitctx_kind_names[first->kind],
+                      request_waitctx_dir_name(first, directions[0]));
         return DECLINED; /* the caller waits synchronously */
     }
 
