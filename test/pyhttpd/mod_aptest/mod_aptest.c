@@ -45,6 +45,11 @@
 #define APTEST_HAS_SUBREQ 1
 #endif
 
+/* Several pending waits of a request, ap_request_wait_cancel() */
+#if defined(APTEST_HAS_SUBREQ) && AP_MODULE_MAGIC_AT_LEAST(20260601, 9)
+#define APTEST_HAS_MULTI 1
+#endif
+
 /* ap_mpm_register_wait()'s flags: per pfd (an array) or for the wait */
 #if AP_MODULE_MAGIC_AT_LEAST(20260601, 10)
 #define APTEST_WAIT_NO_FLAGS NULL
@@ -68,6 +73,7 @@ typedef struct {
     int wait_mode;                  /* APTEST_WAIT_* */
     apr_interval_time_t wait_timer; /* for "timer" */
     int wait_count;                 /* for "pfdpool" */
+    const char *wait_uri;           /* for "multi" (its subrequest) */
     aptest_suspend_conf suspend[2]; /* AptestSuspend, AptestSuspend2 */
     int body_mode;                  /* APTEST_BODY_* (AptestBody) */
     int body_block;                 /* read from an output filter, blocking */
@@ -93,6 +99,7 @@ typedef struct {
 #define APTEST_WAIT_DIGEST 3
 #define APTEST_WAIT_NOTIFIER 4
 #define APTEST_WAIT_PFDPOOL  5
+#define APTEST_WAIT_MULTI    6
 
 static void *aptest_create_dir_conf(apr_pool_t *p, char *dir)
 {
@@ -109,11 +116,13 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
         conf->wait_mode = add->wait_mode;
         conf->wait_timer = add->wait_timer;
         conf->wait_count = add->wait_count;
+        conf->wait_uri = add->wait_uri;
     }
     else {
         conf->wait_mode = base->wait_mode;
         conf->wait_timer = base->wait_timer;
         conf->wait_count = base->wait_count;
+        conf->wait_uri = base->wait_uri;
     }
     for (i = 0; i < 2; i++) {
         conf->suspend[i] = (add->suspend[i].set) ? add->suspend[i]
@@ -176,9 +185,15 @@ static const char *aptest_set_wait(cmd_parms *cmd, void *dconf,
         conf->wait_mode = APTEST_WAIT_PFDPOOL;
         conf->wait_count = (int)n;
     }
+#ifdef APTEST_HAS_MULTI
+    else if (strcmp(mode, "multi") == 0) {
+        conf->wait_mode = APTEST_WAIT_MULTI;
+        conf->wait_uri = ms; /* the subrequest's, optional */
+    }
+#endif
     else {
         return "AptestWait timer <ms> | echo | digest | notifier | "
-               "pfdpool <n>";
+               "pfdpool <n> | multi [<uri>]";
     }
     return NULL;
 }
@@ -322,7 +337,7 @@ static const char *aptest_set_subreq(cmd_parms *cmd, void *dconf,
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
-                   "digest, notifier or pfdpool <n>"),
+                   "digest, notifier, pfdpool <n> or multi [<uri>]"),
 #ifdef APTEST_HAS_RESUME
     AP_INIT_TAKE_ARGV("AptestSuspend", aptest_set_suspend, NULL, OR_ALL,
                       "the first suspending handler: <ms> "
@@ -1150,6 +1165,10 @@ static int aptest_pfdpool(request_rec *r, const aptest_dir_conf *conf)
     return aptest_pfdpool_run(s);
 }
 
+#ifdef APTEST_HAS_MULTI
+static int aptest_multi(request_rec *r, const aptest_dir_conf *conf);
+#endif
+
 static int aptest_wait(request_rec *r)
 {
     const aptest_dir_conf *conf;
@@ -1171,6 +1190,11 @@ static int aptest_wait(request_rec *r)
     if (conf->wait_mode == APTEST_WAIT_PFDPOOL) {
         return aptest_pfdpool(r, conf);
     }
+#ifdef APTEST_HAS_MULTI
+    if (conf->wait_mode == APTEST_WAIT_MULTI) {
+        return aptest_multi(r, conf);
+    }
+#endif
 
     w = apr_pcalloc(r->pool, sizeof(*w));
     w->r = r;
@@ -1930,6 +1954,326 @@ static int aptest_subreq(request_rec *r)
     return aptest_subreq_run(s);
 }
 #endif /* APTEST_HAS_SUBREQ */
+
+#ifdef APTEST_HAS_MULTI
+/*
+ * Several waits of a request pending at once ("AptestWait multi [<uri>]"),
+ * made by the handler in its run, each with its own continuation, all in
+ * the MPM's one wait for the connection:
+ *  - N: a notifier context, notified by another thread 50ms later; its
+ *    continuation runs a subrequest of <uri> if given (its output captured,
+ *    as "aptest-subreq" does) with ap_run_sub_req_async() while the others
+ *    are pending: blocking, since the core refuses to suspend a subrequest
+ *    while other waits of its request are pending (logged), so the
+ *    continuations of the others are called after it and late;
+ *  - P1, P2: two descriptor contexts on the read end of the same pipe (one
+ *    pfd for both in the MPM's wait), which that thread writes 20ms after
+ *    the notification: they complete together, called in that order;
+ *  - T1, T2: two timers of 100ms, made one after the other: they complete
+ *    together, called in that order;
+ *  - C: a timer of 30ms canceled at once (ap_request_wait_cancel()): never
+ *    called, and canceling it again finds no wait;
+ *  - D: a timer of 10s left pending: the request's end drops it (never
+ *    called, an error is logged if it is);
+ *  - F: a timer of 300ms, ending the request once the others are done.
+ * The response: "multi: order=<the continuations called, in order>
+ * cancel=<ok|...> notifier=<ok|...> pipes=<ok|...> timers=<ok|...>
+ * subreq=<status>:<async|inline|none|pending> final=<ok|...>", e.g.
+ * "multi: order=N,P1,P2,T1,T2,F cancel=ok notifier=ok pipes=ok timers=ok
+ * subreq=-:none final=ok" when all went as expected without a subrequest,
+ * "subreq=200:inline" with a subrequest run blocking ("200:async" and S, its
+ * done function, in the order if it suspended), "multi: declined" when the
+ * request can't wait asynchronously (e.g. AsyncRequests Off), "multi: none"
+ * without notifiers in the MPM or threads.
+ */
+typedef struct {
+    request_rec *r;
+    const aptest_dir_conf *conf;
+    ap_mpm_notifier_t *notifier;
+    ap_request_waitctx_t *n, *p1, *p2, *t1, *t2, *c, *d, *f;
+    apr_file_t *pipe_in, *pipe_out;
+#if APR_HAS_THREADS
+    apr_thread_t *thread;       /* notifying, then writing, until joined */
+#endif
+    apr_time_t start;
+    aptest_subreq_t sub;        /* the subrequest's capture (its filter's
+                                 * context) */
+    int sub_status;             /* its final status, -1 until done */
+    const char *sub_how;        /* "async", "inline", "none" */
+    char order[64];             /* the continuations called, in order */
+    apr_size_t olen;
+    const char *report;
+} aptest_multi_t;
+
+static void aptest_multi_note(aptest_multi_t *m, const char *what,
+                              const char *result)
+{
+    m->report = apr_pstrcat(m->r->pool, m->report, " ", what, "=", result,
+                            NULL);
+}
+
+/* A continuation called: noted in order, the time since the start (ms) */
+static apr_interval_time_t aptest_multi_called(aptest_multi_t *m,
+                                               const char *which)
+{
+    if (m->olen + strlen(which) + 2 < sizeof(m->order)) {
+        m->olen += apr_snprintf(m->order + m->olen,
+                                sizeof(m->order) - m->olen, "%s%s",
+                                m->olen ? "," : "", which);
+    }
+    return apr_time_as_msec(apr_time_now() - m->start);
+}
+
+#if APR_HAS_THREADS
+static void *APR_THREAD_FUNC aptest_multi_thread(apr_thread_t *thd,
+                                                 void *data)
+{
+    aptest_multi_t *m = data;
+    apr_size_t len = 1;
+
+    apr_sleep(apr_time_from_msec(50));
+    ap_mpm_notify(m->notifier);
+    apr_sleep(apr_time_from_msec(20));
+    apr_file_write(m->pipe_out, "x", &len);
+    apr_thread_exit(thd, APR_SUCCESS);
+    return NULL;
+}
+
+static apr_status_t aptest_multi_join(void *data)
+{
+    aptest_multi_t *m = data;
+    apr_status_t rv;
+
+    if (m->thread) {
+        apr_thread_join(&rv, m->thread);
+        m->thread = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+static void aptest_multi_sub_done(request_rec *rsub, int status, void *baton)
+{
+    aptest_multi_t *m = baton;
+
+    aptest_multi_called(m, "S");
+    m->sub_status = (status == OK) ? rsub->status : status;
+    ap_destroy_sub_req(rsub);
+}
+
+static void aptest_multi_n(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_t *m = baton;
+    apr_interval_time_t ms = aptest_multi_called(m, "N");
+    request_rec *rsub;
+    int rc;
+
+    aptest_multi_note(m, "notifier",
+                      (status == APR_SUCCESS && ms >= 40 && ms < 90)
+                      ? "ok" : apr_psprintf(r->pool, "%d@%" APR_TIME_T_FMT,
+                                            status, ms));
+    if (!m->conf->wait_uri) {
+        m->sub_how = "none";
+        return;
+    }
+
+    /* While the others are pending */
+    rsub = ap_sub_req_lookup_uri(m->conf->wait_uri, r, NULL);
+    ap_add_output_filter_handle(aptest_capture_handle, &m->sub, rsub,
+                                rsub->connection);
+    if (rsub->status != HTTP_OK) {
+        m->sub_status = rsub->status;
+        m->sub_how = "inline";
+        ap_destroy_sub_req(rsub);
+        return;
+    }
+    rc = ap_run_sub_req_async(rsub, 0, aptest_multi_sub_done, m);
+    if (rc == SUSPENDED) {
+        m->sub_how = "async";
+        return;
+    }
+    m->sub_how = "inline";
+    m->sub_status = (rc == OK) ? rsub->status : rc;
+    ap_destroy_sub_req(rsub);
+}
+
+/* P1 or P2 (which), ready together */
+static void aptest_multi_p(aptest_multi_t *m, int which, apr_status_t status)
+{
+    apr_interval_time_t ms = aptest_multi_called(m, which ? "P2" : "P1");
+    ap_request_waitctx_t *ctx = which ? m->p2 : m->p1;
+
+    if (status != APR_SUCCESS || ap_request_waitctx_ready(ctx) != AP_WAIT_IN
+        || ms < 60 || ms >= 150) {
+        aptest_multi_note(m, which ? "pipe2" : "pipe1",
+                          apr_psprintf(m->r->pool, "%d@%" APR_TIME_T_FMT,
+                                       status, ms));
+    }
+    ap_request_waitctx_release(ctx);
+}
+
+static void aptest_multi_p1(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_p(baton, 0, status);
+}
+
+static void aptest_multi_p2(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_p(baton, 1, status);
+}
+
+static void aptest_multi_t1(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_t *m = baton;
+    apr_interval_time_t ms = aptest_multi_called(m, "T1");
+
+    if (status != APR_SUCCESS || ms < 90 || ms >= 200) {
+        aptest_multi_note(m, "timer1",
+                          apr_psprintf(r->pool, "%d@%" APR_TIME_T_FMT,
+                                       status, ms));
+    }
+}
+
+static void aptest_multi_t2(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_t *m = baton;
+    apr_interval_time_t ms = aptest_multi_called(m, "T2");
+
+    if (status != APR_SUCCESS || ms < 90 || ms >= 200) {
+        aptest_multi_note(m, "timer2",
+                          apr_psprintf(r->pool, "%d@%" APR_TIME_T_FMT,
+                                       status, ms));
+    }
+}
+
+/* C (canceled) and D (dropped): never called */
+static void aptest_multi_never(request_rec *r, apr_status_t status,
+                               void *baton)
+{
+    aptest_multi_t *m = baton;
+
+    aptest_multi_called(m, "X");
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                  "aptest-wait: multi: a canceled or dropped wait's "
+                  "continuation called");
+}
+
+static void aptest_multi_f(request_rec *r, apr_status_t status, void *baton)
+{
+    aptest_multi_t *m = baton;
+    apr_interval_time_t ms = aptest_multi_called(m, "F");
+    const char *pipes, *timers;
+
+    aptest_multi_join(m);
+    pipes = (ap_strstr_c(m->report, "pipe")) ? "FAILED" : "ok";
+    timers = (ap_strstr_c(m->report, "timer")) ? "FAILED" : "ok";
+    aptest_multi_note(m, "pipes", pipes);
+    aptest_multi_note(m, "timers", timers);
+    aptest_multi_note(m, "subreq",
+                      (m->sub_status < 0)
+                      ? apr_pstrcat(r->pool, "-:", m->sub_how, NULL)
+                      : apr_psprintf(r->pool, "%d:%s", m->sub_status,
+                                     m->sub_how));
+    aptest_multi_note(m, "final",
+                      (status == APR_SUCCESS && ms >= 290 && ms < 600)
+                      ? "ok" : apr_psprintf(r->pool, "%d@%" APR_TIME_T_FMT,
+                                            status, ms));
+
+    /* D is still pending: the end drops it */
+    ap_set_content_type(r, "text/plain");
+    ap_rprintf(r, "multi: order=%s%s\n", m->order, m->report);
+    ap_request_finish_suspended(r, OK);
+}
+
+/* A timer's wait, its context made from r->pool */
+static int aptest_multi_timer(aptest_multi_t *m, ap_request_waitctx_t **ctx,
+                              apr_interval_time_t ms,
+                              ap_request_continuation_fn *fn)
+{
+    *ctx = ap_request_waitctx_timer(m->r, m->r->pool);
+    (*ctx)->timeout = apr_time_from_msec(ms);
+    return ap_request_wait(*ctx, AP_WAIT_IN, 0, fn, m);
+}
+#endif /* APR_HAS_THREADS */
+
+static int aptest_multi(request_rec *r, const aptest_dir_conf *conf)
+{
+    aptest_multi_t *m = apr_pcalloc(r->pool, sizeof(*m));
+#if APR_HAS_THREADS
+    apr_pollfd_t pfd;
+    apr_status_t rv;
+    int rc;
+#endif
+
+    m->r = r;
+    m->conf = conf;
+    m->sub_status = -1;
+    m->sub_how = "pending";
+    m->report = " none";
+#if APR_HAS_THREADS
+    if (!ap_request_can_suspend(r)) {
+        m->report = " declined";
+        goto respond;
+    }
+    if (ap_mpm_notifier_create(&m->notifier, r->connection,
+                               r->pool) != APR_SUCCESS
+        || apr_file_pipe_create_pools(&m->pipe_in, &m->pipe_out,
+                                      APR_FULL_NONBLOCK, r->pool,
+                                      r->pool) != APR_SUCCESS) {
+        goto respond;
+    }
+    m->report = "";
+    apr_md5_init(&m->sub.md5);
+    m->sub.r = r;
+    m->sub.conf = conf;
+
+    m->n = ap_request_waitctx_notifier(r, r->pool, m->notifier);
+    m->n->timeout = apr_time_from_sec(5);
+    rc = ap_request_wait(m->n, AP_WAIT_IN, 0, aptest_multi_n, m);
+    if (rc != SUSPENDED) {
+        m->report = " declined";
+        goto respond;
+    }
+    m->start = apr_time_now();
+    apr_pool_pre_cleanup_register(r->pool, m, aptest_multi_join);
+    rv = apr_thread_create(&m->thread, NULL, aptest_multi_thread, m,
+                           r->pool);
+    if (rv != APR_SUCCESS) {
+        m->thread = NULL;
+        return HTTP_INTERNAL_SERVER_ERROR; /* the wait dropped */
+    }
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_FILE;
+    pfd.desc.f = m->pipe_in;
+    m->p1 = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    m->p2 = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    if (ap_request_wait(m->p1, AP_WAIT_IN, 0, aptest_multi_p1,
+                        m) != SUSPENDED
+        || ap_request_wait(m->p2, AP_WAIT_IN, 0, aptest_multi_p2,
+                           m) != SUSPENDED
+        || aptest_multi_timer(m, &m->t1, 100, aptest_multi_t1) != SUSPENDED
+        || aptest_multi_timer(m, &m->t2, 100, aptest_multi_t2) != SUSPENDED
+        || aptest_multi_timer(m, &m->c, 30, aptest_multi_never) != SUSPENDED
+        || aptest_multi_timer(m, &m->d, 10000,
+                              aptest_multi_never) != SUSPENDED
+        || aptest_multi_timer(m, &m->f, 300, aptest_multi_f) != SUSPENDED) {
+        return HTTP_INTERNAL_SERVER_ERROR; /* the waits dropped */
+    }
+
+    rv = ap_request_wait_cancel(m->c);
+    aptest_multi_note(m, "cancel",
+                      (rv == APR_SUCCESS
+                       && APR_STATUS_IS_NOTFOUND(ap_request_wait_cancel(m->c)))
+                      ? "ok" : "FAILED");
+    return SUSPENDED;
+
+respond:
+#endif
+    ap_set_content_type(r, "text/plain");
+    ap_rprintf(r, "multi:%s\n", m->report);
+    return OK;
+}
+#endif /* APTEST_HAS_MULTI */
 
 /* Install this module into the apache2 infrastructure.
  */

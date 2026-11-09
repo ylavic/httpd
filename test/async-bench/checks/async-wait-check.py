@@ -5,7 +5,11 @@ trickle, the read timeouts (Timeout, RequestReadTimeout), a TLS upload cut
 in the middle of a record (the pending input that isn't readable), clients
 aborting mid-upload, a notifier and its context serving several waits
 (re-armed, a stale notification dropped, a re-arm in flight refused, a wait
-without the re-arm declined and logged), descriptor contexts made in
+without the re-arm declined and logged), several waits of a request pending
+at once (a notifier, two descriptor contexts on one pipe, two timers
+completing together in the order they were made, a wait canceled, one
+dropped by the request's end; a subrequest run by a continuation while the
+others are pending: refused and run blocking), descriptor contexts made in
 subpools destroyed after their waits, and a graceful stop during waits. "sync" runs them with
 AsyncRequests Off (every wait blocks: the same results, the threads held),
 "async" with the waits in the MPM (no thread held while waiting); the
@@ -124,6 +128,18 @@ CustomLog "{work}/access_log" t
 <Location "/pfdpool">
     SetHandler aptest-wait
     AptestWait pfdpool {pfdpool}
+</Location>
+<Location "/multi">
+    SetHandler aptest-wait
+    AptestWait multi
+</Location>
+<Location "/multisub">
+    SetHandler aptest-wait
+    AptestWait multi /subtimer
+</Location>
+<Location "/subtimer">
+    SetHandler aptest-wait
+    AptestWait timer 100
 </Location>
 <Location "/server-status">
     SetHandler server-status
@@ -671,6 +687,59 @@ for mode in os.environ.get("MODES", "sync async").split():
               and unrearmed == (8 if is_async else 0) and t < 2)
         report.append("%s: 8 notifier waits re-armed: %ss, bodies %s, unrearmed errors "
                       "logged %d: %s" % (mode, t, bodies, unrearmed, verdict(ok)))
+
+        # Several waits of a request pending at once (mod_aptest's "multi":
+        # a notifier at 50ms, two pipe contexts ready together at 70ms, two
+        # timers of 100ms called in the order they were made, a wait
+        # canceled, one of 10s dropped by the end at 300ms), 16 requests at
+        # once on 4 threads
+        bad_lines = ("a canceled or dropped wait's continuation called",
+                     "can't run the subrequest asynchronously", "can't wait for the")
+        dropped0 = log_count("dropping the wait for the timer (request done)")
+        canceled0 = log_count("dropping the wait for the timer (canceled)")
+        bad0 = sum(log_count(b) for b in bad_lines)
+        smp = Sampler(0.1, 1, 0)
+        res, t = parallel(16, lambda i: get("/multi?i=%d" % i, timeout=20))
+        busy = held(smp.result(), freed=0.25)
+        dropped = log_count("dropping the wait for the timer (request done)") - dropped0
+        canceled = log_count("dropping the wait for the timer (canceled)") - canceled0
+        bad = sum(log_count(b) for b in bad_lines) - bad0
+        want = (b"multi: order=N,P1,P2,T1,T2,F cancel=ok notifier=ok "
+                b"pipes=ok timers=ok subreq=-:none final=ok\n"
+                if is_async else b"multi: declined\n")
+        bodies = sorted(set(r[1] for r in res))
+        ok = (all(r[0] == 200 and r[1] == want for r in res) and not bad
+              and dropped == (16 if is_async else 0)
+              and canceled == (16 if is_async else 0)
+              and (not is_async or (busy is not None and busy <= 1 and t < 1.5)))
+        report.append("%s: 16 requests with 8 waits pending at once: %ss, workers held %s, "
+                      "bodies %s, dropped %d, canceled %d, errors %d: %s"
+                      % (mode, t, busy, bodies, dropped, canceled, bad, verdict(ok)))
+
+        # The same with the notifier's continuation running a subrequest (of
+        # a 100ms timer) while the other waits are pending: refused by the
+        # core (logged), run blocking, the request completing all the same
+        refused_line = ("can't run the subrequest asynchronously while a wait of "
+                        "its request is in flight")
+        refused0 = log_count(refused_line)
+        never0 = log_count(bad_lines[0])
+        st, body = get("/multisub", timeout=20)
+        refused = log_count(refused_line) - refused0
+        never = log_count(bad_lines[0]) - never0
+        if is_async:
+            ok = (st == 200 and body.startswith(b"multi: order=N,")
+                  and b",F " in body and b"X" not in body.split(b" ")[1]
+                  and b" subreq=200:inline " in body and b" cancel=ok " in body
+                  and refused == 1 and not never)
+        else:
+            ok = st == 200 and body == b"multi: declined\n" and not refused and not never
+        # (the others' continuations are called late: "pipes=FAILED", as
+        # expected, not shown)
+        shown = b" ".join(f for f in body.split()
+                          if f.split(b"=")[0] in (b"multi:", b"order", b"cancel",
+                                                  b"subreq", b"final", b"declined"))
+        report.append("%s: a subrequest run while other waits are pending: %s %s, "
+                      "refused %d: %s" % (mode, st, shown, refused, verdict(ok)))
 
         # Descriptor contexts in subpools: PFDPOOL each, two waits, destroyed
         # (every other one released first), on 4 requests at once

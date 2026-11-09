@@ -116,8 +116,14 @@ checks/async-wait-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   upload cut in the middle of a record, clients aborting mid-upload, a
   notifier and its context serving several waits (re-armed, a stale
   notification dropped, a re-arm in flight refused, a wait without the
-  re-arm declined and logged), 200 descriptor contexts per request made in
-  subpools destroyed after their waits, and a graceful stop during waits;
+  re-arm declined and logged), several waits of a request pending at once
+  (a notifier, two descriptor contexts on one pipe, two timers completing
+  together and called in the order they were made, a wait canceled, one
+  dropped by the request's end; no worker held, 16 requests at once; a
+  subrequest run by the notifier's continuation while the others are
+  pending: refused, logged and run blocking), 200
+  descriptor contexts per request made in subpools destroyed after their
+  waits, and a graceful stop during waits;
   "sync" is AsyncRequests Off (every wait
   blocks: the same results, and the blocking timers: as many as the threads
   holding them all, as many more as wait for a worker without being closed
