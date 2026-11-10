@@ -6154,6 +6154,13 @@ struct proxy_tunnel_conn {
      * outcome of the last hold (ap_proxy_tunnel_hold_status()) */
     ap_request_waitctx_t *hold_ctx;
     apr_status_t hold_status;
+    /* a delegated hold's holder (ap_request_hold_delegate()) */
+    ap_request_holder_t holder;
+
+    /* the last activity of the direction from this side (its input read,
+     * its output to the other side written), its idle clock: stopped while
+     * the direction is paused by a hold, restarted at the hold's end */
+    apr_time_t active_at;
 
     unsigned int down_in:1,
                  down_out:1,
@@ -6168,7 +6175,9 @@ struct proxy_tunnel_conn {
                   * over: then its hooks are called again (hold_over) */
                  held:1,
                  hold_both:1,
-                 hold_over:1;
+                 hold_over:1,
+                 /* held by a delegated hold (no context) */
+                 hold_delegated:1;
 };
 
 /* The side of the tunnel a connection is, or NULL */
@@ -6192,6 +6201,66 @@ static int proxy_tunnel_paused(const proxy_tunnel_conn_t *tc)
     return (tc->held || (tc->other->held && tc->other->hold_both));
 }
 
+/* How long the tunnel can wait for its sides before it ends idle (negative
+ * for no end, zero once reached): each direction has its own idle clock,
+ * and the tunnel ends once every direction not paused by a hold has been
+ * idle for the timeout (a paused direction's clock is stopped, restarted
+ * at the hold's end, the other one's restarted at the hold's start), never
+ * while both are paused. A direction over (its input's EOF read) doesn't
+ * count while the other one is held: the hold's bound applies then.
+ */
+static apr_interval_time_t proxy_tunnel_idle_wait(const proxy_tunnel_rec *tunnel,
+                                                  apr_interval_time_t timeout)
+{
+    const proxy_tunnel_conn_t *tcs[2];
+    apr_time_t end = 0, now;
+    int i;
+
+    if (timeout < 0) {
+        return -1;
+    }
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        if (proxy_tunnel_paused(tcs[i])
+            || (tcs[i]->down_in && tcs[i]->other->held)) {
+            continue;
+        }
+        if (tcs[i]->active_at + timeout > end) {
+            end = tcs[i]->active_at + timeout;
+        }
+    }
+    if (!end) {
+        return -1;
+    }
+    now = apr_time_now();
+    return (end > now) ? end - now : 0;
+}
+
+/* A direction's hold starts: the idle clock of the other direction, if
+ * not paused too, restarts, so that it ends the tunnel only if quiet for
+ * the idle timeout during the hold
+ */
+static void proxy_tunnel_hold_started(proxy_tunnel_conn_t *tc)
+{
+    if (!tc->hold_both) {
+        tc->other->active_at = apr_time_now();
+    }
+}
+
+/* A direction's hold ends: the idle clocks of the directions it paused
+ * restart
+ */
+static void proxy_tunnel_hold_ended(proxy_tunnel_conn_t *tc)
+{
+    apr_time_t now = apr_time_now();
+
+    tc->active_at = now;
+    if (tc->hold_both) {
+        tc->other->active_at = now;
+    }
+}
+
 /* What proxy_transfer() does next for a direction: call its hooks again
  * (once) if its hold is over (1), read nothing if its input is paused by a
  * hold (-1), else read its input (0)
@@ -6210,14 +6279,23 @@ static int proxy_tunnel_input(proxy_tunnel_rec *tunnel, conn_rec *c_i)
     return (proxy_tunnel_paused(tc)) ? -1 : 0;
 }
 
-/* Give up a direction's hold not over: its wait canceled */
+/* Give up a direction's hold not over: its wait canceled, or its delegated
+ * hold withdrawn if its work didn't start (else the release finds it given
+ * up)
+ */
 static void proxy_tunnel_hold_cancel(proxy_tunnel_conn_t *tc)
 {
+    if (tc->held) {
+        proxy_tunnel_hold_ended(tc);
+    }
     if (tc->held && tc->hold_ctx) {
         (void)ap_request_wait_cancel(tc->hold_ctx);
     }
+    if (tc->held && tc->hold_delegated) {
+        (void)ap_request_hold_withdraw(&tc->holder);
+    }
     tc->hold_ctx = NULL;
-    tc->held = tc->hold_both = tc->hold_over = 0;
+    tc->held = tc->hold_both = tc->hold_over = tc->hold_delegated = 0;
 }
 
 /* Run the forward hooks of a direction: SUSPENDED once a hook holds it
@@ -6250,9 +6328,20 @@ static int proxy_tunnel_forward(proxy_tunnel_rec *tunnel,
             proxy_tunnel_hold_cancel(tc);
             return HTTP_INTERNAL_SERVER_ERROR;
         }
+        if (tc->hold_delegated
+            && ap_request_hold_withdraw(&tc->holder) == APR_SUCCESS) {
+            /* Nothing would release the hold */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "proxy: %s: tunnel forward hook held the %s's "
+                          "direction without starting the work its hold "
+                          "is delegated to", tunnel->scheme, tc->name);
+            proxy_tunnel_hold_cancel(tc);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
         ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                      "proxy: %s: %s's direction held by a forward hook%s",
+                      "proxy: %s: %s's direction held by a forward hook%s%s",
                       tunnel->scheme, tc->name,
+                      (tc->hold_delegated) ? " (delegated)" : "",
                       (tc->hold_both) ? " (both paused)" : "");
         return SUSPENDED;
     }
@@ -6582,6 +6671,7 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
                                  proxy_tunnel_conn_t *in)
 {
     proxy_tunnel_conn_t *out = in->other;
+    apr_off_t bytes_in = in->bytes_in, bytes_out = out->bytes_out;
     apr_status_t rv;
     int read_eagain = 0;
 
@@ -6598,6 +6688,10 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
                         &in->bytes_in, &out->bytes_out,
                         tunnel, &read_eagain);
     in->in_eagain = read_eagain;
+    if (in->bytes_in != bytes_in || out->bytes_out != bytes_out
+        || APR_STATUS_IS_EOF(rv)) {
+        in->active_at = apr_time_now(); /* the direction's activity */
+    }
     if (rv != APR_SUCCESS) {
         if (APR_STATUS_IS_INCOMPLETE(rv)) {
             /* Pause POLLIN while waiting for POLLOUT on the other
@@ -6654,12 +6748,15 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
 
 /* Process the events of one side of the tunnel: flush its pending output if
  * writable, transfer its input to the other side if readable (and possibly
- * shut either direction down), updating what each side waits for. Returns OK
- * to go on, or the tunnel's final status (DONE when it's over).
+ * shut either direction down), updating what each side waits for. Events
+ * polled at a time (polled, zero when only tried) are the activity of their
+ * directions then. Returns OK to go on, or the tunnel's final status (DONE
+ * when it's over).
  */
 static int proxy_tunnel_events(proxy_tunnel_rec *tunnel,
                                proxy_tunnel_conn_t *tc,
-                               apr_int16_t rtnevents)
+                               apr_int16_t rtnevents,
+                               apr_time_t polled)
 {
     request_rec *r = tunnel->r;
     apr_pollset_t *pollset = tunnel->pollset;
@@ -6691,6 +6788,9 @@ static int proxy_tunnel_events(proxy_tunnel_rec *tunnel,
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
                       "proxy: %s: %s output ready",
                       scheme, out->name);
+        if (polled) {
+            in->active_at = polled; /* the direction writing to out */
+        }
 
         rc = ap_check_output_pending(out->c);
         if (rc == AGAIN) {
@@ -6751,6 +6851,9 @@ static int proxy_tunnel_events(proxy_tunnel_rec *tunnel,
     if ((tc->pfd->reqevents & APR_POLLIN) && !proxy_tunnel_paused(tc)
             && ((rtnevents & (APR_POLLIN | APR_POLLHUP))
                 || !(rtnevents & APR_POLLOUT))) {
+        if (polled) {
+            tc->active_at = polled;
+        }
         rc = proxy_tunnel_transfer(tunnel, tc);
         if (rc != OK) {
             return rc;
@@ -6796,8 +6899,10 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
     proxy_tunnel_conn_t *client = tunnel->client,
                         *origin = tunnel->origin;
     apr_interval_time_t timeout = tunnel->timeout >= 0 ? tunnel->timeout : -1;
+    apr_interval_time_t wait;
     const char *scheme = tunnel->scheme;
     apr_status_t rv;
+    apr_time_t now;
 
     if (!tunnel->pollset && (rv = proxy_tunnel_pollset(tunnel))) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
@@ -6811,6 +6916,9 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
                   scheme, timeout >= 0 ? (double)timeout / APR_USEC_PER_SEC
                                        : (double)-1.0);
 
+    /* The directions' idle clocks start now */
+    client->active_at = origin->active_at = apr_time_now();
+
     /* Loop until both directions of the connection are closed,
      * or a failure occurs.
      */
@@ -6821,8 +6929,12 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
                       "proxy: %s: polling (client=%hx, origin=%hx)",
                       scheme, client->pfd->reqevents, origin->pfd->reqevents);
+        /* Until every direction is idle for the timeout (zero once that's
+         * reached: what's ready still counts)
+         */
+        wait = proxy_tunnel_idle_wait(tunnel, timeout);
         do {
-            rv = apr_pollset_poll(pollset, timeout, &nresults, &results);
+            rv = apr_pollset_poll(pollset, wait, &nresults, &results);
         } while (APR_STATUS_IS_EINTR(rv));
 
         if (rv != APR_SUCCESS) {
@@ -6844,6 +6956,7 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r, APLOGNO(10215)
                       "proxy: %s: woken up, %i result(s)", scheme, nresults);
+        now = apr_time_now();
 
         for (i = 0; i < nresults; i++) {
             const apr_pollfd_t *pfd = &results[i];
@@ -6862,7 +6975,7 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
                 goto done;
             }
 
-            rc = proxy_tunnel_events(tunnel, tc, pfd->rtnevents);
+            rc = proxy_tunnel_events(tunnel, tc, pfd->rtnevents, now);
             if (rc != OK) {
                 status = rc;
                 goto done;
@@ -6892,6 +7005,10 @@ PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
     tcs[0] = tunnel->client;
     tcs[1] = tunnel->origin;
     for (;;) {
+        /* What the caller polled is activity, what's tried counts if it
+         * moves data
+         */
+        apr_time_t polled = (ready) ? apr_time_now() : 0;
         int pending = 0;
 
         for (i = 0; i < 2; i++) {
@@ -6923,7 +7040,7 @@ PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
             ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
                           "proxy: %s: step: %s: %hx/%hx", tunnel->scheme,
                           tc->name, events, tc->pfd->reqevents);
-            status = proxy_tunnel_events(tunnel, tc, events);
+            status = proxy_tunnel_events(tunnel, tc, events, polled);
             if (status != OK) {
                 goto done;
             }
@@ -7006,6 +7123,8 @@ typedef struct proxy_tunnel_async {
     void *baton;
     ap_request_waitctx_t *waiting; /* a context of the tunnel's pending
                                      * wait, if any */
+    ap_request_waitctx_t *timer;   /* the delegated holds' deadline, made
+                                     * on first need */
 } proxy_tunnel_async_t;
 
 /* Give up the holds of the tunnel's directions, the tunnel ending or going
@@ -7035,6 +7154,10 @@ static void proxy_tunnel_async_release(proxy_tunnel_async_t *ta)
             ap_request_waitctx_release(ta->ctxs[i]);
             ta->ctxs[i] = NULL;
         }
+    }
+    if (ta->timer) {
+        ap_request_waitctx_release(ta->timer);
+        ta->timer = NULL;
     }
     ta->waiting = NULL;
 }
@@ -7112,24 +7235,24 @@ static apr_array_header_t *proxy_tunnel_async_ready(proxy_tunnel_async_t *ta)
 
 /* Wait for what the tunnel's sides need (their pfds' reqevents, but the
  * input of a held direction), with the core's waits on the client's and
- * the origin's contexts at once. While a direction is held the tunnel
- * isn't idle: no timeout then (the holds are bounded by their own waits).
- * Returns SUSPENDED with nothing to wait for if a hold's wait is pending.
+ * the origin's contexts at once, until the tunnel ends idle (idle, from
+ * proxy_tunnel_idle_wait(): the directions' own clocks, a held one's
+ * stopped, the holds bounded by their own waits). Returns SUSPENDED with
+ * nothing to wait for if a hold's wait is pending.
  */
-static int proxy_tunnel_async_wait(proxy_tunnel_async_t *ta)
+static int proxy_tunnel_async_wait(proxy_tunnel_async_t *ta,
+                                   apr_interval_time_t idle)
 {
     proxy_tunnel_rec *tunnel = ta->tunnel;
     proxy_tunnel_conn_t *tcs[2];
-    ap_request_waitctx_t *ctxs[2];
-    unsigned int directions[2];
-    apr_interval_time_t timeout;
+    ap_request_waitctx_t *ctxs[3];
+    unsigned int directions[3];
     int i, n = 0, held;
     int rc;
 
     tcs[0] = tunnel->client;
     tcs[1] = tunnel->origin;
     held = (tcs[0]->held || tcs[1]->held);
-    timeout = (ta->timeout >= 0 && !held) ? ta->timeout : -1;
     for (i = 0; i < 2; i++) {
         const apr_pollfd_t *pfd = tcs[i]->pfd;
         unsigned int d = 0;
@@ -7141,13 +7264,25 @@ static int proxy_tunnel_async_wait(proxy_tunnel_async_t *ta)
             d |= AP_WAIT_OUT;
         }
         if (d) {
-            /* The timeout is how long either side can stay idle */
-            ta->ctxs[i]->timeout = timeout;
+            /* The timeout is how long the tunnel can stay idle */
+            ta->ctxs[i]->timeout = idle;
             ta->ctxs[i]->delay = 0;
             ctxs[n] = ta->ctxs[i];
             directions[n] = d;
             n++;
         }
+    }
+    if (idle > 0 && !n && held) {
+        /* Nothing of the sides to wait for but the holds' waits, a
+         * direction still counting for the idle end: that end on a timer
+         */
+        if (!ta->timer) {
+            ta->timer = ap_request_waitctx_timer(tunnel->r, tunnel->r->pool);
+        }
+        ta->timer->timeout = idle;
+        ctxs[n] = ta->timer;
+        directions[n] = AP_WAIT_IN;
+        n++;
     }
     if (!n) {
         /* Nothing to wait for but the holds' waits, if any */
@@ -7175,6 +7310,15 @@ static int proxy_tunnel_async_fallback(proxy_tunnel_async_t *ta)
     tcs[1] = tunnel->origin;
     for (i = 0; i < 2; i++) {
         held[i] = tcs[i]->held;
+        if (held[i] && tcs[i]->hold_delegated) {
+            /* Its work can't be finished blocking */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, tunnel->r, APLOGNO()
+                          "proxy: %s: can't tunnel synchronously while the "
+                          "work of the %s's direction's delegated hold runs",
+                          tunnel->scheme, tcs[i]->name);
+            proxy_tunnel_async_detach(ta);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
     proxy_tunnel_async_detach(ta);
     for (i = 0; i < 2; i++) {
@@ -7199,6 +7343,7 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
 {
     proxy_tunnel_rec *tunnel = ta->tunnel;
     request_rec *r = tunnel->r;
+    apr_interval_time_t idle;
     int status;
 
     for (;;) {
@@ -7207,7 +7352,14 @@ static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
             return status;
         }
 
-        status = proxy_tunnel_async_wait(ta);
+        idle = proxy_tunnel_idle_wait(tunnel, ta->timeout);
+        if (idle == 0) {
+            /* Every direction not held idle for the timeout */
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "proxy: %s: tunnel idle (async)", tunnel->scheme);
+            return HTTP_GATEWAY_TIME_OUT;
+        }
+        status = proxy_tunnel_async_wait(ta, idle);
         if (status == SUSPENDED) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
                           "proxy: %s: tunnel: waiting (async)%s",
@@ -7277,6 +7429,7 @@ static void proxy_tunnel_hold_continuation(request_rec *r,
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, rv, r,
                   "proxy: %s: %s's direction hold over", tunnel->scheme,
                   tc->name);
+    proxy_tunnel_hold_ended(tc);
     tc->hold_status = rv;
     tc->hold_ctx = NULL;
     tc->held = tc->hold_both = 0;
@@ -7291,6 +7444,31 @@ static void proxy_tunnel_hold_continuation(request_rec *r,
     tc->hold_over = 1;
     (void)proxy_tunnel_transfer(tunnel, tc);
     proxy_tunnel_async_finish(ta, HTTP_INTERNAL_SERVER_ERROR);
+}
+
+/* The release of a direction's delegated hold: its work ended, the hook
+ * called again (its work's completion function recorded the outcome), or
+ * undone if the work ended at once (the hook goes on in its call). Nothing
+ * if the hold was given up meanwhile (the tunnel ended).
+ */
+static void proxy_tunnel_hold_release(ap_request_holder_t *holder,
+                                      ap_request_hold_end_e how)
+{
+    proxy_tunnel_conn_t *tc = holder->baton;
+
+    if (!tc->held || !tc->hold_delegated) {
+        return;
+    }
+    proxy_tunnel_hold_ended(tc);
+    tc->hold_status = APR_SUCCESS;
+    tc->held = tc->hold_both = tc->hold_delegated = 0;
+    if (how == AP_REQUEST_HOLD_UNDONE || !tc->ta) {
+        return;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, holder->r,
+                  "proxy: %s: %s's direction delegated hold over",
+                  tc->ta->tunnel->scheme, tc->name);
+    proxy_tunnel_async_resume(tc->ta, tc);
 }
 
 /* The continuation of the tunnel's waits: step the tunnel again until it's
@@ -7353,6 +7531,21 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
     ta->ctxs[0] = ap_request_waitctx_client(r);
     ta->ctxs[1] = ap_request_waitctx_conn(r, r->pool, tunnel->origin->c);
     tunnel->client->ta = tunnel->origin->ta = ta;
+    tunnel->client->holder.r = tunnel->origin->holder.r = r;
+    tunnel->client->holder.name = "the tunnel's client forward hook";
+    tunnel->origin->holder.name = "the tunnel's origin forward hook";
+    tunnel->client->holder.release = proxy_tunnel_hold_release;
+    tunnel->origin->holder.release = proxy_tunnel_hold_release;
+    tunnel->client->holder.baton = tunnel->client;
+    tunnel->origin->holder.baton = tunnel->origin;
+    /* The bound of a delegated hold's work having none: the tunnel's idle
+     * timeout, or the server's Timeout if the tunnel has none
+     */
+    tunnel->client->holder.timeout = (timeout > 0) ? timeout
+                                                   : r->server->timeout;
+    tunnel->origin->holder.timeout = tunnel->client->holder.timeout;
+    /* The directions' idle clocks start now */
+    tunnel->client->active_at = tunnel->origin->active_at = apr_time_now();
     status = proxy_tunnel_async_pump(ta, NULL);
     if (status != SUSPENDED) {
         /* Over already: nothing of the tunnel left pending */
@@ -7371,20 +7564,40 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
     request_rec *r = tunnel->r;
     proxy_tunnel_conn_t *tc = proxy_tunnel_side(tunnel, c_i);
     proxy_tunnel_async_t *ta;
+    apr_status_t rv;
     int rc;
 
-    if (!tc || !tc->forwarding || !ctx || ctx->r != r) {
+    if (!tc || !tc->forwarding) {
+        return APR_EINVAL;
+    }
+    if ((flags & AP_PROXY_TUNNEL_HOLD_DELEGATED)
+        ? ctx != NULL : (!ctx || ctx->r != r)) {
         return APR_EINVAL;
     }
     ta = tc->ta;
     if (!ta) {
         return APR_ENOTIMPL;
     }
-    if (ctx == ta->ctxs[0] || ctx == ta->ctxs[1]) {
+    if (ctx && (ctx == ta->ctxs[0] || ctx == ta->ctxs[1])) {
         return APR_EINVAL;
     }
     if (tc->held) {
         return APR_EBUSY;
+    }
+
+    if (!ctx) {
+        /* Released by the end of the work the hook starts next, bounded by
+         * its own timeout, or the holder's if it has none
+         */
+        rv = ap_request_hold_delegate(&tc->holder);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        tc->hold_status = APR_SUCCESS;
+        tc->held = tc->hold_delegated = 1;
+        tc->hold_both = !!(flags & AP_PROXY_TUNNEL_HOLD_BOTH);
+        proxy_tunnel_hold_started(tc);
+        return APR_SUCCESS;
     }
 
     /* Every hold is bounded: the tunnel's idle timeout (or the server's
@@ -7409,6 +7622,7 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
     tc->hold_status = APR_SUCCESS;
     tc->held = 1;
     tc->hold_both = !!(flags & AP_PROXY_TUNNEL_HOLD_BOTH);
+    proxy_tunnel_hold_started(tc);
     return APR_SUCCESS;
 }
 

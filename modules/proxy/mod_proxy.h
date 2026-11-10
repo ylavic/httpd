@@ -1835,7 +1835,8 @@ typedef void (ap_proxy_tunnel_done_fn)(proxy_tunnel_rec *tunnel, int status,
  * request is a subrequest, or the tunnel is for an HTTP/2 stream's
  * connection) the whole tunneling happens now, as with ap_proxy_tunnel_run().
  * @param tunnel   tunnel to run
- * @param timeout  the time either side can stay idle (negative for none)
+ * @param timeout  the time the tunnel can stay idle, i.e. both of its
+ *                 directions, each on its own clock (negative for none)
  * @param done     called once an asynchronous tunnel is over, or NULL to
  *                 run the tunnel synchronously
  * @param baton    for done
@@ -1895,6 +1896,10 @@ PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, tunnel_forward,
 
 /** Flag for ap_proxy_tunnel_hold(): pause the other direction too */
 #define AP_PROXY_TUNNEL_HOLD_BOTH (1u << 0)
+/** Flag for ap_proxy_tunnel_hold(): the hold is delegated to the
+ *  asynchronous work the hook starts next (ap_request_hold_delegate()),
+ *  released when that work ends */
+#define AP_PROXY_TUNNEL_HOLD_DELEGATED (1u << 1)
 
 /**
  * Hold a direction of an asynchronous tunnel (ap_proxy_tunnel_run_ex())
@@ -1911,26 +1916,37 @@ PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, tunnel_forward,
  *                   hook's c_i)
  * @param ctx        the context whose wait releases the hold, of the
  *                   tunnel's request (ap_request_waitctx_*()), not the
- *                   client's (the tunnel's own)
+ *                   client's (the tunnel's own); NULL with
+ *                   AP_PROXY_TUNNEL_HOLD_DELEGATED
  * @param direction  AP_WAIT_IN or AP_WAIT_OUT for a connection or a
  *                   descriptor, ignored by a timer or a notifier
- * @param flags      AP_PROXY_TUNNEL_HOLD_BOTH or 0
- * @return APR_SUCCESS: held, the hook returns SUSPENDED; APR_EAGAIN: ctx is
- *         ready already (not held, go on); APR_ENOTIMPL: the tunnel runs
- *         synchronously (no done callback, the request can't suspend, or
- *         the tunnel fell back to synchronous) or the wait is refused: the
- *         hook does its work blocking; APR_EBUSY: the direction is held
- *         already; APR_EINVAL: not from a tunnel_forward hook of c_i's
- *         direction, or a context of another request.
+ * @param flags      AP_PROXY_TUNNEL_HOLD_BOTH and/or
+ *                   AP_PROXY_TUNNEL_HOLD_DELEGATED, or 0
+ * @return APR_SUCCESS: held, the hook returns SUSPENDED (a delegated hold:
+ *         once its work suspended); APR_EAGAIN: ctx is ready already (not
+ *         held, go on); APR_ENOTIMPL: the tunnel runs synchronously (no
+ *         done callback, the request can't suspend, or the tunnel fell back
+ *         to synchronous) or the wait is refused: the hook does its work
+ *         blocking; APR_EBUSY: the direction is held already (or another
+ *         delegated hold awaits its work); APR_EINVAL: not from a
+ *         tunnel_forward hook of c_i's direction, a context of another
+ *         request, no context without AP_PROXY_TUNNEL_HOLD_DELEGATED or one
+ *         with it.
  * @remark The hold's outcome, when the hook is called again:
  *         ap_proxy_tunnel_hold_status().
  * @remark Every hold is bounded: a context giving no timeout (e.g. a
  *         notifier's) gets the tunnel's idle timeout (the server's Timeout
  *         if the tunnel has none) for the hold's wait, the hook called
  *         again with APR_TIMEUP when it's reached.
- * @remark While a direction is held its idle time doesn't count: the
- *         tunnel's idle timeout doesn't end the tunnel meanwhile, and runs
- *         again from the hold's end.
+ * @remark Each direction has its own idle clock: a held direction's (and
+ *         the other one's with AP_PROXY_TUNNEL_HOLD_BOTH) is stopped while
+ *         held, and restarts at the hold's end; the other direction's
+ *         restarts at the hold's start and runs as usual, so the tunnel
+ *         ends idle once the directions not held are idle for the idle
+ *         timeout (e.g. the other direction staying quiet for that long
+ *         during a long hold), never while both are held. A direction over
+ *         (its input's EOF read) doesn't end the tunnel idle while the
+ *         other one is held: the hold's bound applies then.
  * @remark The tunnel ending meanwhile (an error, a side closing with
  *         nohalfclose, its done callback called) cancels the hold's wait:
  *         the hook isn't called again, its context and what it holds are
@@ -1938,6 +1954,27 @@ PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, tunnel_forward,
  * @remark If the asynchronous tunnel falls back to synchronous meanwhile,
  *         the hook is called again with APR_ENOTIMPL (its hold's wait
  *         canceled): it finishes its work blocking.
+ * @remark A delegated hold (AP_PROXY_TUNNEL_HOLD_DELEGATED) has no wait of
+ *         its own: the hook starts the asynchronous work right after, in
+ *         the same call (e.g. ap_run_sub_req_async() for a service checking
+ *         what it holds); if that work suspends the hook returns SUSPENDED,
+ *         the work's own completion function records its outcome (it starts
+ *         no other work), then the hook is called again as above; if the
+ *         work ends at once the hold is undone and the hook goes on in its
+ *         call (e.g. with the subrequest's status). A hook returning
+ *         SUSPENDED without starting the work ends the tunnel (logged). The
+ *         other direction keeps flowing meanwhile, unless
+ *         AP_PROXY_TUNNEL_HOLD_BOTH.
+ * @remark A delegated hold is bounded by its work's own timeout (e.g.
+ *         ap_run_sub_req_async()'s), or if it has none by the tunnel's idle
+ *         timeout (the server's Timeout if the tunnel has none), which the
+ *         tunnel gives its holder (ap_request_holder_t's timeout): past it
+ *         the work ends as its timeout says (e.g. a subrequest's done
+ *         function gets HTTP_GATEWAY_TIME_OUT), then the hook is called
+ *         again as above, the tunnel going on.
+ * @remark Synchronous tunnels refuse delegated holds (APR_ENOTIMPL), and an
+ *         asynchronous tunnel can't fall back to synchronous while a
+ *         delegated hold's work runs: it ends then (logged).
  */
 PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
                                                  conn_rec *c_i,
