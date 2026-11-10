@@ -891,10 +891,12 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *         (ap_run_sub_req()). A filter returning without starting the work
  *         has its hold released (logged as an error). One delegated hold
  *         at a time per request (holds are refused while a subrequest is in
- *         progress), while the handlers run, mid-stream too: the producer backs
- *         off meanwhile (ap_filter_should_yield()) and its waits for the
- *         client's output complete when the hold is released, so it stays
- *         paused until then (one ordered stream).
+ *         progress), at every hold point: at the request's end (e.g. to run
+ *         the next subrequest when called again, or for ap_die()'s
+ *         response), and while the handlers run, mid-stream too: the
+ *         producer backs off meanwhile (ap_filter_should_yield()) and its
+ *         waits for the client's output complete when the hold is
+ *         released, so it stays paused until then (one ordered stream).
  * @remark A delegated hold's subrequest dropped before it completes (the
  *         request's end giving up the held output, its wait failing, or
  *         the connection closed) doesn't call its done function, and the

@@ -2348,10 +2348,6 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
     else if (async->subreqs) {
         why = "a subrequest of the request is in progress";
     }
-    else if ((flags & AP_FILTER_HOLD_DELEGATED)
-             && async->phase != AP_REQUEST_PHASE_HANDLER) {
-        why = "a delegated hold outside the handlers";
-    }
     if (why) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
                       "'%s' %sput filter can't hold: %s", f->frec->name,
