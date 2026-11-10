@@ -457,11 +457,12 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         request right after it delegated its hold to the subrequest
  *         (ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED: the
  *         filter returns APR_SUCCESS on SUSPENDED, the core releasing its
- *         hold after done). Not from a filter otherwise, which can't (for
- *         now this isn't detected, the subrequest's wait would be lost; a
- *         call while a wait of the main request's tree is pending is
- *         refused, logged, and runs blocking). One subrequest at a time per
- *         request.
+ *         hold after done). Not from a filter otherwise, which can't, nor
+ *         from the done function of a delegated hold's subrequest (the
+ *         filter runs the next one when called again): detected, logged as
+ *         an error, the subrequest runs blocking. A call while a wait of
+ *         the main request's tree is pending is refused, logged, and runs
+ *         blocking. One subrequest at a time per request.
  * @remark Don't destroy rsub (refused, logged), nor pass output for the main
  *         request, until done is called. The subrequest may run on other
  *         threads than the caller's, as continuations do.

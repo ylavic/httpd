@@ -2710,11 +2710,23 @@ static void async_subreq_end(request_rec *rsub, ap_request_async_t *async,
                              int status)
 {
     ap_filter_t *holder = async->holder; /* async is in rsub's pool */
+    conn_rec *c = rsub->connection;
     int *ended = async->top->ended;
+    int calls = 0;
 
     status = async_subreq_finish(rsub, async, status);
+    if (holder) {
+        /* The filter's code: it runs no subrequest (the filter does when
+         * called again)
+         */
+        calls = ap_filter_calls(c, -1);
+        ap_filter_calls(c, calls + 1);
+    }
     async->done(rsub, status, async->done_baton);
     /* don't dereference rsub from here! (done may destroy it) */
+    if (holder) {
+        ap_filter_calls(c, calls);
+    }
 
     if (holder && !(ended && *ended)) {
         /* The work of the filter's delegated hold ended: the hold is over,
@@ -2761,6 +2773,16 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE2, 0, rsub,
                       "subrequest run blocking: its main request can't "
                       "suspend");
+        return ap_run_sub_req(rsub);
+    }
+    if (!holder && ap_filter_calls(c, -1) > 0) {
+        /* From a filter (or a delegated hold's done function), which can't
+         * return SUSPENDED up: the subrequest would suspend under it
+         */
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, rsub,
+                      APLOGNO() "can't run the subrequest asynchronously "
+                      "from a filter without a delegated hold "
+                      "(AP_FILTER_HOLD_DELEGATED): running it blocking");
         return ap_run_sub_req(rsub);
     }
     main_async = request_async_get(r);
