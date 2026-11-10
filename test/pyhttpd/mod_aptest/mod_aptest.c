@@ -71,6 +71,41 @@
 #define APTEST_HAS_FSUBREQ 1
 #endif
 
+/* Tunnel forward hooks holding their direction (ap_proxy_tunnel_hold()),
+ * mod_proxy's functions (the hook's registration included) referenced
+ * weakly so that the module loads without mod_proxy (GCC-compatible
+ * compilers only)
+ */
+#if defined(APTEST_HAS_SUBREQ) && AP_MODULE_MAGIC_AT_LEAST(20260601, 21) \
+    && defined(__GNUC__)
+#include "mod_proxy.h"
+#pragma weak ap_proxy_tunnel_hold
+#pragma weak ap_proxy_tunnel_hold_status
+#pragma weak proxy_hook_tunnel_forward
+#define APTEST_HAS_THOLD 1
+#endif
+
+/* AptestTunnelHold (see "the tunnel forward hook holding its direction") */
+typedef struct {
+    unsigned int dirs;          /* APTEST_THOLD_IN and/or _OUT, 0 if unset */
+    int mode;                   /* APTEST_THOLD_* */
+    apr_interval_time_t time;   /* timer: the hold; socket: the delay */
+    apr_port_t port;            /* socket: the service's */
+    const char *uri;            /* subreq: the subrequest's */
+    int every;                  /* "every <n>": one chunk in n held */
+    int pause;                  /* "pause": both directions paused */
+    apr_interval_time_t timeout; /* "timeout <ms>": the context's (socket)
+                                  * or the subrequest's (subreq), else 0 */
+} aptest_thold_conf;
+
+#define APTEST_THOLD_IN  (1u << 0) /* client to origin */
+#define APTEST_THOLD_OUT (1u << 1) /* origin to client */
+
+#define APTEST_THOLD_TIMER  1 /* on a timer */
+#define APTEST_THOLD_NEVER  2 /* on a notifier never notified */
+#define APTEST_THOLD_SOCKET 3 /* on a service's socket answering */
+#define APTEST_THOLD_SUBREQ 4 /* delegated to a subrequest */
+
 /* AptestFilterSubreq (see "the filter running subrequests") */
 typedef struct {
     const char *uri;            /* NULL if unset */
@@ -118,6 +153,7 @@ typedef struct {
     apr_size_t hold_size;           /* "room": the pieces passed */
     int hold_proto;                 /* "proto": a protocol filter */
     aptest_fsubreq_conf fsubreq;    /* AptestFilterSubreq */
+    aptest_thold_conf thold;        /* AptestTunnelHold */
 } aptest_dir_conf;
 
 /* AptestHold's modes */
@@ -208,6 +244,7 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
         conf->hold_proto = base->hold_proto;
     }
     conf->fsubreq = (add->fsubreq.uri) ? add->fsubreq : base->fsubreq;
+    conf->thold = (add->thold.dirs) ? add->thold : base->thold;
     return conf;
 }
 
@@ -481,6 +518,79 @@ static const char *aptest_set_fsubreq(cmd_parms *cmd, void *dconf,
 }
 #endif /* APTEST_HAS_FSUBREQ */
 
+#ifdef APTEST_HAS_THOLD
+static const char *aptest_set_thold(cmd_parms *cmd, void *dconf,
+                                    int argc, char *const argv[])
+{
+    aptest_thold_conf *th = &((aptest_dir_conf *)dconf)->thold;
+    const char *usage = "AptestTunnelHold in|out|both timer <ms>|never|"
+                        "socket <port> <ms>|subreq <uri> [every <n>] "
+                        "[pause] [timeout <ms>]";
+    int i = 2;
+
+    if (argc < 2) {
+        return usage;
+    }
+    memset(th, 0, sizeof(*th));
+    if (strcmp(argv[0], "in") == 0) {
+        th->dirs = APTEST_THOLD_IN;
+    }
+    else if (strcmp(argv[0], "out") == 0) {
+        th->dirs = APTEST_THOLD_OUT;
+    }
+    else if (strcmp(argv[0], "both") == 0) {
+        th->dirs = APTEST_THOLD_IN | APTEST_THOLD_OUT;
+    }
+    else {
+        return usage;
+    }
+    if (strcmp(argv[1], "timer") == 0 && argc > 2 && apr_isdigit(*argv[2])) {
+        th->mode = APTEST_THOLD_TIMER;
+        th->time = apr_time_from_msec(apr_atoi64(argv[i++]));
+    }
+    else if (strcmp(argv[1], "never") == 0) {
+        th->mode = APTEST_THOLD_NEVER;
+    }
+    else if (strcmp(argv[1], "socket") == 0 && argc > 3
+             && apr_isdigit(*argv[2]) && apr_isdigit(*argv[3])) {
+        th->mode = APTEST_THOLD_SOCKET;
+        th->port = (apr_port_t)apr_atoi64(argv[i++]);
+        th->time = apr_time_from_msec(apr_atoi64(argv[i++]));
+    }
+    else if (strcmp(argv[1], "subreq") == 0 && argc > 2) {
+        th->mode = APTEST_THOLD_SUBREQ;
+        th->uri = argv[i++];
+    }
+    else {
+        th->dirs = 0;
+        return usage;
+    }
+    th->every = 1;
+    for (; i < argc; i++) {
+        if (strcmp(argv[i], "every") == 0 && i + 1 < argc
+            && apr_isdigit(*argv[i + 1])) {
+            th->every = (int)apr_atoi64(argv[++i]);
+            if (th->every < 1) {
+                th->every = 1;
+            }
+        }
+        else if (strcmp(argv[i], "pause") == 0) {
+            th->pause = 1;
+        }
+        else if (strcmp(argv[i], "timeout") == 0 && i + 1 < argc
+                 && apr_isdigit(*argv[i + 1])) {
+            th->timeout = apr_time_from_msec(apr_atoi64(argv[++i]));
+        }
+        else {
+            th->dirs = 0;
+            return apr_pstrcat(cmd->pool, "AptestTunnelHold: unknown "
+                               "option ", argv[i], NULL);
+        }
+    }
+    return NULL;
+}
+#endif /* APTEST_HAS_THOLD */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
@@ -514,6 +624,12 @@ static const command_rec aptest_cmds[] = {
                       "the filter running subrequests: <uri> <n> "
                       "captured|below [mid] [proto] [nohold|unpaired] "
                       "[timeout <ms>]"),
+#endif
+#ifdef APTEST_HAS_THOLD
+    AP_INIT_TAKE_ARGV("AptestTunnelHold", aptest_set_thold, NULL, OR_ALL,
+                      "the tunnel forward hook holding its direction: "
+                      "in|out|both timer <ms>|never|socket <port> <ms>|"
+                      "subreq <uri> [every <n>] [pause] [timeout <ms>]"),
 #endif
     {NULL}
 };
@@ -3265,6 +3381,323 @@ static void aptest_fsubreq_insert(request_rec *r)
 }
 #endif /* APTEST_HAS_FSUBREQ */
 
+#ifdef APTEST_HAS_THOLD
+/*
+ * The tunnel forward hook holding its direction ("AptestTunnelHold
+ * in|out|both timer <ms>|never|socket <port> <ms>|subreq <uri> [every <n>]
+ * [pause] [timeout <ms>]"), a tunnel_forward hook of mod_proxy acting on
+ * the tunnels of requests whose location configures it: for each brigade
+ * with data forwarded in a configured direction ("in": client to origin,
+ * "out": origin to client), one in n ("every"), it holds the direction
+ * (ap_proxy_tunnel_hold(), AP_PROXY_TUNNEL_HOLD_BOTH with "pause"), keeps
+ * the data and returns SUSPENDED, then forwards them unchanged when called
+ * again (an empty brigade) whatever the hold's outcome
+ * (ap_proxy_tunnel_hold_status()):
+ *  - "timer": on a timer context of <ms>;
+ *  - "never": on a notifier's context never notified, without a timeout
+ *    (the tunnel bounds the hold: APR_TIMEUP);
+ *  - "socket": on a service's socket (127.0.0.1:<port>, connected once per
+ *    direction), sent "<ms>\n" and answering a line after that delay,
+ *    with the context's timeout "timeout <ms>" if given (the tunnel's idle
+ *    timeout otherwise); a timed out answer drops the socket (a new one for
+ *    the next hold);
+ *  - "subreq": delegated (AP_PROXY_TUNNEL_HOLD_DELEGATED) to a subrequest
+ *    of <uri> run by ap_run_sub_req_async(), its output captured, its
+ *    timeout "timeout <ms>" if given.
+ * A hold refused (a synchronous tunnel) does the same work blocking: the
+ * same bytes in every mode. What it did is logged at the request's end
+ * (aptest:info) with its URI, per direction: chunks seen, holds,
+ * subrequests suspended and ended at once, holds refused, ready already,
+ * timeouts, synchronous re-calls (APR_ENOTIMPL), the subrequests' statuses.
+ */
+typedef struct {
+    request_rec *r;
+    const aptest_thold_conf *conf;
+    const char *name;
+    apr_bucket_brigade *held;       /* what it holds, made once */
+    ap_request_waitctx_t *ctx;     /* timer, notifier, socket: made once
+                                     * (per socket) */
+    ap_mpm_notifier_t *notifier;    /* never */
+    apr_socket_t *sock;             /* socket */
+    aptest_subreq_t cap;            /* subreq: the capture, statuses */
+    int chunks, holds, nasync, ninline, refused, ready, timeups, enotimpl;
+    unsigned int holding :1;
+} aptest_thold_dir_t;
+
+typedef struct {
+    aptest_thold_dir_t dir[2];      /* in, out */
+} aptest_thold_t;
+
+static apr_status_t aptest_thold_report(void *data)
+{
+    aptest_thold_t *t = data;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        aptest_thold_dir_t *d = &t->dir[i];
+        if (!(d->conf->dirs & (1u << i))) {
+            continue;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, d->r, APLOGNO()
+                      "aptest-thold: %s %s: chunks=%d holds=%d async=%d "
+                      "inline=%d refused=%d ready=%d timeups=%d enotimpl=%d "
+                      "statuses=%s", d->r->uri, d->name, d->chunks, d->holds,
+                      d->nasync,
+                      d->ninline, d->refused, d->ready, d->timeups,
+                      d->enotimpl, d->cap.statuses);
+    }
+    return APR_SUCCESS;
+}
+
+static aptest_thold_t *aptest_thold_get(request_rec *r,
+                                        const aptest_dir_conf *conf)
+{
+    aptest_thold_t *t = ap_get_module_config(r->request_config,
+                                             &aptest_module);
+    int i;
+
+    if (!t) {
+        t = apr_pcalloc(r->pool, sizeof(*t));
+        for (i = 0; i < 2; i++) {
+            aptest_thold_dir_t *d = &t->dir[i];
+            d->r = r;
+            d->conf = &conf->thold;
+            d->name = (i == 0) ? "in" : "out";
+            d->held = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+            d->cap.r = r;
+            d->cap.conf = conf;
+            apr_md5_init(&d->cap.md5);
+        }
+        ap_set_module_config(r->request_config, &aptest_module, t);
+        apr_pool_cleanup_register(r->pool, t, aptest_thold_report,
+                                  apr_pool_cleanup_null);
+    }
+    return t;
+}
+
+static void aptest_thold_done(request_rec *rsub, int status, void *baton)
+{
+    aptest_thold_dir_t *d = baton;
+
+    /* Recorded for the hook, called again once the hold is released */
+    aptest_subreq_record(&d->cap, rsub, status);
+}
+
+/* The service's socket of a direction (connected on first need), with its
+ * context
+ */
+static apr_status_t aptest_thold_socket(aptest_thold_dir_t *d)
+{
+    request_rec *r = d->r;
+    apr_sockaddr_t *sa;
+    apr_pollfd_t pfd;
+    apr_status_t rv;
+
+    if (d->sock) {
+        return APR_SUCCESS;
+    }
+    rv = apr_sockaddr_info_get(&sa, "127.0.0.1", APR_INET, d->conf->port, 0,
+                               r->pool);
+    if (rv == APR_SUCCESS) {
+        rv = apr_socket_create(&d->sock, APR_INET, SOCK_STREAM,
+                               APR_PROTO_TCP, r->pool);
+    }
+    if (rv == APR_SUCCESS) {
+        rv = apr_socket_connect(d->sock, sa);
+    }
+    if (rv != APR_SUCCESS) {
+        d->sock = NULL;
+        return rv;
+    }
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = d->sock;
+    d->ctx = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    return APR_SUCCESS;
+}
+
+/* Read the service's answer (after the hold, or blocking) */
+static void aptest_thold_answer(aptest_thold_dir_t *d)
+{
+    char buf[64];
+    apr_size_t len = sizeof(buf);
+
+    if (d->sock) {
+        (void)apr_socket_recv(d->sock, buf, &len);
+    }
+}
+
+/* Drop the service's socket (its answer late) */
+static void aptest_thold_drop_socket(aptest_thold_dir_t *d)
+{
+    if (d->sock) {
+        ap_request_waitctx_release(d->ctx);
+        apr_socket_close(d->sock);
+        d->sock = NULL;
+        d->ctx = NULL;
+    }
+}
+
+static int aptest_thold_forward(proxy_tunnel_rec *tunnel,
+                                conn_rec *c_i, conn_rec *c_o,
+                                apr_bucket_brigade *bb)
+{
+    request_rec *r = tunnel->r;
+    const aptest_dir_conf *conf = ap_get_module_config(r->per_dir_config,
+                                                       &aptest_module);
+    unsigned int flags;
+    aptest_thold_dir_t *d;
+    request_rec *rsub;
+    apr_bucket *e;
+    apr_status_t rv = APR_SUCCESS;
+    int i, rc;
+
+    i = (c_i == r->connection) ? 0 : 1;
+    if (!(conf->thold.dirs & (1u << i))) {
+        return OK;
+    }
+    d = &aptest_thold_get(r, conf)->dir[i];
+    if (d->holding) {
+        /* Called again once the hold is over: forward what it held */
+        d->holding = 0;
+        rv = ap_proxy_tunnel_hold_status(tunnel, c_i);
+        if (APR_STATUS_IS_TIMEUP(rv)) {
+            d->timeups++;
+            if (d->conf->mode == APTEST_THOLD_SOCKET) {
+                aptest_thold_drop_socket(d);
+            }
+        }
+        else if (APR_STATUS_IS_ENOTIMPL(rv)) {
+            /* Synchronous from now on: the work finished blocking */
+            d->enotimpl++;
+            if (d->conf->mode == APTEST_THOLD_SOCKET) {
+                aptest_thold_answer(d);
+            }
+        }
+        else if (d->conf->mode == APTEST_THOLD_SOCKET) {
+            aptest_thold_answer(d);
+        }
+        APR_BRIGADE_PREPEND(bb, d->held);
+        return OK;
+    }
+    if (APR_BRIGADE_EMPTY(bb) || (d->chunks++ % d->conf->every) != 0) {
+        return OK;
+    }
+
+    flags = (d->conf->pause) ? AP_PROXY_TUNNEL_HOLD_BOTH : 0;
+    switch (d->conf->mode) {
+    case APTEST_THOLD_TIMER:
+        if (!d->ctx) {
+            d->ctx = ap_request_waitctx_timer(r, r->pool);
+        }
+        d->ctx->timeout = d->conf->time;
+        rv = ap_proxy_tunnel_hold(tunnel, c_i, d->ctx, AP_WAIT_IN, flags);
+        break;
+    case APTEST_THOLD_NEVER:
+        if (!d->ctx) {
+            rv = ap_mpm_notifier_create(&d->notifier, r->connection, r->pool);
+            if (rv != APR_SUCCESS) {
+                break;
+            }
+            d->ctx = ap_request_waitctx_notifier(r, r->pool, d->notifier);
+        }
+        else {
+            (void)ap_mpm_notifier_rearm(d->notifier);
+        }
+        d->ctx->timeout = -1; /* none: the tunnel bounds the hold */
+        rv = ap_proxy_tunnel_hold(tunnel, c_i, d->ctx, AP_WAIT_IN, flags);
+        break;
+    case APTEST_THOLD_SOCKET: {
+        char line[32];
+        apr_size_t len;
+
+        rv = aptest_thold_socket(d);
+        if (rv != APR_SUCCESS) {
+            break;
+        }
+        len = apr_snprintf(line, sizeof(line), "%" APR_TIME_T_FMT "\n",
+                           apr_time_as_msec(d->conf->time));
+        rv = apr_socket_send(d->sock, line, &len);
+        if (rv != APR_SUCCESS) {
+            aptest_thold_drop_socket(d);
+            break;
+        }
+        d->ctx->timeout = (d->conf->timeout) ? d->conf->timeout : -1;
+        rv = ap_proxy_tunnel_hold(tunnel, c_i, d->ctx, AP_WAIT_IN, flags);
+        break;
+    }
+    case APTEST_THOLD_SUBREQ:
+        rv = ap_proxy_tunnel_hold(tunnel, c_i, NULL, 0,
+                                  flags | AP_PROXY_TUNNEL_HOLD_DELEGATED);
+        if (rv != APR_SUCCESS) {
+            break;
+        }
+        d->cap.i++;
+        rsub = ap_sub_req_lookup_uri(d->conf->uri, r, NULL);
+        ap_add_output_filter_handle(aptest_capture_handle, &d->cap, rsub,
+                                    rsub->connection);
+        rc = ap_run_sub_req_async(rsub, d->conf->timeout, aptest_thold_done,
+                                  d);
+        if (rc != SUSPENDED) {
+            /* Ended at once: the hold is undone, forward now */
+            d->ninline++;
+            aptest_subreq_record(&d->cap, rsub, rc);
+            return OK;
+        }
+        d->nasync++;
+        break;
+    }
+
+    if (rv == APR_SUCCESS) {
+        /* Held: keep the data (copied, nothing in r's pool per hold) */
+        for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+             e = APR_BUCKET_NEXT(e)) {
+            const char *data;
+            apr_size_t len;
+
+            if (APR_BUCKET_IS_METADATA(e)) {
+                continue;
+            }
+            if (apr_bucket_read(e, &data, &len, APR_BLOCK_READ)
+                    != APR_SUCCESS) {
+                return HTTP_INTERNAL_SERVER_ERROR;
+            }
+            apr_brigade_write(d->held, NULL, NULL, data, len);
+        }
+        apr_brigade_cleanup(bb);
+        d->holds++;
+        d->holding = 1;
+        return SUSPENDED;
+    }
+    if (APR_STATUS_IS_EAGAIN(rv)) {
+        d->ready++;
+        if (d->conf->mode == APTEST_THOLD_SOCKET) {
+            aptest_thold_answer(d);
+        }
+        return OK;
+    }
+
+    /* Refused: the same work blocking */
+    d->refused++;
+    switch (d->conf->mode) {
+    case APTEST_THOLD_TIMER:
+        apr_sleep(d->conf->time);
+        break;
+    case APTEST_THOLD_SOCKET:
+        aptest_thold_answer(d);
+        break;
+    case APTEST_THOLD_SUBREQ:
+        d->cap.i++;
+        rsub = ap_sub_req_lookup_uri(d->conf->uri, r, NULL);
+        ap_add_output_filter_handle(aptest_capture_handle, &d->cap, rsub,
+                                    rsub->connection);
+        aptest_subreq_record(&d->cap, rsub, ap_run_sub_req(rsub));
+        break;
+    }
+    return OK;
+}
+#endif /* APTEST_HAS_THOLD */
+
 /* Install this module into the apache2 infrastructure.
  */
 static void aptest_hooks(apr_pool_t *pool)
@@ -3326,6 +3759,12 @@ static void aptest_hooks(apr_pool_t *pool)
                                                             aptest_fsubreq_filter,
                                                             NULL,
                                                             AP_FTYPE_PROTOCOL);
+#endif
+#ifdef APTEST_HAS_THOLD
+    if (proxy_hook_tunnel_forward) {
+        proxy_hook_tunnel_forward(aptest_thold_forward, NULL, NULL,
+                                  APR_HOOK_MIDDLE);
+    }
 #endif
 
 }
