@@ -439,6 +439,10 @@ typedef struct ap_request_async_t {
     unsigned int suspended :1;
     /** A subrequest's deadline (ap_run_sub_req_async()) was reached */
     unsigned int deadline_reached :1;
+    /** The subrequests of the tree in progress (ap_run_sub_req(), or
+     *  ap_run_sub_req_async() until done), whose output may go through the
+     *  main request's filters; the top-level request's */
+    int subreqs;
     /** For a subrequest run by ap_run_sub_req_async(): its done function
      * (ap_sub_req_done_fn) and baton, its deadline (zero for none), and the
      * module whose log level its log lines follow */

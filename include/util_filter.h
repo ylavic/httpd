@@ -748,6 +748,15 @@ AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
 AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
 
 /**
+ * The wait of a request filter holding its output on a context
+ * (ap_filter_pending_wait()) completed, core's own: the output walk calls
+ * the filter again.
+ * @param f The filter
+ * @param status The wait's status, as given to a continuation
+ */
+AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
+
+/**
  * The core input_pending hook.
  */
 AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c);

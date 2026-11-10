@@ -791,6 +791,96 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *ctx);
  */
 AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ctx);
 
+/**
+ * Hold the output of a request in one of its output filters until the wait
+ * of a context completes, or until the filters after it have room: the
+ * filter returns to its caller as if it had passed what it holds (with
+ * APR_SUCCESS), and the core calls it again later to pass it. For a filter
+ * with work to do before passing on (e.g. waiting for a backend of its own,
+ * or for another thread that notifies), or one passing a large output in
+ * pieces without blocking on the client.
+ * @param f The filter: a request filter (f->r) of a top-level request
+ * @param bb What the filter holds of the brigade it was passed, set aside
+ *        in r's pool and given back to it (prepended) when called again,
+ *        or NULL (a filter keeping what it holds itself)
+ * @param ctx The context whose wait releases the hold (ap_request_wait()
+ *        on it with direction and flags, made by the core), or NULL to be
+ *        called again once the filters after f have room
+ *        (ap_filter_should_yield(f->next) false)
+ * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection or a
+ *        descriptor, ignored by a timer or a notifier
+ * @param flags AP_REQUEST_WAIT_DRAINED or 0
+ * @return APR_SUCCESS: held, the filter returns APR_SUCCESS (it may pass
+ *         nothing meanwhile); APR_ENOTIMPL: the output can't be held now
+ *         (logged at debug: a connection filter, a subrequest's, one below
+ *         AsyncFilter, a request that can't suspend, outside the handlers,
+ *         a subrequest of the request in progress, or the MPM refusing the
+ *         wait): the filter does its work now, blocking as without this
+ *         function; APR_EAGAIN: no context and nothing pending after f
+ *         (go on passing); APR_EBUSY: f holds already.
+ * @remark Who calls the filter again, and when: the core's output walk
+ *         (ap_check_output_pending()), once its wait completed (with an
+ *         empty brigade, what it held prepended) or the filters after it
+ *         have room (with a WC bucket), from the thread processing its
+ *         request: the producer's next check of the output (it backs off
+ *         meanwhile, ap_filter_should_yield() being true, and its waits for
+ *         the client's output complete when the hold's does), or the
+ *         continuation of the hold's wait, or the request's end. The
+ *         filter passes on, or holds again.
+ * @remark Its outcome: ap_request_waitctx_ready(ctx) when called again (0
+ *         after a timeout or an error), c->aborted when the connection is
+ *         gone. After a failed wait (a timeout, the MPM failing or
+ *         stopping) the filter is called once: if it holds again, its hold
+ *         is dropped (with what it held) and the connection is closed after
+ *         the response.
+ * @remark Every hold is bounded: a context giving no timeout (e.g. a
+ *         notifier's) gets the server's Timeout for the hold's wait.
+ * @remark FLUSH keeps its meaning: a filter passed a FLUSH bucket does its
+ *         work and passes on blocking, without holding.
+ * @remark A held filter passed more data (by a producer not backing off)
+ *         keeps it behind what it holds, its own buffer: the core doesn't
+ *         bound it.
+ * @remark Don't release or destroy ctx while the hold is pending; removing
+ *         the filter cancels its hold (and drops what it held).
+ */
+AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
+                                                apr_bucket_brigade *bb,
+                                                ap_request_waitctx_t *ctx,
+                                                unsigned int direction,
+                                                unsigned int flags);
+
+/**
+ * Hold the output of a request in one of its output filters until a
+ * notifier is notified (ap_mpm_notify()), or until the filters after it
+ * have room: ap_filter_pending_wait() with the notifier's context
+ * (ap_request_waitctx_notifier(), made by the core and reused while the
+ * same notifier is given, re-armed between the waits).
+ * @param f The filter
+ * @param bb What the filter holds, or NULL
+ * @param notifier The notifier, or NULL for room
+ * @return As ap_filter_pending_wait()
+ */
+AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
+                                                  apr_bucket_brigade *bb,
+                                                  struct ap_mpm_notifier_t *notifier);
+
+/**
+ * Whether a request filter can hold its output now, and if so, with ctx
+ * not NULL, make the hold's wait (ap_request_wait() on ctx), whose
+ * continuation releases the hold (ap_filter_hold_done()), core's own (for
+ * ap_filter_pending_wait()).
+ * @param f The filter
+ * @param ctx The context, or NULL to check only
+ * @param direction As ap_request_wait()
+ * @param flags As ap_request_wait()
+ * @return SUSPENDED if the wait is pending, OK if ready already or just
+ *         checked, DECLINED if the filter can't hold (logged at debug)
+ */
+AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
+                                            ap_request_waitctx_t *ctx,
+                                            unsigned int direction,
+                                            unsigned int flags);
+
 /** Flag for ap_request_read_body(): set the buckets read aside in the
  *  request's pool (they may be transient otherwise) */
 #define AP_REQUEST_BODY_SETASIDE (1u << 0)

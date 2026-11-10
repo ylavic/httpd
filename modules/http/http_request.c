@@ -1991,6 +1991,9 @@ static void request_waitreg_deadline(ap_request_async_t *async,
     }
 }
 
+/* request_wait() internal flags */
+#define REQUEST_WAIT_BOUNDED (1u << 0) /* no timeout: the server's Timeout */
+
 /* Wait for the targets of nctxs contexts, the first ready completing the
  * wait (ap_request_wait(), ap_request_wait_any() if any): a pending wait
  * of the tree, given to the MPM with the others at the end of the run.
@@ -1999,7 +2002,7 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
                         const unsigned int *directions,
                         unsigned int flags,
                         ap_request_continuation_fn *fn, void *baton,
-                        int any)
+                        int any, unsigned int internal)
 {
     request_rec *r = ctxs[0]->r;
     ap_request_async_t *async;
@@ -2031,6 +2034,14 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     if (rc != AGAIN) {
         request_waitreg_put(w, g);
         return rc;
+    }
+    if ((internal & REQUEST_WAIT_BOUNDED) && g->timeout < 0) {
+        /* A filter's hold gets the server's Timeout if its context gives
+         * none (a notifier's)
+         */
+        g->timeout = r->server->timeout;
+        g->timer_expires = 0;
+        g->due_expires = 0;
     }
     request_waitreg_deadline(async, g, &plan);
 
@@ -2092,7 +2103,7 @@ AP_DECLARE(int) ap_request_wait(ap_request_waitctx_t *pub,
                         || directions == AP_WAIT_OUT);
         return DECLINED;
     }
-    return request_wait(&pub, 1, &directions, flags, fn, baton, 0);
+    return request_wait(&pub, 1, &directions, flags, fn, baton, 0, 0);
 }
 
 AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
@@ -2109,7 +2120,7 @@ AP_DECLARE(int) ap_request_wait_any(ap_request_waitctx_t *const *ctxs,
         AP_DEBUG_ASSERT(nctxs > 0);
         return DECLINED;
     }
-    return request_wait(ctxs, nctxs, directions, flags, fn, baton, 1);
+    return request_wait(ctxs, nctxs, directions, flags, fn, baton, 1, 0);
 }
 
 AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
@@ -2128,6 +2139,114 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
     request_waitreg_finish(g, REQUEST_WAITREG_CANCELED, AP_MPM_WAIT_READY);
     request_waitreg_put(w, g);
     return APR_SUCCESS;
+}
+
+/* Complete the pending waits of a tree for c's output held by a request
+ * filter (REQUEST_WAIT_HELD_OUT), as ready: that hold is over. Their
+ * continuations are called next, from the continuation run in progress.
+ * Returns how many.
+ */
+static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c)
+{
+    request_waitreg_t *g;
+    int i, n = 0;
+
+    for (g = w->waits; g; g = g->next) {
+        if (g->completed) {
+            continue;
+        }
+        for (i = 0; i < g->nctxs; i++) {
+            request_waitctx_t *ctx = g->ctxs[i];
+            if (ctx && ctx->c == c
+                && (g->held[i] & REQUEST_WAIT_HELD_OUT)) {
+                ctx->ready |= AP_WAIT_OUT;
+                g->status = APR_SUCCESS;
+                g->completed = 1;
+            }
+        }
+        n += g->completed;
+    }
+    return n;
+}
+
+/* The continuation of a request filter's hold (ap_filter_pending_wait()):
+ * the hold is over, the filter is called again by the next output walk:
+ * the waits for the output it held complete (their continuations check the
+ * output, which calls it), else the walk runs now.
+ */
+static void request_filter_hold_continuation(request_rec *r,
+                                             apr_status_t status,
+                                             void *baton)
+{
+    ap_filter_t *f = baton;
+    conn_rec *c = r->connection;
+    ap_request_async_t *async = request_async_get(r);
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, status, r,
+                  "the hold of '%s' output filter is over", f->frec->name);
+    ap_filter_hold_done(f, status);
+    if (!async || !request_waitset_held_done(async->top->waitset, c)) {
+        (void)ap_check_output_pending(c);
+    }
+}
+
+AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
+                                            ap_request_waitctx_t *ctx,
+                                            unsigned int direction,
+                                            unsigned int flags)
+{
+    request_rec *r = f->r;
+    conn_rec *c = f->c;
+    ap_request_async_t *async = (r) ? request_async_get(r) : NULL;
+    core_dir_config *d;
+    const char *why = NULL;
+    int rc;
+
+    if (!r || f->frec->ftype >= AP_FTYPE_CONNECTION) {
+        why = "a connection filter";
+    }
+    else if (r->main) {
+        why = "a subrequest's filter";
+    }
+    else if (f->frec->ftype < c->async_filter) {
+        why = "below AsyncFilter";
+    }
+    else if (!request_can_wait || r->prev || c->master || !async) {
+        why = "the request can't suspend";
+    }
+    else if ((d = ap_get_core_module_config(r->per_dir_config),
+              d->async_requests == AP_CORE_CONFIG_OFF)) {
+        why = "AsyncRequests off";
+    }
+    else if (async->phase != AP_REQUEST_PHASE_HANDLER) {
+        why = "not at a hold point (the handlers)";
+    }
+    else if (async->subreqs) {
+        why = "a subrequest of the request is in progress";
+    }
+    if (why) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
+                      "'%s' output filter can't hold its output: %s",
+                      f->frec->name, why);
+        return DECLINED;
+    }
+    if (!ctx) {
+        return OK;
+    }
+
+    if (REQUEST_WAITCTX_HAS_PFD((request_waitctx_t *)ctx)
+        && direction != AP_WAIT_IN && direction != AP_WAIT_OUT) {
+        return DECLINED;
+    }
+    rc = request_wait(&ctx, 1, &direction, flags,
+                      request_filter_hold_continuation, f, 0,
+                      REQUEST_WAIT_BOUNDED);
+    if (rc == DECLINED) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
+                      "'%s' output filter can't hold its output: its wait "
+                      "is refused", f->frec->name);
+    }
+    return rc;
 }
 
 /* Whether some waits of the tree of a request are pending */
@@ -2243,6 +2362,7 @@ static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
 
     async->phase = AP_REQUEST_PHASE_DONE;
     async->suspended = 0;
+    async->top->subreqs--;
     if (status == DONE) {
         status = OK;
     }
@@ -2341,6 +2461,7 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
         async->deadline = apr_time_now() + timeout;
     }
     req_cfg->async = async;
+    async->top->subreqs++; /* until async_subreq_finish() */
 
     /* As ap_run_sub_req() */
     status = DECLINED;

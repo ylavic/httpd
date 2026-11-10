@@ -88,6 +88,11 @@ struct ap_filter_private {
     /* FILTER_PENDING_HELD: the status of the hold's wait, once completed */
     apr_status_t held_status;
     unsigned int held_done :1;
+    /* ap_filter_pending_notify(): the notifier's context, reused for the
+     * same notifier
+     */
+    struct ap_mpm_notifier_t *notifier;
+    ap_request_waitctx_t *notifier_ctx;
 };
 APR_RING_HEAD(pending_ring, ap_filter_private);
 
@@ -639,6 +644,21 @@ static APR_INLINE int is_pending_filter(ap_filter_t *f)
     return APR_RING_NEXT(fp, pending) != fp;
 }
 
+/* A request filter is linked in its connection's pending ring only while
+ * it holds something (a reason, or data): the ring would otherwise keep it
+ * until its request's end, which may come in the middle of a walk (the EOR
+ * set aside by a connection filter, destroyed by a later walk's write)
+ * after the walk has saved it as the next filter to visit.
+ */
+static void pending_filter_unlink_request(struct ap_filter_private *fp)
+{
+    if (fp->f->r && !fp->why && (!fp->bb || APR_BRIGADE_EMPTY(fp->bb))
+        && APR_RING_NEXT(fp, pending) != fp) {
+        APR_RING_REMOVE(fp, pending);
+        APR_RING_ELEM_INIT(fp, pending);
+    }
+}
+
 static apr_status_t pending_filter_cleanup(void *arg)
 {
     ap_filter_t *f = arg;
@@ -656,6 +676,8 @@ static apr_status_t pending_filter_cleanup(void *arg)
     fp->held = NULL;
     fp->held_status = APR_SUCCESS;
     fp->held_done = 0;
+    fp->notifier = NULL;
+    fp->notifier_ctx = NULL;
 
     if (fp->bb) {
         ap_release_brigade(f->c, fp->bb);
@@ -670,7 +692,14 @@ static void remove_any_filter(ap_filter_t *f, ap_filter_t **r_filt, ap_filter_t 
 {
     ap_filter_t **curr = r_filt ? r_filt : c_filt;
     ap_filter_t *fscan = *curr;
+    struct ap_filter_private *fp = f->priv;
 
+    /* A filter removed while its hold's wait is pending: the wait goes, its
+     * continuation would call the filter
+     */
+    if ((fp->why & FILTER_PENDING_HELD) && !fp->held_done && fp->ctx) {
+        (void)ap_request_wait_cancel(fp->ctx);
+    }
     pending_filter_cleanup(f);
 
     if (p_filt && *p_filt == f)
@@ -1323,8 +1352,10 @@ AP_DECLARE(int) ap_filter_should_yield(ap_filter_t *f)
 
 /* Whether the core may call a request filter holding its output, from the
  * output walk: only from a run of its top-level request (the request in
- * progress, not e.g. a walk run for a subrequest of its tree). Otherwise the
- * filter stays pending, a wait target only.
+ * progress, not e.g. a walk run for a subrequest of its tree) with no
+ * subrequest in progress (the filter wouldn't expect a call while another
+ * request of its tree runs). Otherwise the filter stays pending, a wait
+ * target only, until the next walk.
  */
 static int pending_filter_callable(ap_filter_t *f)
 {
@@ -1337,7 +1368,7 @@ static int pending_filter_callable(ap_filter_t *f)
     req_cfg = ap_get_core_module_config(f->r->request_config);
     async = (req_cfg) ? req_cfg->async : NULL;
     return (async && async->r == f->r && async->top == async
-            && async->running);
+            && async->running && !async->subreqs);
 }
 
 /* Record what the output walk stopped on, the lowest pending filter from f
@@ -1377,11 +1408,14 @@ static apr_status_t pending_filter_call(ap_filter_t *f,
 {
     struct ap_filter_private *fp = f->priv;
     int was_held = !!(fp->why & FILTER_PENDING_HELD);
+    int failed = (was_held && fp->held_status != APR_SUCCESS);
+    apr_status_t rv;
 
     fp->why = 0;
     fp->due = 0;
     fp->ctx = NULL;
     fp->held_done = 0;
+    fp->held_status = APR_SUCCESS;
     if (fp->held) {
         APR_BRIGADE_CONCAT(bb, fp->held);
     }
@@ -1389,9 +1423,33 @@ static apr_status_t pending_filter_call(ap_filter_t *f,
         APR_BRIGADE_INSERT_TAIL(bb, ap_bucket_wc_create(bb->bucket_alloc));
     }
     ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
-                  "calling '%s' output filter, its output %s",
-                  f->frec->name, (was_held) ? "held" : "paced or for room");
-    return ap_pass_brigade(f, bb);
+                  "calling '%s' output filter, its output %s%s",
+                  f->frec->name, (was_held) ? "held" : "paced or for room",
+                  (failed) ? " (its wait failed)" : "");
+    rv = ap_pass_brigade(f, bb);
+
+    /* Called once after a failed wait: a filter holding again is given up
+     * (with what it holds), the hold check never loops, and the connection
+     * closes after the response, which may lack it
+     */
+    if (failed && fp->why) {
+        ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, f->c, APLOGNO()
+                      "'%s' output filter holds again after its hold's wait "
+                      "failed: dropping what it holds", f->frec->name);
+        if ((fp->why & FILTER_PENDING_HELD) && !fp->held_done && fp->ctx) {
+            (void)ap_request_wait_cancel(fp->ctx);
+        }
+        if (fp->held) {
+            apr_brigade_cleanup(fp->held);
+        }
+        fp->why = 0;
+        fp->due = 0;
+        fp->ctx = NULL;
+        fp->held_done = 0;
+        f->c->keepalive = AP_CONN_CLOSE;
+    }
+    pending_filter_unlink_request(fp);
+    return rv;
 }
 
 AP_DECLARE_NONSTD(int) ap_core_output_pending(conn_rec *c)
@@ -1528,6 +1586,102 @@ AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
     }
 }
 
+AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
+                                                apr_bucket_brigade *bb,
+                                                ap_request_waitctx_t *ctx,
+                                                unsigned int direction,
+                                                unsigned int flags)
+{
+    struct ap_filter_private *fp = f->priv;
+    apr_status_t rv;
+    int rc;
+
+    if (f->frec->direction != AP_FILTER_OUTPUT) {
+        return APR_EINVAL;
+    }
+    if (fp->why) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
+                      "'%s' output filter can't hold its output: it holds "
+                      "already", f->frec->name);
+        return APR_EBUSY;
+    }
+    if (!ctx && f->r && !ap_filter_should_yield(f->next)) {
+        return APR_EAGAIN; /* room already */
+    }
+    rc = ap_request_filter_hold(f, ctx, direction, flags);
+    if (rc != OK && rc != SUSPENDED) {
+        return APR_ENOTIMPL;
+    }
+
+    if (bb && !APR_BRIGADE_EMPTY(bb)) {
+        if (!fp->held) {
+            fp->held = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+        }
+        rv = ap_save_brigade(f, &fp->held, &bb, f->r->pool);
+        if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+            /* Not held: the wait's continuation finds nothing to release */
+            if (rc == SUSPENDED) {
+                (void)ap_request_wait_cancel(ctx);
+            }
+            return rv;
+        }
+    }
+    ap_filter_prepare_brigade(f);
+    fp->why = (ctx) ? FILTER_PENDING_HELD : FILTER_PENDING_ROOM;
+    fp->ctx = ctx;
+    fp->held_status = APR_SUCCESS;
+    fp->held_done = (ctx && rc == OK); /* ready already */
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
+                  "'%s' output filter holds its output%s",
+                  f->frec->name, (!ctx) ? " for room"
+                                        : (fp->held_done) ? " (ready already)"
+                                                          : "");
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
+                                                  apr_bucket_brigade *bb,
+                                                  struct ap_mpm_notifier_t *notifier)
+{
+    struct ap_filter_private *fp = f->priv;
+
+    if (!notifier) {
+        return ap_filter_pending_wait(f, bb, NULL, 0, 0);
+    }
+    if (!f->r || f->frec->direction != AP_FILTER_OUTPUT) {
+        return (f->r) ? APR_EINVAL : APR_ENOTIMPL;
+    }
+    if (fp->why) {
+        return ap_filter_pending_wait(f, bb, fp->notifier_ctx, 0, 0); /* EBUSY */
+    }
+    /* The context of the notifier given last, re-armed by its owner between
+     * the waits, else a new one (once per notifier, in the request's pool)
+     */
+    if (fp->notifier != notifier || !fp->notifier_ctx) {
+        if (ap_request_filter_hold(f, NULL, 0, 0) != OK) {
+            return APR_ENOTIMPL;
+        }
+        if (fp->notifier_ctx) {
+            ap_request_waitctx_release(fp->notifier_ctx);
+        }
+        fp->notifier_ctx = ap_request_waitctx_notifier_(f->r, f->r->pool,
+                                                        notifier,
+                                                        APLOG_MODULE_INDEX);
+        fp->notifier = notifier;
+    }
+    return ap_filter_pending_wait(f, bb, fp->notifier_ctx, 0, 0);
+}
+
+AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status)
+{
+    struct ap_filter_private *fp = f->priv;
+
+    if (fp->why & FILTER_PENDING_HELD) {
+        fp->held_done = 1;
+        fp->held_status = status;
+    }
+}
+
 AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
 {
     struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
@@ -1561,6 +1715,7 @@ AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
             fp->due = 0;
             fp->ctx = NULL;
             fp->held_done = 0;
+            pending_filter_unlink_request(fp);
         }
     }
     return pending;
