@@ -914,6 +914,10 @@ struct worker_slot {
     apr_uint32_t drain_epoch;
 };
 static struct worker_slot *worker_slots;
+#ifdef AP_THREAD_LOCAL
+/* The slot of the worker running this thread, if any */
+static AP_THREAD_LOCAL struct worker_slot *worker_current_slot;
+#endif
 
 /* Disabling / enabling listening sockets can only happen in the listener
  * thread, which is the only one to set 'dying' to 1 too, so it's all thread
@@ -1442,9 +1446,12 @@ static void close_worker_sockets(void)
 {
     int i;
     for (i = 0; i < threads_per_child; i++) {
-        apr_socket_t *csd = worker_slots[i].csd;
+        /* Taken from the worker, which leaves the socket and its pool
+         * alone from then on (take_back_worker_socket())
+         */
+        apr_socket_t *csd = apr_atomic_xchgptr((void *volatile *)
+                                               &worker_slots[i].csd, NULL);
         if (csd) {
-            worker_slots[i].csd = NULL;
             close_socket(csd);
         }
     }
@@ -1804,6 +1811,36 @@ static void flush_limbo(void);
  * Pre-condition: nonblocking, can be called from anywhere provided cs is not
  *                in any timeout queue or in the pollset.
  */
+/* Take a connection's socket back from the slot where the worker processing
+ * it published it, before the socket is closed and its pool (holding it)
+ * recycled: zero if close_worker_sockets() took it, on an ungraceful stop,
+ * the socket and its pool then to be left alone (the child is exiting, pchild
+ * frees the pool). A socket not published (e.g. a connection closed by the
+ * listener) is taken back unless the child stops ungracefully.
+ */
+static int take_back_worker_socket(apr_socket_t *csd)
+{
+    struct worker_slot *slot = NULL;
+#ifdef AP_THREAD_LOCAL
+    slot = worker_current_slot;
+#else
+    int i;
+    for (i = 0; i < threads_per_child; i++) {
+        if (apr_atomic_casptr((void *volatile *)&worker_slots[i].csd,
+                              csd, csd) == csd) {
+            slot = &worker_slots[i];
+            break;
+        }
+    }
+#endif
+    if (slot && apr_atomic_casptr((void *volatile *)&slot->csd,
+                                  NULL, csd) == csd) {
+        return 1;
+    }
+    /* signal_threads() sets workers_may_exit before close_worker_sockets() */
+    return !apr_atomic_read32(&workers_may_exit);
+}
+
 static void close_connection_at(event_conn_state_t *cs,
                                 const char *at, int line)
 {
@@ -1818,6 +1855,10 @@ static void close_connection_at(event_conn_state_t *cs,
                       CS_ARG_TO(cs), at, line);
     }
 
+    if (!take_back_worker_socket(cs_sd(cs))) {
+        /* close_worker_sockets() closes it */
+        return;
+    }
     close_socket_at(cs_sd(cs), at, line);
     recycle_connection_pool(cs->p);
 }
@@ -4841,6 +4882,9 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
     ws->generation = retained->mpm->my_generation;
     ap_update_child_status_from_indexes(process_slot, thread_slot,
                                         SERVER_STARTING, NULL);
+#ifdef AP_THREAD_LOCAL
+    worker_current_slot = &worker_slots[thread_slot];
+#endif
 
     for (;;) {
         ap_queue_event_t *qe;
@@ -4889,9 +4933,11 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
                 apr_socket_t *csd = cs_se(cs)->sd;
                 ap_queue_info_idlers_dec(worker_queue_info);
                 is_idler = 0;
-                worker_slots[thread_slot].csd = csd;
+                (void)apr_atomic_xchgptr((void *volatile *)
+                                         &worker_slots[thread_slot].csd, csd);
                 process_socket(thd, cs->p, csd, cs, process_slot, thread_slot);
-                worker_slots[thread_slot].csd = NULL;
+                (void)apr_atomic_xchgptr((void *volatile *)
+                                         &worker_slots[thread_slot].csd, NULL);
                 continue;
             }
         }
@@ -4964,9 +5010,11 @@ static void *APR_THREAD_FUNC worker_thread(apr_thread_t * thd, void *dummy)
             cs = qe->data.se->baton;
             ap_assert(p && csd && cs && qe == cs_qe(cs));
 
-            worker_slots[thread_slot].csd = csd;
+            (void)apr_atomic_xchgptr((void *volatile *)
+                                     &worker_slots[thread_slot].csd, csd);
             process_socket(thd, p, csd, cs, process_slot, thread_slot);
-            worker_slots[thread_slot].csd = NULL;
+            (void)apr_atomic_xchgptr((void *volatile *)
+                                     &worker_slots[thread_slot].csd, NULL);
         }
         else if (qe->type == AP_QUEUE_EVENT_TIMER) {
             timer_event_t *te;
