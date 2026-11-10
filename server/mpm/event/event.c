@@ -3034,14 +3034,23 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         ap_update_child_status(cs->sbh, SERVER_BUSY_WRITE, NULL);
 
         if (!processed) {
+            /* What these writes need (cs->pub.sense), e.g. TLS wanting to
+             * read to write (CONN_SENSE_WANT_READ)
+             */
+            cs->pub.sense = CONN_SENSE_DEFAULT;
             pending = ap_check_output_pending(c);
         }
         else if (ap_filter_should_yield(c->output_filters)) {
+            /* No write here: the sense left by the processing may be a
+             * read's
+             */
+            cs->pub.sense = CONN_SENSE_DEFAULT;
             pending = AGAIN;
         }
         if (pending == AGAIN) {
-            /* Let the event thread poll for write */
-            cs->pub.sense = CONN_SENSE_DEFAULT;
+            /* Let the event thread poll for write (or for read if the
+             * writes above need it)
+             */
             if (pollset_add(cs, CONN_SENSE_WANT_WRITE, cs->sc->wc_q, NULL)) {
                 return; /* queued */
             }
@@ -5137,6 +5146,10 @@ static void process_lingering_close(event_conn_state_t *cs)
         conn_rec *c = cs->c;
         int rc = OK;
 
+        /* What the writes below need (cs->pub.sense), e.g. TLS wanting to
+         * read to write (CONN_SENSE_WANT_READ)
+         */
+        cs->pub.sense = CONN_SENSE_DEFAULT;
         if (!cs->linger_started) {
             cs->linger_started = 1; /* once! */
             cs->pub.state = CONN_STATE_LINGER;
@@ -5165,7 +5178,6 @@ static void process_lingering_close(event_conn_state_t *cs)
         }
 
         cs->pub.state = CONN_STATE_LINGER;
-        cs->pub.sense = CONN_SENSE_DEFAULT;
         if (rc == AGAIN) {
             ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, cs->c,
                           "queuing lingering close for connection %" CS_FMT,
@@ -5174,6 +5186,7 @@ static void process_lingering_close(event_conn_state_t *cs)
                 return; /* queued */
             }
         }
+        cs->pub.sense = CONN_SENSE_DEFAULT; /* reading from now on */
         if (rc != OK || apr_socket_shutdown(csd, APR_SHUTDOWN_WRITE)) {
             close_connection(cs);
             return;
