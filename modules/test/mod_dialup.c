@@ -25,12 +25,8 @@
 #include "http_request.h"
 #include "http_protocol.h"
 
-#include "ap_mpm.h"
-#include "mpm_common.h"
 
 module AP_MODULE_DECLARE_DATA dialup_module;
-
-static int mpm_can_suspend = 0;
 
 typedef struct dialup_dcfg_t {
     apr_size_t bytes_per_second;
@@ -42,7 +38,9 @@ typedef struct dialup_baton_t {
     apr_file_t *fd;
     apr_bucket_brigade *bb;
     apr_bucket_brigade *tmpbb;
+    ap_request_waitctx_t *timer; /* a second between the pulses */
     int response_sent;
+    int blocking;                 /* the request can't suspend: sleep */
 } dialup_baton_t;
 
 static int
@@ -73,7 +71,12 @@ dialup_send_pulse(dialup_baton_t *db)
             APR_BRIGADE_CONCAT(db->tmpbb, db->bb);
         }
 
-        e = apr_bucket_flush_create(db->r->connection->bucket_alloc);
+        /* Without blocking on the client when the request waits for the
+         * next pulse asynchronously (WC), otherwise a FLUSH
+         */
+        e = (db->blocking)
+            ? apr_bucket_flush_create(db->r->connection->bucket_alloc)
+            : ap_bucket_wc_create(db->r->connection->bucket_alloc);
 
         APR_BRIGADE_INSERT_TAIL(db->tmpbb, e);
 
@@ -98,51 +101,66 @@ dialup_send_pulse(dialup_baton_t *db)
 }
 
 static void
-dialup_callback(void *baton)
+dialup_continuation(request_rec *r, apr_status_t status, void *baton);
+
+/* Send the pulses a second apart, waiting for each second on a timer
+ * without holding the thread (or sleeping if the request can't suspend):
+ * SUSPENDED while waiting, else the pulses' final status
+ */
+static int
+dialup_run(dialup_baton_t *db)
 {
-    int status;
-    dialup_baton_t *db = (dialup_baton_t *)baton;
-    conn_rec *c = db->r->connection;
+    int status, rc;
 
-    status = dialup_send_pulse(db);
-
-    if (status == SUSPENDED) {
-        ap_mpm_register_timed_callback(apr_time_from_sec(1), dialup_callback, baton);
-        return;
+    for (;;) {
+        status = dialup_send_pulse(db);
+        if (status != SUSPENDED) {
+            break;
+        }
+        if (!db->blocking) {
+            db->timer->timeout = apr_time_from_sec(1);
+            rc = ap_request_wait(db->timer, 0, 0, dialup_continuation, db);
+            if (rc == SUSPENDED) {
+                return SUSPENDED;
+            }
+            if (rc == OK) {
+                continue;
+            }
+            db->blocking = 1; /* can't wait asynchronously */
+        }
+        apr_sleep(apr_time_from_sec(1));
     }
 
     if (status != DONE && db->response_sent) {
-        c->cs->state = CONN_STATE_LINGER;
-        c->keepalive = AP_CONN_CLOSE;
+        db->r->connection->keepalive = AP_CONN_CLOSE;
         status = DONE;
     }
-    if (status == DONE) {
-        ap_finalize_request_protocol(db->r);
-        ap_process_request_after_handler(db->r);
-    }
-    else {
+    if (status != DONE) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, db->r, APLOGNO(01868)
                       "dialup: pulse returned: %d", status);
-        db->r->status = HTTP_OK;
-        ap_die(status, db->r);
     }
-
-    ap_mpm_resume_suspended(c);
+    return status;
 }
 
 static void
-dialup_suspend_connection(conn_rec *c, request_rec *r)
+dialup_continuation(request_rec *r, apr_status_t status, void *baton)
 {
-    dialup_baton_t *db = NULL;
-    if (r) {
-        db = ap_get_module_config(r->request_config, &dialup_module);
-    }
-    if (!db) {
+    dialup_baton_t *db = baton;
+    int rc;
+
+    if (status != APR_SUCCESS) {
+        /* The MPM failed to wait (e.g. stopping): what's sent is the
+         * response
+         */
+        r->connection->keepalive = AP_CONN_CLOSE;
+        ap_request_finish_suspended(r, DONE);
         return;
     }
-    ap_assert(db->r == r);
-
-    ap_mpm_register_timed_callback(apr_time_from_sec(1), dialup_callback, db);
+    rc = dialup_run(db);
+    if (rc == SUSPENDED) {
+        return;
+    }
+    ap_request_finish_suspended(r, rc);
 }
 
 static int
@@ -167,12 +185,6 @@ dialup_handler(request_rec *r)
                                 &dialup_module);
 
     if (dcfg->bytes_per_second == 0) {
-        return DECLINED;
-    }
-
-    if (!mpm_can_suspend) {
-        ap_log_rerror (APLOG_MARK, APLOG_NOTICE, 0, r, APLOGNO(02637)
-                "dialup: MPM doesn't support suspending");
         return DECLINED;
     }
 
@@ -223,29 +235,21 @@ dialup_handler(request_rec *r)
     db->bytes_per_second = dcfg->bytes_per_second;
     db->r = r;
     db->fd = fd;
+    db->timer = ap_request_waitctx_timer(r, r->pool);
+    db->blocking = !ap_request_can_suspend(r);
 
     e = apr_bucket_eos_create(r->connection->bucket_alloc);
 
     APR_BRIGADE_INSERT_TAIL(db->bb, e);
 
-    status = dialup_send_pulse(db);
+    status = dialup_run(db);
     if (status == SUSPENDED) {
-        ap_set_module_config(r->request_config, &dialup_module, db);
         return SUSPENDED;
     }
     if (status != DONE) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01870)
                       "dialup: failed, send pulse");
         return status;
-    }
-    return OK;
-}
-
-static int dialup_post_config(apr_pool_t *pconf, apr_pool_t *plog,
-                              apr_pool_t *ptemp, server_rec *s)
-{
-    if (ap_mpm_query(AP_MPMQ_CAN_SUSPEND, &mpm_can_suspend) != APR_SUCCESS) {
-        mpm_can_suspend = 0;
     }
     return OK;
 }
@@ -258,10 +262,6 @@ static void
 dialup_register_hooks(apr_pool_t *p)
 {
     ap_hook_handler(dialup_handler, NULL, NULL, APR_HOOK_ALMOST_LAST);
-    ap_hook_post_config(dialup_post_config, NULL, NULL, APR_HOOK_MIDDLE);
-
-    /* Schedule timer when the SUSPENDED connection reaches the MPM */
-    ap_hook_suspend_connection(dialup_suspend_connection, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
 typedef struct modem_speed_t {
