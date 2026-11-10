@@ -877,6 +877,17 @@
  *                         ap_filter_hold_undo() to util_filter.h, and
  *                         ap_request_async_t->holder, ->delegate and
  *                         ->subreqs_delegated to http_core.h
+ * 20260601.19 (2.5.1-dev) Add ap_request_hold_end_e, ap_request_holder_t,
+ *                         ap_request_hold_release_fn,
+ *                         ap_request_hold_delegate() and
+ *                         ap_request_hold_withdraw() to http_request.h, and
+ *                         ap_filter_holder(), ap_request_holder_await(),
+ *                         ap_request_holder_take() and
+ *                         ap_request_holder_withdraw() to util_filter.h;
+ *                         ap_request_async_t->holder is an
+ *                         ap_request_holder_t; ap_filter_hold_delegate()
+ *                         removed from util_filter.h
+ * 20260601.22 (2.5.1-dev) Add ap_request_holder_t.timeout to http_request.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -884,7 +895,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 18    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 19    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

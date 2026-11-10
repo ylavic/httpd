@@ -436,10 +436,11 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  * @param timeout The longest the subrequest may run from now on, its waits
  *        capped to what's left: once reached, its pending waits complete
  *        with APR_TIMEUP and done gets HTTP_GATEWAY_TIME_OUT whatever the
- *        subrequest's own status; zero or negative for none (the server's
- *        Timeout for the work of a request output filter's delegated hold,
- *        which is always bounded). Only the asynchronous waits are capped
- *        (not a subrequest running blocking).
+ *        subrequest's own status; zero or negative for none (the
+ *        holder's timeout for the work of a delegated hold, see
+ *        ap_request_holder_t, the server's Timeout for a request output
+ *        filter's, which is always bounded). Only the asynchronous waits
+ *        are capped (not a subrequest running blocking).
  * @param done Called once the subrequest completes asynchronously
  * @param baton For done
  * @param module_index The module whose log level the log lines follow (a
@@ -453,14 +454,15 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         runs blocking (ap_run_sub_req()).
  * @remark Only from a handler of the main request (or a continuation of
  *         it, e.g. the done function of a previous subrequest), which
- *         returns SUSPENDED up, or from a request output filter of the main
- *         request right after it delegated its hold to the subrequest
- *         (ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED: the
- *         filter returns APR_SUCCESS on SUSPENDED, the core releasing its
- *         hold after done). Not from a filter otherwise, which can't, nor
- *         from the done function of a delegated hold's subrequest (the
- *         filter runs the next one when called again): detected, logged as
- *         an error, the subrequest runs blocking.
+ *         returns SUSPENDED up, or right after its caller delegated a hold
+ *         to the subrequest (ap_request_hold_delegate(), or for a request
+ *         output filter of the main request ap_filter_pending_wait() with
+ *         AP_FILTER_HOLD_DELEGATED: the filter returns APR_SUCCESS on
+ *         SUSPENDED), the core releasing the hold after done. Not from a
+ *         filter otherwise, which can't, nor from the done function of a
+ *         delegated hold's subrequest (the holder runs the next one once
+ *         released): detected, logged as an error, the subrequest runs
+ *         blocking.
  * @remark Other waits of the main request's tree may be pending meanwhile
  *         (e.g. a tunnel's, see ap_request_wait()), and several subrequests
  *         may be suspended at once, each done called when it completes: the
@@ -478,6 +480,91 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
 /** ap_run_sub_req_async_() for the calling module (APLOG_MODULE_INDEX) */
 #define ap_run_sub_req_async(rsub, timeout, done, baton) \
     ap_run_sub_req_async_(rsub, timeout, done, baton, APLOG_MODULE_INDEX)
+
+/** How a delegated hold ends (ap_request_hold_delegate()) */
+typedef enum {
+    /** The work ended asynchronously, after its own completion function
+     *  (e.g. a subrequest's done function, which records its outcome) */
+    AP_REQUEST_HOLD_RELEASED,
+    /** The work ended at once, in the holder's call that started it (e.g.
+     *  ap_run_sub_req_async() returning a final status): the holder goes on
+     *  in that call as if it hadn't held */
+    AP_REQUEST_HOLD_UNDONE
+} ap_request_hold_end_e;
+
+/** A holder of a delegated hold (ap_request_hold_delegate()) */
+typedef struct ap_request_holder_t ap_request_holder_t;
+
+/**
+ * The function the core calls when the work a hold was delegated to ends,
+ * from the thread processing the request.
+ * @param holder The holder
+ * @param how AP_REQUEST_HOLD_RELEASED or AP_REQUEST_HOLD_UNDONE
+ */
+typedef void ap_request_hold_release_fn(ap_request_holder_t *holder,
+                                        ap_request_hold_end_e how);
+
+/**
+ * @brief What holds something of a request (e.g. a request output filter
+ * its output, a tunnel one of its directions) while the asynchronous work
+ * it delegated its hold to runs (ap_request_hold_delegate()), released by
+ * the core when that work ends: the module's own, its fields set before
+ * delegating, alive until released or the request's end (e.g. in the
+ * request's pool, made once).
+ */
+struct ap_request_holder_t {
+    /** The request (a top-level one) */
+    request_rec *r;
+    /** What holds, in the logs */
+    const char *name;
+    /** Called when the work ends */
+    ap_request_hold_release_fn *release;
+    /** For release */
+    void *baton;
+    /** The bound the core gives the work when that work has none (e.g. a
+     *  zero or negative timeout given to ap_run_sub_req_async()), set by
+     *  the holder before delegating (e.g. its own idle timeout, or the
+     *  server's Timeout); zero or negative for none (the work unbounded
+     *  then). The work's own timeout applies when it has one. The core
+     *  sets it to the server's Timeout for a request output filter's
+     *  delegated hold (ap_filter_pending_wait()). */
+    apr_interval_time_t timeout;
+};
+
+/**
+ * Delegate a hold to the asynchronous work that the caller starts next, in
+ * the same call: the core links that work to the holder, and releases the
+ * holder when the work ends (AP_REQUEST_HOLD_RELEASED, after the work's
+ * own completion function), or at once if the work ends at once
+ * (AP_REQUEST_HOLD_UNDONE). The work is a subrequest run by
+ * ap_run_sub_req_async(), the only kind for now: if it returns SUSPENDED
+ * the caller returns SUSPENDED up, its hold standing; the subrequest's done
+ * function records the outcome for the holder (it doesn't start other work
+ * or end the request: a subrequest it runs is run blocking, logged), then
+ * the holder is released.
+ * @param holder The holder, its fields set
+ * @return APR_SUCCESS: the hold awaits its work; APR_ENOTIMPL: the request
+ *         can't suspend now (ap_request_can_suspend(), logged at debug):
+ *         the caller does its work blocking; APR_EBUSY: another hold awaits
+ *         its work on the connection; APR_EINVAL: not a top-level request,
+ *         or no release function.
+ * @remark A request output filter delegates its hold with
+ *         ap_filter_pending_wait() and AP_FILTER_HOLD_DELEGATED instead.
+ * @remark If the caller doesn't start the work, it withdraws the hold
+ *         (ap_request_hold_withdraw()): nothing else would release it.
+ * @remark A holder whose work is dropped (its request ending meanwhile) is
+ *         not released, as the work's done function isn't called.
+ */
+AP_DECLARE(apr_status_t) ap_request_hold_delegate(ap_request_holder_t *holder);
+
+/**
+ * Withdraw a delegated hold that still awaits its work (no work started
+ * since ap_request_hold_delegate()).
+ * @param holder The holder
+ * @return APR_SUCCESS if it awaited its work (it's not released), or
+ *         APR_NOTFOUND if not (e.g. its work started)
+ */
+AP_DECLARE(apr_status_t) ap_request_hold_withdraw(ap_request_holder_t *holder);
 
 /** The directions of a request's wait (ap_request_wait()), as bits */
 typedef enum {

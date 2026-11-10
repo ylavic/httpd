@@ -459,12 +459,14 @@ typedef struct ap_request_async_t {
     apr_time_t deadline;
     int module_index;
     /** For a subrequest run by ap_run_sub_req_async() as the work of a
-     *  request filter's delegated hold (ap_filter_pending_wait() with
-     *  AP_FILTER_HOLD_DELEGATED): that filter, whose hold its end releases */
-    ap_filter_t *holder;
-    /** The subrequest in progress as the work of a filter's delegated hold
-     *  (one at a time), and how many subrequests of the tree are in
-     *  progress for it (with its own); the top-level request's */
+     *  delegated hold (ap_request_hold_delegate(), or a request filter's
+     *  ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED): its holder,
+     *  which its end releases */
+    struct ap_request_holder_t *holder;
+    /** The subrequest in progress as the work of a request output filter's
+     *  delegated hold (one at a time), which the request's end waits for,
+     *  and how many subrequests of the tree are in progress for it (with
+     *  its own); the top-level request's */
     struct ap_request_async_t *delegate;
     int subreqs_delegated;
 } ap_request_async_t;

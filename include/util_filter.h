@@ -770,19 +770,54 @@ AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
  */
 AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
 
+/* http_request.h's ap_request_holder_t (C89 forbids repeating its typedef) */
+struct ap_request_holder_t;
+
 /**
- * The request filter of r whose delegated hold (ap_filter_pending_wait()
- * with AP_FILTER_HOLD_DELEGATED) awaits the asynchronous work it's delegated
- * to, made by the filter's call in progress, now given that work (no longer
- * awaiting it), core's own: the core releases the hold when the work ends
- * (ap_filter_hold_done()), or undoes it if the work ends at once
- * (ap_filter_hold_undo()).
- * @param c The connection
- * @param r The request whose filter may delegate
- * @return The filter, or NULL if none of r awaits its work
+ * The holder of a request filter's delegated hold (ap_filter_pending_wait()
+ * with AP_FILTER_HOLD_DELEGATED), core's own: part of the filter, its
+ * fields set by the core when the filter delegates.
+ * @param f The filter
+ * @return The holder
  */
-AP_CORE_DECLARE(ap_filter_t *) ap_filter_hold_delegate(conn_rec *c,
-                                                       request_rec *r);
+AP_CORE_DECLARE(struct ap_request_holder_t *) ap_filter_holder(ap_filter_t *f);
+
+/**
+ * Make a holder the one whose delegated hold awaits its work on its
+ * request's connection (ap_request_hold_delegate(), or a request filter's
+ * ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED), core's own:
+ * one at a time per connection, until the work takes it
+ * (ap_request_holder_take()) or it's withdrawn
+ * (ap_request_holder_withdraw()). A request filter's that its call returns
+ * without starting the work is released then (logged).
+ * @param c The connection
+ * @param holder The holder
+ * @return APR_SUCCESS, or APR_EBUSY if another one awaits its work
+ */
+AP_CORE_DECLARE(apr_status_t) ap_request_holder_await(conn_rec *c,
+                                                      struct ap_request_holder_t *holder);
+
+/**
+ * Take the holder of r whose delegated hold awaits its work on the
+ * connection, made by the code calling (a request filter's call in
+ * progress, or a module's code before it starts the work), now given that
+ * work (no longer awaiting it), core's own: the core releases it when the
+ * work ends, or at once if the work ends at once.
+ * @param c The connection
+ * @param r The request whose holder may await
+ * @return The holder, or NULL if none of r awaits its work
+ */
+AP_CORE_DECLARE(struct ap_request_holder_t *) ap_request_holder_take(conn_rec *c,
+                                                                     request_rec *r);
+
+/**
+ * Withdraw a holder still awaiting its work on the connection, core's own.
+ * @param c The connection
+ * @param holder The holder
+ * @return Non-zero if it awaited its work (no longer), zero otherwise
+ */
+AP_CORE_DECLARE(int) ap_request_holder_withdraw(conn_rec *c,
+                                                struct ap_request_holder_t *holder);
 
 /**
  * Undo a request filter's delegated hold whose work ended at once, core's

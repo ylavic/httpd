@@ -98,6 +98,10 @@ struct ap_filter_private {
      * (ap_filter_hold_undo())
      */
     apr_bucket_brigade *given;
+    /* FILTER_PENDING_DELEGATED: its holder (ap_filter_holder()), set by the
+     * core when the filter delegates
+     */
+    ap_request_holder_t holder;
     /* ap_filter_pending_notify(): the notifier's context, reused for the
      * same notifier
      */
@@ -129,10 +133,11 @@ struct ap_filter_conn_ctx {
      */
     int calls;
 
-    /* The request filter whose delegated hold awaits its work (made by the
-     * filter's call in progress, ap_filter_hold_delegate())
+    /* The holder whose delegated hold awaits its work (a request filter's,
+     * made by the filter's call in progress, or a module's,
+     * ap_request_holder_await())
      */
-    ap_filter_t *delegating;
+    ap_request_holder_t *delegating;
 
     struct spare_ring *spare_containers,
                       *spare_brigades,
@@ -689,7 +694,7 @@ static apr_status_t pending_filter_cleanup(void *arg)
         APR_RING_REMOVE(fp, pending);
         APR_RING_ELEM_INIT(fp, pending);
     }
-    if (x && x->delegating == f) {
+    if (x && x->delegating == &fp->holder) {
         x->delegating = NULL;
     }
 
@@ -908,7 +913,7 @@ AP_DECLARE(apr_status_t) ap_pass_brigade(ap_filter_t *next,
         x->calls++;
         rv = next->frec->filter_func.out_func(next, bb);
         x->calls--;
-        if (x->delegating == next) {
+        if (x->delegating == &next->priv->holder) {
             filter_hold_unpaired(next);
         }
         return rv;
@@ -1729,9 +1734,9 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
         x = get_conn_ctx(f->c);
         if (x->delegating) {
             ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
-                          "'%s' output filter can't delegate its hold: '%s' "
-                          "output filter's awaits its work", f->frec->name,
-                          x->delegating->frec->name);
+                          "'%s' output filter can't delegate its hold: "
+                          "%s's awaits its work", f->frec->name,
+                          x->delegating->name);
             return APR_EBUSY;
         }
     }
@@ -1771,12 +1776,13 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
     fp->held_status = APR_SUCCESS;
     fp->held_done = (ctx && rc == OK); /* ready already */
     if (flags & AP_FILTER_HOLD_DELEGATED) {
-        /* Released by the end of its work, paired with the hold by the
-         * filter's next call (ap_filter_hold_delegate())
+        /* Released by the end of its work, which takes the holder (set by
+         * ap_request_filter_hold()) in the filter's call
+         * (ap_request_holder_take())
          */
         fp->why = FILTER_PENDING_HELD | FILTER_PENDING_DELEGATED;
         fp->given = bb;
-        x->delegating = f;
+        x->delegating = &fp->holder;
     }
     else {
         fp->why = (ctx) ? FILTER_PENDING_HELD : FILTER_PENDING_ROOM;
@@ -1791,18 +1797,47 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
     return APR_SUCCESS;
 }
 
-AP_CORE_DECLARE(ap_filter_t *) ap_filter_hold_delegate(conn_rec *c,
-                                                       request_rec *r)
+AP_CORE_DECLARE(ap_request_holder_t *) ap_filter_holder(ap_filter_t *f)
+{
+    return &f->priv->holder;
+}
+
+AP_CORE_DECLARE(apr_status_t) ap_request_holder_await(conn_rec *c,
+                                                      ap_request_holder_t *holder)
+{
+    struct ap_filter_conn_ctx *x = get_conn_ctx(c);
+
+    if (x->delegating) {
+        return APR_EBUSY;
+    }
+    x->delegating = holder;
+    return APR_SUCCESS;
+}
+
+AP_CORE_DECLARE(ap_request_holder_t *) ap_request_holder_take(conn_rec *c,
+                                                              request_rec *r)
 {
     struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
-    ap_filter_t *f;
+    ap_request_holder_t *holder;
 
     if (!x || !x->delegating || x->delegating->r != r) {
         return NULL;
     }
-    f = x->delegating;
+    holder = x->delegating;
     x->delegating = NULL;
-    return f;
+    return holder;
+}
+
+AP_CORE_DECLARE(int) ap_request_holder_withdraw(conn_rec *c,
+                                                ap_request_holder_t *holder)
+{
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+
+    if (!x || x->delegating != holder) {
+        return 0;
+    }
+    x->delegating = NULL;
+    return 1;
 }
 
 AP_CORE_DECLARE(void) ap_filter_hold_undo(ap_filter_t *f)
@@ -1968,7 +2003,7 @@ AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
             if (fp->held) {
                 apr_brigade_cleanup(fp->held);
             }
-            if (x->delegating == fp->f) {
+            if (x->delegating == &fp->holder) {
                 x->delegating = NULL;
             }
             fp->why = 0;

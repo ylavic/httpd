@@ -512,6 +512,14 @@ static int async_request_hold(request_rec *r, ap_request_async_t *async,
 static void request_filter_hold_continuation(request_rec *r,
                                              apr_status_t status,
                                              void *baton);
+static void request_filter_hold_release(ap_request_holder_t *holder,
+                                        ap_request_hold_end_e how);
+
+/* Whether a delegated hold is a request output filter's, which the
+ * request's end waits for
+ */
+#define REQUEST_HOLDER_IS_FILTER(holder) \
+    ((holder)->release == request_filter_hold_release)
 
 static void async_request_enter(request_rec *r, ap_request_async_t *async)
 {
@@ -2312,6 +2320,22 @@ static void request_filter_hold_continuation(request_rec *r,
     }
 }
 
+/* The release of a request output filter's delegated hold: over (as its
+ * wait's continuation would), or undone if its work ended at once (the
+ * filter goes on in its call)
+ */
+static void request_filter_hold_release(ap_request_holder_t *holder,
+                                        ap_request_hold_end_e how)
+{
+    ap_filter_t *f = holder->baton;
+
+    if (how == AP_REQUEST_HOLD_UNDONE) {
+        ap_filter_hold_undo(f);
+        return;
+    }
+    request_filter_hold_continuation(holder->r, APR_SUCCESS, f);
+}
+
 AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
                                             ap_request_waitctx_t *ctx,
                                             unsigned int direction,
@@ -2356,6 +2380,18 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
         return DECLINED;
     }
     if (!ctx) {
+        if (flags & AP_FILTER_HOLD_DELEGATED) {
+            /* Its holder, taken by the work it starts next */
+            ap_request_holder_t *holder = ap_filter_holder(f);
+            holder->r = r;
+            holder->name = f->frec->name;
+            holder->release = request_filter_hold_release;
+            holder->baton = f;
+            /* Its work is bounded, the request's end waiting for it: the
+             * server's Timeout if it gives none
+             */
+            holder->timeout = r->server->timeout;
+        }
         return OK;
     }
 
@@ -2391,7 +2427,7 @@ static void async_request_drop_holds(request_rec *r, ap_request_async_t *async)
          */
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
                       "abandoning the subrequest of '%s' output filter's "
-                      "delegated hold", top->delegate->holder->frec->name);
+                      "delegated hold", top->delegate->holder->name);
         if (w) {
             request_waitset_drop(w, top->delegate->r, 0);
         }
@@ -2617,13 +2653,13 @@ void ap_process_async_request(request_rec *r)
  */
 
 /* Whether a subrequest runs as the work of a filter's delegated hold (it,
- * or one of its main requests)
+ * or one of its main requests), which the request's end waits for
  */
 static int request_async_delegated(ap_request_async_t *async)
 {
     for (; async && async != async->top;
          async = request_async_get(async->r->main)) {
-        if (async->holder) {
+        if (async->holder && REQUEST_HOLDER_IS_FILTER(async->holder)) {
             return 1;
         }
     }
@@ -2703,15 +2739,15 @@ static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
 static void async_subreq_end(request_rec *rsub, ap_request_async_t *async,
                              int status)
 {
-    ap_filter_t *holder = async->holder; /* async is in rsub's pool */
+    ap_request_holder_t *holder = async->holder; /* in rsub's pool */
     conn_rec *c = rsub->connection;
     int *ended = async->top->ended;
     int calls = 0;
 
     status = async_subreq_finish(rsub, async, status);
     if (holder) {
-        /* The filter's code: it runs no subrequest (the filter does when
-         * called again)
+        /* The holder's code: it runs no subrequest (the holder does once
+         * released)
          */
         calls = ap_filter_calls(c, -1);
         ap_filter_calls(c, calls + 1);
@@ -2723,11 +2759,46 @@ static void async_subreq_end(request_rec *rsub, ap_request_async_t *async,
     }
 
     if (holder && !(ended && *ended)) {
-        /* The work of the filter's delegated hold ended: the hold is over,
-         * the filter called again by the next output walk
+        /* The work of the delegated hold ended: the hold is over (e.g. a
+         * filter called again by the next output walk)
          */
-        request_filter_hold_continuation(holder->r, APR_SUCCESS, holder);
+        holder->release(holder, AP_REQUEST_HOLD_RELEASED);
     }
+}
+
+AP_DECLARE(apr_status_t) ap_request_hold_delegate(ap_request_holder_t *holder)
+{
+    request_rec *r = holder->r;
+    apr_status_t rv;
+
+    if (!r || r->main || !holder->release) {
+        return APR_EINVAL;
+    }
+    if (!ap_request_can_suspend(r)) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "%s can't delegate its hold: the request can't "
+                      "suspend", holder->name);
+        return APR_ENOTIMPL;
+    }
+    rv = ap_request_holder_await(r->connection, holder);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO()
+                      "%s can't delegate its hold: another one awaits its "
+                      "work", holder->name);
+        return rv;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE6, 0, r,
+                  "%s delegates its hold", holder->name);
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_status_t) ap_request_hold_withdraw(ap_request_holder_t *holder)
+{
+    if (!holder->r
+        || !ap_request_holder_withdraw(holder->r->connection, holder)) {
+        return APR_NOTFOUND;
+    }
+    return APR_SUCCESS;
 }
 
 AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
@@ -2739,11 +2810,13 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
     conn_rec *c = rsub->connection;
     core_request_config *req_cfg;
     ap_request_async_t *main_async, *async;
-    ap_filter_t *holder;
+    ap_request_holder_t *holder;
     int status, calls;
 
-    /* The work of a filter's delegated hold made by the filter calling? */
-    holder = (r) ? ap_filter_hold_delegate(c, r) : NULL;
+    /* The work of a delegated hold made by the code calling (a filter, or
+     * a module's code that delegated its hold)?
+     */
+    holder = (r) ? ap_request_holder_take(c, r) : NULL;
 
     req_cfg = ap_get_core_module_config(rsub->request_config);
     if (!r || !done || !req_cfg || req_cfg->async) {
@@ -2758,7 +2831,7 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
                                      : "run already");
         status = ap_run_sub_req(rsub);
         if (holder) {
-            ap_filter_hold_undo(holder);
+            holder->release(holder, AP_REQUEST_HOLD_UNDONE);
         }
         return status;
     }
@@ -2792,15 +2865,21 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
     async->done = done;
     async->done_baton = baton;
     async->module_index = module_index;
+    if (timeout <= 0 && holder) {
+        /* The work of a delegated hold giving no timeout: its holder's */
+        timeout = holder->timeout;
+    }
     if (timeout > 0) {
         async->deadline = apr_time_now() + timeout;
     }
     req_cfg->async = async;
     async->top->subreqs++; /* until async_subreq_finish() */
-    if (holder) {
-        /* One at a time: holds are refused while a subrequest runs */
+    async->holder = holder;
+    if (holder && REQUEST_HOLDER_IS_FILTER(holder)) {
+        /* One at a time: filters' holds are refused while a subrequest
+         * runs
+         */
         AP_DEBUG_ASSERT(!async->top->delegate);
-        async->holder = holder;
         async->top->delegate = async;
     }
     if (request_async_delegated(async)) {
@@ -2823,14 +2902,15 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
         /* Its continuations go on with it, then done */
         async->suspended = 1;
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE5, 0, rsub,
-                      "subrequest suspended%s", (holder) ? " (the work of a "
-                      "filter's delegated hold)" : "");
+                      "subrequest suspended%s%s%s", (holder) ? " (the work "
+                      "of " : "", (holder) ? holder->name : "",
+                      (holder) ? "'s delegated hold)" : "");
         return SUSPENDED;
     }
     status = async_subreq_finish(rsub, async, status);
     if (holder) {
-        /* Ended at once: the filter goes on in its call */
-        ap_filter_hold_undo(holder);
+        /* Ended at once: the holder goes on in its call */
+        holder->release(holder, AP_REQUEST_HOLD_UNDONE);
     }
     return status;
 }
