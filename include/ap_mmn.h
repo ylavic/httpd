@@ -869,6 +869,7 @@
  *                         ->end_status to http_core.h, and
  *                         ap_request_drop_holds() to http_request.h
  * 20260601.14 (2.5.1-dev) Add ap_filter_pending_more() to util_filter.h
+ * 20260601.15 (2.5.1-dev) Add ap_input_pending_held() to util_filter.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -876,7 +877,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 14    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 15    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

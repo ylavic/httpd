@@ -762,13 +762,22 @@ AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
 AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
 
 /**
- * The wait of a request filter holding its output on a context
+ * The wait of a request filter holding its output or input on a context
  * (ap_filter_pending_wait()) completed, core's own: the output walk calls
- * the filter again.
+ * an output filter again, an input filter is read again.
  * @param f The filter
  * @param status The wait's status, as given to a continuation
  */
 AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
+
+/**
+ * Whether a request input filter of the connection holds its input on a
+ * context (ap_filter_pending_wait()), core's own: the waits for the
+ * connection's input wait for that hold too.
+ * @param c The connection
+ * @return Non-zero if one does
+ */
+AP_CORE_DECLARE(int) ap_input_pending_held(conn_rec *c);
 
 /**
  * The core input_pending hook.

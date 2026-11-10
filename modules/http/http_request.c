@@ -680,8 +680,6 @@ static const char *const request_waitctx_kind_names[] = {
 /* The state of a context's waits in a direction */
 typedef struct {
     int waits;         /* registered so far, the next ones keep the pfd */
-    int pending_ready; /* answered OK for the filters' pending input, see
-                        * request_waitctx_check_ready() */
 } request_waitctx_dir_t;
 
 struct request_waitreg_t;
@@ -724,6 +722,8 @@ typedef struct request_waitctx_t {
  */
 #define REQUEST_WAIT_HELD_OUT (1u << 0)
 #define REQUEST_WAIT_DUE_OUT  (1u << 1)
+#define REQUEST_WAIT_HELD_IN  (1u << 2) /* the input held by a request
+                                         * filter, besides the descriptor */
 
 /* The directions of a wait's context polled on its descriptor */
 #define REQUEST_WAIT_POLLED(g, i) \
@@ -1218,7 +1218,8 @@ static const char *request_waitctx_dir_name(const request_waitctx_t *ctx,
  * input pending (or an error the read will report), no output pending (or
  * an error). For output still pending, *held tells what it waits for when
  * it's not room (POLLOUT): a held filter's wait (REQUEST_WAIT_HELD_OUT), or
- * a time (REQUEST_WAIT_DUE_OUT, *due).
+ * a time (REQUEST_WAIT_DUE_OUT, *due); for input not readable, whether a
+ * request filter holds input too (REQUEST_WAIT_HELD_IN).
  */
 static unsigned int request_waitctx_check_ready(request_waitctx_t *ctx,
                                                 unsigned int directions,
@@ -1232,18 +1233,15 @@ static unsigned int request_waitctx_check_ready(request_waitctx_t *ctx,
         return 0;
     }
     if (directions & AP_WAIT_IN) {
-        request_waitctx_dir_t *d = &ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)];
-
-        /* Input kept by the filters after the caller's last read said EAGAIN
-         * (e.g. mod_ssl's part of a line) is pending but not readable: after
-         * an OK for it, the next wait in this direction polls the socket.
+        /* Input kept by the filters but needing more (e.g. mod_ssl's part of
+         * a line, ap_filter_pending_more()) or held isn't readable: wait for
+         * the socket (and the hold)
          */
-        if (ap_check_input_pending(ctx->c) != OK && !d->pending_ready) {
-            d->pending_ready = 1;
+        if (ap_check_input_pending(ctx->c) != OK) {
             ready |= AP_WAIT_IN;
         }
-        else {
-            d->pending_ready = 0;
+        else if (ap_input_pending_held(ctx->c)) {
+            *held |= REQUEST_WAIT_HELD_IN;
         }
     }
     if (directions & AP_WAIT_OUT) {
@@ -1390,6 +1388,12 @@ static void request_waitset_drop(struct ap_request_waitset *w,
         request_waitreg_finish(g, (flags & REQUEST_WAITS_ENDING)
                                ? REQUEST_WAITREG_ENDING : REQUEST_WAITREG_DROPPED,
                                AP_MPM_WAIT_READY);
+        if (g->fn == request_filter_hold_continuation) {
+            /* A filter's hold goes with its wait (an input filter is read
+             * blocking from now on)
+             */
+            ap_filter_hold_done(g->baton, APR_EGENERAL);
+        }
         request_waitreg_put(w, g);
     }
 }
@@ -1612,7 +1616,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
             if (!ctx) {
                 continue;
             }
-            if (g->held[i] & REQUEST_WAIT_HELD_OUT) {
+            if (g->held[i] & (REQUEST_WAIT_HELD_OUT | REQUEST_WAIT_HELD_IN)) {
                 nheld++; /* completed by the hold's wait */
             }
             if (ctx->attached) {
@@ -1804,7 +1808,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             if (ready) {
                 continue; /* OK below: the next contexts are only checked */
             }
-            if (g->held[i] & REQUEST_WAIT_HELD_OUT) {
+            if (g->held[i] & (REQUEST_WAIT_HELD_OUT | REQUEST_WAIT_HELD_IN)) {
                 plan->held++;
             }
             if (g->held[i] & REQUEST_WAIT_DUE_OUT) {
@@ -1945,7 +1949,9 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
                       (g->held[i] & REQUEST_WAIT_HELD_OUT)
                       ? ", its output held by a filter"
                       : (g->held[i] & REQUEST_WAIT_DUE_OUT)
-                        ? ", its output paced by a filter" : "");
+                        ? ", its output paced by a filter"
+                        : (g->held[i] & REQUEST_WAIT_HELD_IN)
+                          ? ", its input held by a filter too" : "");
     }
     g->waiter = g->ctxs[0]->pub.r;
     g->fn = fn;
@@ -2233,13 +2239,16 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
     return APR_SUCCESS;
 }
 
-/* Complete the pending waits of a tree for c's output held by a request
- * filter (REQUEST_WAIT_HELD_OUT), as ready: that hold is over. Their
- * continuations are called next, from the continuation run in progress.
- * Returns how many.
+/* Complete the pending waits of a tree for c's output or input held by a
+ * request filter (REQUEST_WAIT_HELD_OUT or _IN, the direction given), as
+ * ready: that hold is over. Their continuations are called next, from the
+ * continuation run in progress. Returns how many.
  */
-static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c)
+static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c,
+                                     unsigned int direction)
 {
+    unsigned int bit = (direction == AP_WAIT_IN) ? REQUEST_WAIT_HELD_IN
+                                                 : REQUEST_WAIT_HELD_OUT;
     request_waitreg_t *g;
     int i, n = 0;
 
@@ -2249,9 +2258,8 @@ static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c)
         }
         for (i = 0; i < g->nctxs; i++) {
             request_waitctx_t *ctx = g->ctxs[i];
-            if (ctx && ctx->c == c
-                && (g->held[i] & REQUEST_WAIT_HELD_OUT)) {
-                ctx->ready |= AP_WAIT_OUT;
+            if (ctx && ctx->c == c && (g->held[i] & bit)) {
+                ctx->ready |= direction;
                 g->status = APR_SUCCESS;
                 g->completed = 1;
             }
@@ -2262,9 +2270,10 @@ static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c)
 }
 
 /* The continuation of a request filter's hold (ap_filter_pending_wait()):
- * the hold is over, the filter is called again by the next output walk:
- * the waits for the output it held complete (their continuations check the
- * output, which calls it), else the walk runs now.
+ * the hold is over. An output filter is called again by the next output
+ * walk: the waits for the output it held complete (their continuations
+ * check the output, which calls it), else the walk runs now. The waits for
+ * the input an input filter held complete, their continuations reading it.
  */
 static void request_filter_hold_continuation(request_rec *r,
                                              apr_status_t status,
@@ -2273,11 +2282,17 @@ static void request_filter_hold_continuation(request_rec *r,
     ap_filter_t *f = baton;
     conn_rec *c = r->connection;
     ap_request_async_t *async = request_async_get(r);
+    int input = (f->frec->direction == AP_FILTER_INPUT);
+    int n;
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE5, status, r,
-                  "the hold of '%s' output filter is over", f->frec->name);
+                  "the hold of '%s' %sput filter is over", f->frec->name,
+                  (input) ? "in" : "out");
     ap_filter_hold_done(f, status);
-    if (!async || !request_waitset_held_done(async->top->waitset, c)) {
+    n = (async) ? request_waitset_held_done(async->top->waitset, c,
+                                            (input) ? AP_WAIT_IN : AP_WAIT_OUT)
+                : 0;
+    if (!n && !input) {
         (void)ap_check_output_pending(c);
     }
 }
@@ -2310,7 +2325,9 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
               d->async_requests == AP_CORE_CONFIG_OFF)) {
         why = "AsyncRequests off";
     }
-    else if (async->phase != AP_REQUEST_PHASE_HANDLER && !async->hold_point) {
+    else if (async->phase != AP_REQUEST_PHASE_HANDLER
+             && (!async->hold_point
+                 || f->frec->direction == AP_FILTER_INPUT)) {
         why = "not at a hold point (the handlers, the request's end)";
     }
     else if (async->subreqs) {
@@ -2318,8 +2335,9 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
     }
     if (why) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
-                      "'%s' output filter can't hold its output: %s",
-                      f->frec->name, why);
+                      "'%s' %sput filter can't hold: %s", f->frec->name,
+                      (f->frec->direction == AP_FILTER_INPUT) ? "in" : "out",
+                      why);
         return DECLINED;
     }
     if (!ctx) {
@@ -2335,8 +2353,9 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
                       REQUEST_WAIT_BOUNDED | REQUEST_WAIT_AT_HOLD);
     if (rc == DECLINED) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
-                      "'%s' output filter can't hold its output: its wait "
-                      "is refused", f->frec->name);
+                      "'%s' %sput filter can't hold: its wait is refused",
+                      f->frec->name,
+                      (f->frec->direction == AP_FILTER_INPUT) ? "in" : "out");
     }
     return rc;
 }

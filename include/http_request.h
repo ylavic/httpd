@@ -725,9 +725,9 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  *         as ready), or pacing it until a time (this wait completes then,
  *         as ready, unless its own timeout is earlier). The caller checks
  *         the output again and waits again as usual.
- * @remark Input that the filters keep after the caller's last read returned
- *         EAGAIN (e.g. mod_ssl's part of a line) is pending but not readable:
- *         such a wait answers OK once, then waits.
+ * @remark Input that the filters keep but can't return without more input
+ *         (e.g. mod_ssl's part of a line, ap_filter_pending_more()) is not
+ *         readable: such a wait waits for the socket.
  * @remark ap_request_waitctx_ready() tells which directions are ready.
  * @remark A context is in one pending wait at a time (another wait on it
  *         is DECLINED): cancel the pending one first to wait otherwise
@@ -853,6 +853,20 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *         bound it.
  * @remark Don't release or destroy ctx while the hold is pending; removing
  *         the filter cancels its hold (and drops what it held).
+ * @remark A request input filter can hold its input too (e.g. validating
+ *         what it read before returning it, waiting for a backend of its
+ *         own), on a context only, keeping what it holds itself (bb NULL),
+ *         from a nonblocking read while the handlers run: it returns
+ *         EAGAIN (an empty brigade) meanwhile, its pending input isn't
+ *         readable (ap_check_input_pending()), and the waits for the
+ *         client's input (ap_request_wait(), ap_request_wait_body()) wait
+ *         for the hold as well as the socket: the hold's end completes them
+ *         (ready), and the consumer reads again, the filter returning what
+ *         it held. APR_EAGAIN if ctx is ready already (go on reading),
+ *         APR_EINVAL without a context or with bb. At the request's end
+ *         (the handlers done) an input hold is dropped with the other
+ *         waits: the filter is read blocking then (e.g. the body
+ *         discarded), ap_request_waitctx_ready(ctx) 0.
  */
 AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
                                                 apr_bucket_brigade *bb,

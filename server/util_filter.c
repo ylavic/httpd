@@ -1603,6 +1603,44 @@ AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
     }
 }
 
+/* An input filter holding its input until the wait of a context completes:
+ * its pending input isn't readable meanwhile, the waits for the client's
+ * input wait for the hold too (and the socket), the hold's end completes
+ * them (ap_filter_hold_done()), then the filter is read again.
+ */
+static apr_status_t filter_hold_input(ap_filter_t *f, apr_bucket_brigade *bb,
+                                      ap_request_waitctx_t *ctx,
+                                      unsigned int direction,
+                                      unsigned int flags)
+{
+    struct ap_filter_private *fp = f->priv;
+    int rc;
+
+    if (!ctx || (bb && !APR_BRIGADE_EMPTY(bb))) {
+        return APR_EINVAL; /* it keeps what it holds itself */
+    }
+    if (fp->why & FILTER_PENDING_HELD) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
+                      "'%s' input filter can't hold its input: it holds "
+                      "already", f->frec->name);
+        return APR_EBUSY;
+    }
+    rc = ap_request_filter_hold(f, ctx, direction, flags);
+    if (rc == OK) {
+        return APR_EAGAIN; /* ready already, go on */
+    }
+    if (rc != SUSPENDED) {
+        return APR_ENOTIMPL;
+    }
+    ap_filter_prepare_brigade(f);
+    fp->why |= FILTER_PENDING_HELD;
+    fp->ctx = ctx;
+    fp->held_status = APR_SUCCESS;
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
+                  "'%s' input filter holds its input", f->frec->name);
+    return APR_SUCCESS;
+}
+
 AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
                                                 apr_bucket_brigade *bb,
                                                 ap_request_waitctx_t *ctx,
@@ -1613,8 +1651,8 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
     apr_status_t rv;
     int rc;
 
-    if (f->frec->direction != AP_FILTER_OUTPUT) {
-        return APR_EINVAL;
+    if (f->frec->direction == AP_FILTER_INPUT) {
+        return filter_hold_input(f, bb, ctx, direction, flags);
     }
     if (fp->why) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
@@ -1665,11 +1703,12 @@ AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
     if (!notifier) {
         return ap_filter_pending_wait(f, bb, NULL, 0, 0);
     }
-    if (!f->r || f->frec->direction != AP_FILTER_OUTPUT) {
-        return (f->r) ? APR_EINVAL : APR_ENOTIMPL;
+    if (!f->r) {
+        return APR_ENOTIMPL;
     }
-    if (fp->why) {
-        return ap_filter_pending_wait(f, bb, fp->notifier_ctx, 0, 0); /* EBUSY */
+    if (fp->why & FILTER_PENDING_HELD
+        || (fp->why && f->frec->direction == AP_FILTER_OUTPUT)) {
+        return APR_EBUSY;
     }
     /* The context of the notifier given last, re-armed by its owner between
      * the waits, else a new one (once per notifier, in the request's pool)
@@ -1694,9 +1733,36 @@ AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status)
     struct ap_filter_private *fp = f->priv;
 
     if (fp->why & FILTER_PENDING_HELD) {
-        fp->held_done = 1;
+        if (f->frec->direction == AP_FILTER_INPUT) {
+            /* Read again (not called by the core) */
+            fp->why &= ~FILTER_PENDING_HELD;
+            fp->ctx = NULL;
+            pending_filter_unlink_request(fp);
+        }
+        else {
+            fp->held_done = 1;
+        }
         fp->held_status = status;
     }
+}
+
+AP_CORE_DECLARE(int) ap_input_pending_held(conn_rec *c)
+{
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+    struct ap_filter_private *fp;
+
+    if (!x || !x->pending_input_filters) {
+        return 0;
+    }
+    for (fp = APR_RING_FIRST(x->pending_input_filters);
+         fp != APR_RING_SENTINEL(x->pending_input_filters,
+                                 ap_filter_private, pending);
+         fp = APR_RING_NEXT(fp, pending)) {
+        if (fp->why & FILTER_PENDING_HELD) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
@@ -1759,8 +1825,8 @@ AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c)
          * needs more input for it (e.g. the start of a line)
          */
         AP_DEBUG_ASSERT(fp->bb);
-        if (fp->why & FILTER_PENDING_MORE) {
-            continue;
+        if (fp->why & (FILTER_PENDING_MORE | FILTER_PENDING_HELD)) {
+            continue; /* not readable (yet) */
         }
         e = APR_BRIGADE_FIRST(fp->bb);
         if (e != APR_BRIGADE_SENTINEL(fp->bb) && e->length != (apr_size_t)-1) {
