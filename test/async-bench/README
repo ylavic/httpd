@@ -203,6 +203,26 @@ checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   refused, the filter sleeping: the same responses), "async" also checks
   that no worker is held (mod_status). Ports 18460-18462.
 
+checks/async-filter-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Request filters delegating their holds to subrequests
+  (AP_FILTER_HOLD_DELEGATED, then ap_run_sub_req_async()) through mod_aptest's
+  AptestFilterSubreq filter (mod_aptest built as for async-wait-check): 1, 3
+  and 8 proxied subrequests in turn at a static file's EOS (captured, or
+  passed below the filter), 3 before the first data of 8 proxied streams on
+  4 threads (mid-stream, the producer paused), 16 clients on 4 threads, a
+  subrequest reaching its timeout (504), the work's timeout bounding the
+  request's end rather than Timeout (a subrequest whose own timeout is
+  longer than Timeout completing past it, one without a timeout getting
+  Timeout: 504), ap_die()'s 404 held by a protocol filter running one (the
+  second hold point), a subrequest's own filter (refused, blocking), the
+  core's checks of a filter running ap_run_sub_req_async() without a
+  delegated hold (run blocking, logged) and of a delegated hold without its
+  work (released, logged), pipelined requests, the core's invariants in the
+  error log and a graceful stop.
+  "sync" is AsyncRequests Off (the holds refused, the subrequests blocking:
+  the same responses), "async" also checks that no worker is held
+  (mod_status). Ports 18465-18466 (the backend's -addr on 18466).
+
 checks/async-pace-check.py PREFIX WORKDIR
   Paced output (ap_filter_pending_until()): mod_ratelimit (rate-limit
   200KB/s) pacing a 200KB static file and a proxied stream for 8 clients on
