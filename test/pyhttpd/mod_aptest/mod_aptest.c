@@ -154,6 +154,9 @@ typedef struct {
     int hold_proto;                 /* "proto": a protocol filter */
     aptest_fsubreq_conf fsubreq;    /* AptestFilterSubreq */
     aptest_thold_conf thold;        /* AptestTunnelHold */
+    int wantread;                   /* AptestWantRead: 1 on, -1 off, 0 unset
+                                     * (see "the connection filter wanting to
+                                     * read to write") */
 } aptest_dir_conf;
 
 /* AptestHold's modes */
@@ -245,6 +248,7 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
     }
     conf->fsubreq = (add->fsubreq.uri) ? add->fsubreq : base->fsubreq;
     conf->thold = (add->thold.dirs) ? add->thold : base->thold;
+    conf->wantread = (add->wantread) ? add->wantread : base->wantread;
     return conf;
 }
 
@@ -472,6 +476,12 @@ static const char *aptest_set_hold(cmd_parms *cmd, void *dconf,
     }
     return NULL;
 }
+
+static const char *aptest_set_wantread(cmd_parms *cmd, void *dconf, int on)
+{
+    ((aptest_dir_conf *)dconf)->wantread = (on) ? 1 : -1;
+    return NULL;
+}
 #endif /* APTEST_HAS_HOLD */
 
 #ifdef APTEST_HAS_FSUBREQ
@@ -618,6 +628,9 @@ static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE_ARGV("AptestHold", aptest_set_hold, NULL, OR_ALL,
                       "how the holding filters hold: timer|notifier|chunk|"
                       "input <ms> [proto] or room <bytes>"),
+    AP_INIT_FLAG("AptestWantRead", aptest_set_wantread, NULL, OR_ALL,
+                 "the connection filter keeps the response until the client "
+                 "sends a byte, wanting to read meanwhile"),
 #endif
 #ifdef APTEST_HAS_FSUBREQ
     AP_INIT_TAKE_ARGV("AptestFilterSubreq", aptest_set_fsubreq, NULL, OR_ALL,
@@ -3381,6 +3394,105 @@ static void aptest_fsubreq_insert(request_rec *r)
 }
 #endif /* APTEST_HAS_FSUBREQ */
 
+#ifdef APTEST_HAS_HOLD
+/*
+ * The connection filter wanting to read to write ("AptestWantRead on"), as
+ * mod_ssl when SSL_write() wants to read (e.g. a TLS renegotiation): it keeps
+ * the response of the requests arming it (the insert_filter hook, the filter
+ * added once per connection), as pending output until the request's end
+ * (EOR) so that the MPM's write completion calls it, then asks the MPM to poll
+ * for input (CONN_SENSE_WANT_READ) until the client sends a byte, which it
+ * consumes, and passes the response. Its calls until then are logged
+ * (aptest:info): a few, unless the MPM polls for output meanwhile (a spin).
+ */
+static ap_filter_rec_t *aptest_wantread_handle;
+
+typedef struct {
+    int armed;
+    int ended;  /* the request's end (EOR) kept */
+    int calls;
+} aptest_wantread_t;
+
+/* Whether the client sent something (or closed), one byte consumed */
+static int aptest_wantread_got(conn_rec *c)
+{
+    apr_socket_t *s = ap_get_conn_socket(c);
+    apr_pollfd_t pfd;
+    apr_int32_t n = 0;
+    apr_size_t len = 1;
+    char byte;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = c->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.reqevents = APR_POLLIN;
+    pfd.desc.s = s;
+    if (apr_poll(&pfd, 1, &n, 0) != APR_SUCCESS || n < 1) {
+        return 0;
+    }
+    (void)apr_socket_recv(s, &byte, &len);
+    return 1;
+}
+
+static apr_status_t aptest_wantread_filter(ap_filter_t *f,
+                                           apr_bucket_brigade *bb)
+{
+    aptest_wantread_t *w = f->ctx;
+    apr_status_t rv;
+
+    if (!w->armed) {
+        return ap_pass_brigade(f->next, bb);
+    }
+    w->calls++;
+    rv = ap_filter_reinstate_brigade(f, bb, NULL);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+    if (!w->ended) {
+        apr_bucket *b;
+
+        for (b = APR_BRIGADE_FIRST(bb); b != APR_BRIGADE_SENTINEL(bb);
+             b = APR_BUCKET_NEXT(b)) {
+            if (AP_BUCKET_IS_EOR(b)) {
+                w->ended = 1;
+            }
+        }
+        return ap_filter_setaside_brigade(f, bb);
+    }
+    if (!aptest_wantread_got(f->c)) {
+        if (f->c->cs) {
+            f->c->cs->sense = CONN_SENSE_WANT_READ;
+        }
+        return ap_filter_setaside_brigade(f, bb);
+    }
+    ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, f->c, APLOGNO()
+                  "aptest-wantread: calls=%d", w->calls);
+    w->armed = 0;
+    w->ended = 0;
+    w->calls = 0;
+    return ap_pass_brigade(f->next, bb);
+}
+
+static void aptest_wantread_insert(request_rec *r)
+{
+    const aptest_dir_conf *conf = ap_get_module_config(r->per_dir_config,
+                                                       &aptest_module);
+    conn_rec *c = r->connection;
+    aptest_wantread_t *w;
+
+    if (r->main || conf->wantread <= 0) {
+        return;
+    }
+    w = ap_get_module_config(c->conn_config, &aptest_module);
+    if (!w) {
+        w = apr_pcalloc(c->pool, sizeof(*w));
+        ap_set_module_config(c->conn_config, &aptest_module, w);
+        ap_add_output_filter_handle(aptest_wantread_handle, w, r, c);
+    }
+    w->armed = 1;
+}
+#endif /* APTEST_HAS_HOLD */
+
 #ifdef APTEST_HAS_THOLD
 /*
  * The tunnel forward hook holding its direction ("AptestTunnelHold
@@ -3748,6 +3860,11 @@ static void aptest_hooks(apr_pool_t *pool)
                                                      aptest_hold_in_filter,
                                                      NULL,
                                                      AP_FTYPE_CONTENT_SET);
+    ap_hook_insert_filter(aptest_wantread_insert, NULL, NULL, APR_HOOK_MIDDLE);
+    aptest_wantread_handle = ap_register_output_filter("APTEST_WANTREAD",
+                                                       aptest_wantread_filter,
+                                                       NULL,
+                                                       AP_FTYPE_CONNECTION);
 #endif
 #ifdef APTEST_HAS_FSUBREQ
     ap_hook_insert_filter(aptest_fsubreq_insert, NULL, NULL, APR_HOOK_MIDDLE);

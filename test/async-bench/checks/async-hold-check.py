@@ -3,7 +3,9 @@ through mod_aptest's holding filters ("AptestHold"): a static file's EOS held
 on a timer and on a notifier by many clients on few threads, then by two
 filters of a request in turn, each on a notifier of its own, a burst of
 new connections waiting for a worker longer than Timeout (served late, not
-dropped), a proxied
+dropped), a connection filter wanting to read to write (the response kept
+until the client sends a byte, the MPM polling for input, not spinning on
+output), a proxied
 response streamed through a filter holding each chunk (the producer backing
 off), a large response passed in pieces held for room to a crawling reader,
 ap_die()'s error response held by a protocol filter (the request's second
@@ -51,6 +53,7 @@ TIMEOUT = 2       # Timeout (s)
 HOLD = 0.4        # the holds at the EOS (s)
 GRACE_HOLD = 1.5  # the holds pending at a graceful stop (s), under Timeout
 CHUNK_HOLD = 0.05 # each chunk's hold (s)
+WANTREAD = 0.5    # how long the client sends nothing to a filter wanting to read (s)
 FILE_SIZE = 100000
 BIG_SIZE = 1 << 20
 
@@ -77,7 +80,7 @@ FILES = {
     "big.bin": bytes([(i * 7) % 251 for i in range(BIG_SIZE)]),
 }
 # The files, at the top and under each holding location
-for d in ("", "timer", "notifier", "twice", "long", "grace", "room", "proto"):
+for d in ("", "timer", "notifier", "twice", "long", "grace", "room", "proto", "wantread"):
     os.makedirs(os.path.join(docs, d), exist_ok=True)
     for name, data in FILES.items():
         with open(os.path.join(docs, d, name), "wb") as f:
@@ -136,6 +139,9 @@ ProxyAsyncDelay 0
 <Location "/twice/">
     AptestHold notifier {hold_ms}
     SetOutputFilter APTEST_HOLD_PROTO
+</Location>
+<Location "/wantread/">
+    AptestWantRead on
 </Location>
 <Location "/long/">
     AptestHold timer 5000
@@ -420,6 +426,36 @@ for mode in os.environ.get("MODES", "sync async").split():
                       "%.2fs, statuses %s, bodies %s: %s"
                       % (mode, n, late, TIMEOUT, t, sorted(set(str(r[0]) for r in res)),
                          "same" if same else "DIFFER", verdict(ok)))
+
+        # A connection filter wanting to read to write (as mod_ssl when
+        # SSL_write() wants to read): the response kept until the client sends
+        # a byte, the MPM polling for input meanwhile, not for output (a spin:
+        # the filter called again and again)
+        log0 = len(errlog())
+        s = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+        try:
+            s.sendall(b"GET /wantread/file.txt HTTP/1.1\r\nHost: x\r\n"
+                      b"Connection: close\r\n\r\n")
+            s.settimeout(WANTREAD)
+            try:
+                early = len(s.recv(65536))
+            except socket.timeout:
+                early = 0
+            s.settimeout(30)
+            t0 = time.monotonic()
+            s.sendall(b"x")
+            st, _, body, _ = recv_response(s)
+            t = time.monotonic() - t0
+        finally:
+            s.close()
+        time.sleep(0.2)
+        calls = [int(m) for m in re.findall(r"aptest-wantread: calls=(\d+)", errlog()[log0:])]
+        ok = (early == 0 and st == 200 and body == FILES["file.txt"] and len(calls) == 1
+              and calls[0] <= 8 and t < 1)
+        report.append("%s: a connection filter wanting to read for %.1fs: %d bytes before, "
+                      "%s and %s %d bytes %.2fs after the client's byte, filter calls %s: %s"
+                      % (mode, WANTREAD, early, st, "the same" if body == FILES["file.txt"]
+                         else "DIFFERENT", len(body), t, calls, verdict(ok)))
 
         # Each chunk of a proxied streamed response held (mid-stream holds)
         n = 8

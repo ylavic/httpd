@@ -193,7 +193,11 @@ checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   Request filters holding their output or input (ap_filter_pending_wait())
   through mod_aptest's AptestHold filters (mod_aptest built as for
   async-wait-check): a static file's EOS held on a timer and on a notifier
-  by 16 clients on 4 threads, each chunk of a proxied stream held (the
+  by 16 clients on 4 threads, then by two filters of a request in turn, a
+  burst of connections waiting for a worker longer than Timeout (served late,
+  none reset), a connection filter wanting to read to write (AptestWantRead:
+  the MPM polling for input, not spinning on output), each chunk of a
+  proxied stream held (the
   backend's -addr on port 18462), a 1MB response passed in pieces held for
   room to crawling readers, ap_die()'s 404 held by a protocol filter (the
   second hold point), request bodies held by an input filter while the core's
@@ -201,7 +205,7 @@ checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   nothing more on the socket), holds refused while a subrequest writes
   through the filter, pipelined requests, TLS, a hold longer than Timeout
   (given up, the connection closed), the core's invariants in the error log
-  and a graceful stop while holding. "sync" is AsyncRequests Off (the holds
+  and a graceful stop while holding (shorter than Timeout: answered). "sync" is AsyncRequests Off (the holds
   refused, the filter sleeping: the same responses), "async" also checks
   that no worker is held (mod_status). Ports 18460-18462.
 
