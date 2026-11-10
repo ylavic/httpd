@@ -395,6 +395,9 @@ static int char_buffer_read(bio_filter_in_ctx_t *inctx, char *in, int inl)
         return 0;
     }
 
+    /* What's left is readable, unless saved again as a partial line */
+    ap_filter_pending_more(inctx->filter_ctx->pInputFilter, 0);
+
     if (inl > avail) {
         inl = avail;
     }
@@ -422,6 +425,8 @@ static int char_buffer_write(bio_filter_in_ctx_t *inctx, char *in, int inl)
     if (buf->b->length) {
         char_buffer_insert(inctx);
     }
+    /* Readable, unless a partial line (ssl_io_input_getline()) */
+    ap_filter_pending_more(inctx->filter_ctx->pInputFilter, 0);
 
     return inl;
 }
@@ -894,8 +899,12 @@ static apr_status_t ssl_io_input_getline(bio_filter_in_ctx_t *inctx,
 
         if (status != APR_SUCCESS) {
             if (APR_STATUS_IS_EAGAIN(status) && (*len > 0)) {
-                /* Save the part of the line we already got */
+                /* Save the part of the line we already got, which the next
+                 * read can't return until more input comes: not readable
+                 * input for the pending check (ap_check_input_pending())
+                 */
                 char_buffer_write(inctx, buf, *len);
+                ap_filter_pending_more(inctx->filter_ctx->pInputFilter, 1);
             }
             return status;
         }
