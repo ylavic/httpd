@@ -1727,7 +1727,10 @@ static int proxy_http_response_body(proxy_http_req_t *req)
                     break;
                 }
                 apr_brigade_cleanup(bb);
-                if (ap_filter_should_yield(c->output_filters)) {
+                /* The request's filters too: one may hold or pace its
+                 * output (the client's wait is for that then)
+                 */
+                if (ap_filter_should_yield(r->output_filters)) {
                     rc = proxy_http_response_body_wait(req,
                                                        AP_PROXY_CLIENT_OUT, 0);
                 }
@@ -1896,9 +1899,11 @@ static int proxy_http_response_body(proxy_http_req_t *req)
         apr_brigade_cleanup(pass_bb);
         apr_brigade_cleanup(bb);
 
-        if (!finish && req->can_suspend && ap_filter_should_yield(c->output_filters)) {
-            /* The client is slower than the backend: wait for it to drain
-             * the pending output before reading more (backpressure).
+        if (!finish && req->can_suspend
+            && ap_filter_should_yield(r->output_filters)) {
+            /* The client is slower than the backend (or a request filter
+             * holds or paces the output): wait for it to drain the pending
+             * output before reading more (backpressure).
              */
             rc = proxy_http_response_body_wait(req, AP_PROXY_CLIENT_OUT, 0);
             if (rc == SUSPENDED) {
