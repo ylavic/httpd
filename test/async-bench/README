@@ -187,6 +187,22 @@ checks/async-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   "async" also checks that no worker is held (mod_status). Ports
   18455-18456.
 
+checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Request filters holding their output or input (ap_filter_pending_wait())
+  through mod_aptest's AptestHold filters (mod_aptest built as for
+  async-wait-check): a static file's EOS held on a timer and on a notifier
+  by 16 clients on 4 threads, each chunk of a proxied stream held (the
+  backend's -addr on port 18462), a 1MB response passed in pieces held for
+  room to crawling readers, ap_die()'s 404 held by a protocol filter (the
+  second hold point), request bodies held by an input filter while the core's
+  body reader and mod_proxy wait for the client (completed by the hold, with
+  nothing more on the socket), holds refused while a subrequest writes
+  through the filter, pipelined requests, TLS, a hold longer than Timeout
+  (given up, the connection closed), the core's invariants in the error log
+  and a graceful stop while holding. "sync" is AsyncRequests Off (the holds
+  refused, the filter sleeping: the same responses), "async" also checks
+  that no worker is held (mod_status). Ports 18460-18462.
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
