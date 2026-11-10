@@ -1,6 +1,7 @@
 """Check request filters holding their output or input (ap_filter_pending_wait())
 through mod_aptest's holding filters ("AptestHold"): a static file's EOS held
-on a timer and on a notifier by many clients on few threads, a proxied
+on a timer and on a notifier by many clients on few threads, then by two
+filters of a request in turn, each on a notifier of its own, a proxied
 response streamed through a filter holding each chunk (the producer backing
 off), a large response passed in pieces held for room to a crawling reader,
 ap_die()'s error response held by a protocol filter (the request's second
@@ -74,7 +75,7 @@ FILES = {
     "big.bin": bytes([(i * 7) % 251 for i in range(BIG_SIZE)]),
 }
 # The files, at the top and under each holding location
-for d in ("", "timer", "notifier", "long", "grace", "room", "proto"):
+for d in ("", "timer", "notifier", "twice", "long", "grace", "room", "proto"):
     os.makedirs(os.path.join(docs, d), exist_ok=True)
     for name, data in FILES.items():
         with open(os.path.join(docs, d, name), "wb") as f:
@@ -129,6 +130,10 @@ ProxyAsyncDelay 0
 </Location>
 <Location "/notifier/">
     AptestHold notifier {hold_ms}
+</Location>
+<Location "/twice/">
+    AptestHold notifier {hold_ms}
+    SetOutputFilter APTEST_HOLD_PROTO
 </Location>
 <Location "/long/">
     AptestHold timer 5000
@@ -376,6 +381,30 @@ for mode in os.environ.get("MODES", "sync async").split():
                           "bodies %s, holds/refused/sleeps/failed %s: %s"
                           % (mode, n, kind, HOLD * 1000, t, busy,
                              "same" if same else "DIFFER", tot, verdict(ok)))
+
+        # Two holding filters in one request, each on a notifier of its own
+        # attached to the request's: the EOS held by one, then by the other
+        # (8 clients: the sync ones queued for a worker stay under Timeout)
+        n = 8
+        log0 = len(errlog())
+        sampler = Sampler(HOLD, 3, HOLD / 4)
+        res, t = parallel(n, lambda i: get("/twice/file.txt?i=%d" % i))
+        busy = sampler.held()
+        time.sleep(0.2)
+        log = errlog()[log0:]
+        tot1, _ = holds_logged(log, "aptest_hold")
+        tot2, _ = holds_logged(log, "aptest_hold_proto")
+        same = all(r == (200, FILES["file.txt"]) for r in res)
+        if asyn:
+            ok = (same and t < HOLD * 4 and busy <= 1 and tot1[0] == n and tot2[0] == n
+                  and tot1[1] == 0 and tot2[1] == 0 and tot1[3] == 0 and tot2[3] == 0)
+        else:
+            ok = (same and t >= 2 * HOLD * n / THREADS * 0.9 and tot1[2] == n
+                  and tot2[2] == n)
+        report.append("%s: %d clients, the EOS held by two filters on notifiers of %dms: %.2fs, "
+                      "workers held %s, statuses %s, bodies %s, holds/refused/sleeps/failed %s and %s: %s"
+                      % (mode, n, HOLD * 1000, t, busy, sorted(set(str(r[0]) for r in res)),
+                         "same" if same else "DIFFER", tot1, tot2, verdict(ok)))
 
         # Each chunk of a proxied streamed response held (mid-stream holds)
         n = 8
