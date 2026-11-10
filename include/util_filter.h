@@ -649,9 +649,15 @@ AP_DECLARE(int) ap_filter_should_yield(ap_filter_t *f);
  * filters, and if so, attempts to make a single write to each filter
  * with pending data.
  *
+ * AGAIN has the output's meaning: something is still pending in the
+ * filters, so the caller waits for what that output waits for (the
+ * connection to be writable) before writing more; it doesn't mean that
+ * something can be done now.
+ *
  * @param c The connection.
- * @return OK if no pending data remain, AGAIN if some remain, DONE
- * if the connection is aborted, anything else on error.
+ * @return OK if no pending data remain, AGAIN if some remain (wait for
+ * their targets), DONE if the connection is aborted, anything else on
+ * error.
  */
 AP_DECLARE(int) ap_check_output_pending(conn_rec *c);
 
@@ -660,19 +666,25 @@ AP_DECLARE(int) ap_check_output_pending(conn_rec *c);
  * filters. Pending data is data that has been read from the underlying
  * socket but not yet returned to the application.
  *
+ * AGAIN has the input's meaning, the opposite of the output's: data can be
+ * read now without the socket being readable, so the caller reads rather
+ * than waiting for the socket.
+ *
  * @param c The connection.
- * @return OK if no pending data remain, AGAIN if some remain, DONE
- * if the connection is aborted, anything else on error.
+ * @return OK if no pending data remain (wait for the socket before
+ * reading), AGAIN if some remain (readable now), DONE if the connection is
+ * aborted, anything else on error.
  */
 AP_DECLARE(int) ap_check_input_pending(conn_rec *c);
 
 /**
  * Hook called to determine whether we should stay within the write completion
- * phase.
+ * phase, i.e. whether some output is still pending in the filters.
  * @param c The current connection
- * @return OK if we can write without blocking, AGAIN if a write would block,
- * DECLINED to let the next hook decide, DONE if the connection is aborted,
- * anything else on error.
+ * @return OK if no output is pending (writing more won't wait for previous
+ * output), AGAIN if some is pending (wait for the connection to be writable
+ * before writing more), DECLINED to let the next hook decide, DONE if the
+ * connection is aborted, anything else on error.
  * @ingroup hooks
  */
 AP_DECLARE_HOOK(int, output_pending, (conn_rec *c))
@@ -680,9 +692,10 @@ AP_DECLARE_HOOK(int, output_pending, (conn_rec *c))
 /**
  * Hook called to determine whether any data is pending in the input filters.
  * @param c The current connection
- * @return OK if we can read without blocking, AGAIN if a read would block,
- * DECLINED to let the next hook decide, DONE if the connection is aborted,
- * anything else on error.
+ * @return OK if no input is pending (a read would wait for the socket),
+ * AGAIN if some is pending and readable without the socket (read it rather
+ * than waiting), DECLINED to let the next hook decide, DONE if the connection
+ * is aborted, anything else on error.
  * @ingroup hooks
  */
 AP_DECLARE_HOOK(int, input_pending, (conn_rec *c))
