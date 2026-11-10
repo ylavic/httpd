@@ -202,6 +202,18 @@ struct ssi_internal_ctx {
     ap_expr_eval_ctx_t *expr_eval_ctx;  /* NULL if there wasn't an ap_expr yet */
     const char         *expr_vary_this; /* for use by ap_expr_eval_ctx */
     const char         *expr_err;       /* for use by ap_expr_eval_ctx */
+
+    /* An include virtual run without holding the thread (the filter's hold
+     * delegated to its subrequest): the output before it and the rest of
+     * the document kept until it's done, then the include directive goes on
+     */
+    int                 include_state;  /* INCLUDE_* */
+    request_rec        *include_rr;     /* the subrequest */
+    char               *include_tag_val;
+    char               *include_last_error;
+    int                 include_status; /* its final status, from done */
+    apr_bucket_brigade *include_pass;   /* the output before it */
+    apr_bucket_brigade *include_rest;   /* the rest, parsed after it */
 #ifdef DEBUG_INCLUDE
     struct {
         ap_filter_t *f;
@@ -209,6 +221,11 @@ struct ssi_internal_ctx {
     } debug;
 #endif
 };
+
+/* ssi_internal_ctx->include_state */
+#define INCLUDE_NONE    0
+#define INCLUDE_RUNNING 1 /* suspended, the filter's hold delegated to it */
+#define INCLUDE_DONE    2 /* done, the filter called again next */
 
 
 /*
@@ -1781,11 +1798,52 @@ static apr_status_t handle_comment(include_ctx_t *ctx, ap_filter_t *f,
  * virtual url. If onerror fails, or no onerror is present, the default
  * error string is inserted into the stream.
  */
+/* The done function of an include virtual's subrequest that suspended: its
+ * status for the include directive, which goes on when the filter is called
+ * again
+ */
+static void include_virtual_done(request_rec *rr, int status, void *baton)
+{
+    include_ctx_t *ctx = baton;
+
+    ctx->intern->include_status = status;
+    ctx->intern->include_state = INCLUDE_DONE;
+}
+
+/* Run an include virtual's subrequest without holding the thread when the
+ * filter can delegate its hold to it (else blocking, as ap_run_sub_req()):
+ * SUSPENDED if it suspended, the filter keeping what it has to output until
+ * it's done (include_virtual_done()), else its final status
+ */
+static int include_virtual_run(include_ctx_t *ctx, ap_filter_t *f,
+                               request_rec *rr)
+{
+    int status;
+
+    if (ap_filter_pending_wait(f, NULL, NULL, 0, AP_FILTER_HOLD_DELEGATED)
+        != APR_SUCCESS) {
+        return ap_run_sub_req(rr);
+    }
+    status = ap_run_sub_req_async(rr, 0, include_virtual_done, ctx);
+    if (status == SUSPENDED) {
+        ctx->intern->include_state = INCLUDE_RUNNING;
+        ctx->intern->include_rr = rr;
+    }
+    return status;
+}
+
 static apr_status_t handle_include(include_ctx_t *ctx, ap_filter_t *f,
                                    apr_bucket_brigade *bb)
 {
     request_rec *r = f->r;
+    struct ssi_internal_ctx *intern = ctx->intern;
     char *last_error;
+    int resumed = 0;
+
+    if (intern->include_state == INCLUDE_DONE) {
+        /* Its include virtual is done: the directive goes on */
+        resumed = 1;
+    }
 
     if (!ctx->argc) {
         ap_log_rerror(APLOG_MARK,
@@ -1805,7 +1863,7 @@ static apr_status_t handle_include(include_ctx_t *ctx, ap_filter_t *f,
         return APR_SUCCESS;
     }
 
-    last_error = NULL;
+    last_error = (resumed) ? intern->include_last_error : NULL;
     while (1) {
         char *tag     = NULL;
         char *tag_val = NULL;
@@ -1814,6 +1872,19 @@ static apr_status_t handle_include(include_ctx_t *ctx, ap_filter_t *f,
         char *parsed_string;
         apr_status_t rv = APR_SUCCESS;
         int status = 0;
+
+        if (resumed) {
+            resumed = 0;
+            rr = intern->include_rr;
+            tag_val = intern->include_tag_val;
+            status = intern->include_status;
+            intern->include_state = INCLUDE_NONE;
+            intern->include_rr = NULL;
+            if (status) {
+                error_fmt = "unable to include \"%s\" in parsed file %s, subrequest returned %d";
+            }
+            goto ran;
+        }
 
         ap_ssi_get_tag_and_value(ctx, &tag, &tag_val, SSI_VALUE_DECODED);
         if (!tag || !tag_val) {
@@ -1877,10 +1948,27 @@ static apr_status_t handle_include(include_ctx_t *ctx, ap_filter_t *f,
             ap_set_module_config(rr->request_config, &include_module, r);
         }
 
-        if (!error_fmt && ((status = ap_run_sub_req(rr)))) {
-            error_fmt = "unable to include \"%s\" in parsed file %s, subrequest returned %d";
+        if (!error_fmt) {
+            if (tag[0] == 'f') {
+                status = ap_run_sub_req(rr);
+            }
+            else {
+                status = include_virtual_run(ctx, f, rr);
+                if (status == SUSPENDED) {
+                    /* Goes on from here when done (the filter called
+                     * again)
+                     */
+                    intern->include_tag_val = tag_val;
+                    intern->include_last_error = last_error;
+                    return APR_SUCCESS;
+                }
+            }
+            if (status) {
+                error_fmt = "unable to include \"%s\" in parsed file %s, subrequest returned %d";
+            }
         }
 
+ran:
         if (error_fmt) {
             /* Intentional no APLOGNO */
             /* error text is also sent to client */
@@ -3407,6 +3495,21 @@ static apr_size_t find_argument(include_ctx_t *ctx, const char *data,
 /*
  * This is the main loop over the current bucket brigade.
  */
+/* Keep a brigade's buckets in *kept (made once, in the request's pool),
+ * set aside, while an include virtual runs
+ */
+static apr_status_t include_keep(ap_filter_t *f, apr_bucket_brigade **kept,
+                                 apr_bucket_brigade *bb)
+{
+    apr_status_t rv;
+
+    if (!*kept) {
+        *kept = apr_brigade_create(f->r->pool, f->c->bucket_alloc);
+    }
+    rv = ap_save_brigade(f, kept, &bb, f->r->pool);
+    return APR_STATUS_IS_ENOTIMPL(rv) ? APR_SUCCESS : rv;
+}
+
 static apr_status_t send_parsed_content(ap_filter_t *f, apr_bucket_brigade *bb)
 {
     include_ctx_t *ctx = f->ctx;
@@ -3417,20 +3520,41 @@ static apr_status_t send_parsed_content(ap_filter_t *f, apr_bucket_brigade *bb)
     apr_status_t rv = APR_SUCCESS;
     char *magic; /* magic pointer for sentinel use */
 
-    /* fast exit */
-    if (APR_BRIGADE_EMPTY(bb)) {
-        return APR_SUCCESS;
-    }
-
-    /* we may crash, since already cleaned up; hand over the responsibility
-     * to the next filter;-)
-     */
-    if (intern->seen_eos) {
-        return ap_pass_brigade(f->next, bb);
+    if (intern->include_state == INCLUDE_RUNNING) {
+        /* More while an include virtual runs: kept behind the rest */
+        if (APR_BRIGADE_EMPTY(bb)) {
+            return APR_SUCCESS;
+        }
+        return include_keep(f, &intern->include_rest, bb);
     }
 
     /* All stuff passed along has to be put into that brigade */
     pass_bb = apr_brigade_create(ctx->pool, f->c->bucket_alloc);
+
+    if (intern->include_state == INCLUDE_DONE) {
+        /* Called again once the include virtual is done: the output before
+         * it, then the rest from the include directive on (whose execution
+         * goes on)
+         */
+        APR_BRIGADE_CONCAT(pass_bb, intern->include_pass);
+        APR_BRIGADE_PREPEND(bb, intern->include_rest);
+        b = APR_BRIGADE_FIRST(bb);
+    }
+    else {
+        /* fast exit */
+        if (APR_BRIGADE_EMPTY(bb)) {
+            apr_brigade_destroy(pass_bb);
+            return APR_SUCCESS;
+        }
+
+        /* we may crash, since already cleaned up; hand over the
+         * responsibility to the next filter;-)
+         */
+        if (intern->seen_eos) {
+            apr_brigade_destroy(pass_bb);
+            return ap_pass_brigade(f->next, bb);
+        }
+    }
 
     /* initialization for this loop */
     intern->bytes_read = 0;
@@ -3741,6 +3865,19 @@ static apr_status_t send_parsed_content(ap_filter_t *f, apr_bucket_brigade *bb)
                         apr_brigade_destroy(pass_bb);
                         return rv;
                     }
+                    if (intern->include_state == INCLUDE_RUNNING) {
+                        /* An include virtual suspended (the filter's hold
+                         * delegated to it): what's to be output and the
+                         * rest from this directive on (b) are kept until
+                         * it's done, its output passed first
+                         */
+                        rv = include_keep(f, &intern->include_pass, pass_bb);
+                        if (rv == APR_SUCCESS) {
+                            rv = include_keep(f, &intern->include_rest, bb);
+                        }
+                        apr_brigade_destroy(pass_bb);
+                        return rv;
+                    }
                 }
                 else {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01371)
@@ -3907,6 +4044,19 @@ static apr_status_t includes_filter(ap_filter_t *f, apr_bucket_brigade *b)
         intern->undefined_echo = conf->undefined_echo ? conf->undefined_echo :
                                  DEFAULT_UNDEFINED_ECHO;
         intern->undefined_echo_len = strlen(intern->undefined_echo);
+
+        intern->include_state = INCLUDE_NONE;
+        intern->include_rr = NULL;
+        intern->include_tag_val = NULL;
+        intern->include_last_error = NULL;
+        intern->include_status = 0;
+        intern->include_pass = NULL;
+        intern->include_rest = NULL;
+    }
+    else if (((include_ctx_t *)f->ctx)->intern->include_state
+             != INCLUDE_NONE) {
+        /* An include virtual running or done: the environment's set */
+        return send_parsed_content(f, b);
     }
 
     if ((parent = ap_get_module_config(r->request_config, &include_module))) {
