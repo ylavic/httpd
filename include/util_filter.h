@@ -780,6 +780,18 @@ AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
 AP_CORE_DECLARE(int) ap_input_pending_held(conn_rec *c);
 
 /**
+ * The number of filter calls in progress on a connection (ap_get_brigade(),
+ * ap_pass_brigade(), nested), core's own: non-zero when the code calling it
+ * runs from a filter, which can't return SUSPENDED up.
+ * @param c The connection
+ * @param calls The number to set if not negative (e.g. zero while the
+ *        handlers of a subrequest run from a filter, then the previous
+ *        number back), else unchanged
+ * @return The number before
+ */
+AP_CORE_DECLARE(int) ap_filter_calls(conn_rec *c, int calls);
+
+/**
  * The core input_pending hook.
  */
 AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c);

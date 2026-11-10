@@ -116,6 +116,11 @@ struct ap_filter_conn_ctx {
     unsigned int out_why;
     apr_time_t out_due;
 
+    /* The filter calls in progress (ap_get_brigade(), ap_pass_brigade()),
+     * nested: non-zero when code runs from a filter (ap_filter_calls())
+     */
+    int calls;
+
     struct spare_ring *spare_containers,
                       *spare_brigades,
                       *spare_filters,
@@ -815,8 +820,14 @@ AP_DECLARE(apr_status_t) ap_get_brigade(ap_filter_t *next,
                                         apr_off_t readbytes)
 {
     if (next) {
-        return next->frec->filter_func.in_func(next, bb, mode, block,
-                                               readbytes);
+        struct ap_filter_conn_ctx *x = get_conn_ctx(next->c);
+        apr_status_t rv;
+
+        x->calls++;
+        rv = next->frec->filter_func.in_func(next, bb, mode, block,
+                                             readbytes);
+        x->calls--;
+        return rv;
     }
     return AP_NOBODY_READ;
 }
@@ -831,6 +842,8 @@ AP_DECLARE(apr_status_t) ap_pass_brigade(ap_filter_t *next,
 {
     if (next) {
         apr_bucket *e = APR_BRIGADE_LAST(bb);
+        struct ap_filter_conn_ctx *x;
+        apr_status_t rv;
 
         if (e != APR_BRIGADE_SENTINEL(bb) && APR_BUCKET_IS_EOS(e) && next->r) {
             /* This is only safe because HTTP_HEADER filter is always in
@@ -853,9 +866,24 @@ AP_DECLARE(apr_status_t) ap_pass_brigade(ap_filter_t *next,
                 }
             }
         }
-        return next->frec->filter_func.out_func(next, bb);
+        x = get_conn_ctx(next->c);
+        x->calls++;
+        rv = next->frec->filter_func.out_func(next, bb);
+        x->calls--;
+        return rv;
     }
     return AP_NOBODY_WROTE;
+}
+
+AP_CORE_DECLARE(int) ap_filter_calls(conn_rec *c, int calls)
+{
+    struct ap_filter_conn_ctx *x = get_conn_ctx(c);
+    int old = x->calls;
+
+    if (calls >= 0) {
+        x->calls = calls;
+    }
+    return old;
 }
 
 /* Pass the buckets to the next filter in the filter stack
