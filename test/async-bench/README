@@ -181,8 +181,10 @@ checks/async-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   requests behind requests running subrequests, many clients on few threads,
   mod_auth_form's replay of a login form's request (the subrequest suspended
   by AptestSuspend), the error log and a graceful stop during subrequests;
-  then mod_include's include virtual of a proxied URL, blocking in both
-  modes (a thread held: from a filter, phase B's), with the same output.
+  then mod_include's include virtual of a proxied URL, from its filter with
+  the filter's hold delegated to the subrequest (no worker held in
+  "async"), and two includes in a document, the second one's onerror run
+  after it fails, with the same output.
   "sync" is AsyncRequests Off (the subrequests block: the same responses),
   "async" also checks that no worker is held (mod_status). Ports
   18455-18456.

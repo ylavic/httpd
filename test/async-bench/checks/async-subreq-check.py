@@ -13,9 +13,10 @@ request as a subrequest (here suspended by AptestSuspend), and a graceful
 stop during subrequests. "sync"
 runs them with AsyncRequests Off (the subrequests block: the same responses,
 the threads held), "async" with the waits in the MPM (no thread held while a
-subrequest waits). Then mod_include's include virtual of a proxied URL, which
-stays blocking in both modes (a thread held: mod_include runs its subrequests
-from a filter, which can't suspend), with the same output.
+subrequest waits). Then mod_include's include virtual of a proxied URL, run
+from its filter with the filter's hold delegated to the subrequest (no
+thread held in "async"), and a document with two includes, the second one's
+onerror include run after the first include fails, with the same output.
 
 mod_aptest is built from ../../pyhttpd/mod_aptest with the install's apxs
 into WORKDIR unless MOD_APTEST_SO is given.
@@ -66,6 +67,9 @@ FILES = {
     "long/file.txt": b"long\n",
     "af/file.txt": b"replayed after the login form\n",
     "inc/index.shtml": b'before\n<!--#include virtual="/p/x?d=%d" -->\nafter\n' % INC_MS,
+    "inc/two.shtml": b'a\n<!--#include virtual="/p/x?d=%d" -->\nb\n'
+                     b'<!--#include virtual="/nothere.txt" onerror="/p/x?d=%d" -->\nc\n'
+                     % (INC_MS, INC_MS),
 }
 for name, data in FILES.items():
     os.makedirs(os.path.dirname(os.path.join(docs, name)), exist_ok=True)
@@ -532,21 +536,31 @@ for mode in os.environ.get("MODES", "sync async").split():
         report.append("%s: %d login forms replayed by mod_auth_form at once: %ss, workers held "
                       "%s, replays suspended %d: %s" % (mode, n, t, busy, replays, verdict(ok)))
 
-        # mod_include's include virtual of a proxied URL: blocking in both
-        # modes (from the INCLUDES filter), the same output
+        # mod_include's include virtual of a proxied URL, from the INCLUDES
+        # filter: its hold delegated to the subrequest (async), blocking
+        # (sync), the same output
+        before = log()
         st, body, hdr, t = get("/inc/index.shtml")
-        case("include virtual of a proxied URL (mod_include, blocking)", st, body, None,
+        case("include virtual of a proxied URL (mod_include)", st, body, None,
              st == 200 and body == b"before\n" + BACKEND_BODY + b"\nafter\n")
-        # (one thread left for mod_status' requests)
+        st, body, hdr, t = get("/inc/two.shtml")
+        inc_errors = log()[len(before):].count("unable to include")
+        case("two includes, the second one's onerror after it fails (mod_include)", st,
+             body, None, st == 200 and inc_errors == 1
+             and body == b"a\n" + BACKEND_BODY + b"\nb\n" + BACKEND_BODY + b"\nc\n",
+             " [include errors logged %d]" % inc_errors)
+        # (one thread left for mod_status' requests when blocking)
         wait_idle()
-        n = THREADS - 1
+        n = 8 if is_async else THREADS - 1
         smp = Sampler([INC_MS / 3000.0, INC_MS / 2000.0])
         res, t = parallel(n, lambda i: get("/inc/index.shtml?i=%d" % i))
         busy = smp.held()
         ok = all(r[0] == 200 and r[1] == b"before\n" + BACKEND_BODY + b"\nafter\n"
-                 for r in res) and busy == n
+                 for r in res)
+        ok = ok and busy is not None and (busy <= 1 if is_async else busy == n)
         report.append("%s: %d include virtual of a proxied URL at once: %ss, workers held %s "
-                      "(blocking, phase B's): %s" % (mode, n, t, busy, verdict(ok)))
+                      "(%s): %s" % (mode, n, t, busy, "delegated holds" if is_async
+                                    else "blocking", verdict(ok)))
 
         # Many clients on THREADS threads (as many as don't wait for a worker
         # longer than Timeout when blocking): no worker held while the
@@ -575,7 +589,7 @@ for mode in os.environ.get("MODES", "sync async").split():
             "crashes": text.count("exit signal"),
             "errors": sum(1 for l in text.splitlines()
                           if (":error]" in l or ":crit]" in l or ":emerg]" in l)
-                          and "MaxRequestWorkers" not in l) - sto_errors,
+                          and "MaxRequestWorkers" not in l) - sto_errors - inc_errors,
             "timeout case's errors (mod_proxy's)": sto_errors,
         }
         report.append("%s: error_log: %s: %s"
