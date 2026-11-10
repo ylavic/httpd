@@ -887,6 +887,9 @@
  *                         ap_request_async_t->holder is an
  *                         ap_request_holder_t; ap_filter_hold_delegate()
  *                         removed from util_filter.h
+ * 20260601.20 (2.5.1-dev) Add AP_PROXY_TUNNEL_HOLD_BOTH,
+ *                         ap_proxy_tunnel_hold() and
+ *                         ap_proxy_tunnel_hold_status() to mod_proxy.h
  * 20260601.22 (2.5.1-dev) Add ap_request_holder_t.timeout to http_request.h
  */
 
@@ -895,7 +898,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 19    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 20    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

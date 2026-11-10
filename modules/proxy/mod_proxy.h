@@ -1871,17 +1871,93 @@ PROXY_DECLARE(apr_off_t) ap_proxy_tunnel_conn_bytes_out(
  * the origin. Each hook receives incoming buckets in bb and produces outgoing
  * buckets in the same bb, much like an output filter.
  * @param tunnel   the tunnel
- * @param c        the connection the data are going to
+ * @param c_i      the connection the data come from
+ * @param c_o      the connection the data are going to
  * @param bb       the incoming data
  * @return         OK/DECLINED to pass to the next hooks, DONE to not pass to
- *                 the next hooks, an HTTP_ error on failure.
- * @note A hook must not return DONE unless it consumes/sets-aside *all* the
- *       incoming buckets, and it must produce (non-meta-)data buckets only.
+ *                 the next hooks, SUSPENDED once the hook holds the
+ *                 direction (ap_proxy_tunnel_hold()), an HTTP_ error on
+ *                 failure.
+ * @note A hook must not return DONE nor SUSPENDED unless it
+ *       consumes/sets-aside *all* the incoming buckets, and it must produce
+ *       (non-meta-)data buckets only.
+ * @note When a hold is over the hooks are called again for its direction
+ *       with an empty bb (the holder producing what it held, if anything):
+ *       a hook not holding passes an empty bb through.
+ * @note Data a hook sends on its own (e.g. a protocol's closing frames
+ *       passed to c_i's or c_o's output filters) end with a WC bucket, not
+ *       a FLUSH one: a FLUSH blocks the thread until written.
  */
 PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, tunnel_forward,
                             (proxy_tunnel_rec *tunnel,
                              conn_rec *c_i, conn_rec *c_o,
                              apr_bucket_brigade *bb))
+
+/** Flag for ap_proxy_tunnel_hold(): pause the other direction too */
+#define AP_PROXY_TUNNEL_HOLD_BOTH (1u << 0)
+
+/**
+ * Hold a direction of an asynchronous tunnel (ap_proxy_tunnel_run_ex())
+ * from a tunnel_forward hook, until the wait of a context completes (e.g.
+ * a service checking what the hook was passed, a notifier of another
+ * thread), without holding a thread meanwhile: the hook keeps what it holds
+ * (set aside in its own pool), returns SUSPENDED with bb empty, and is
+ * called again for that direction when the wait completes, with an empty
+ * bb, producing what it held (or holding again). The tunnel reads no more
+ * from c_i meanwhile, but keeps writing what was forwarded already, and
+ * the other direction keeps flowing unless AP_PROXY_TUNNEL_HOLD_BOTH.
+ * @param tunnel     the tunnel
+ * @param c_i        the connection the direction's data come from (the
+ *                   hook's c_i)
+ * @param ctx        the context whose wait releases the hold, of the
+ *                   tunnel's request (ap_request_waitctx_*()), not the
+ *                   client's (the tunnel's own)
+ * @param direction  AP_WAIT_IN or AP_WAIT_OUT for a connection or a
+ *                   descriptor, ignored by a timer or a notifier
+ * @param flags      AP_PROXY_TUNNEL_HOLD_BOTH or 0
+ * @return APR_SUCCESS: held, the hook returns SUSPENDED; APR_EAGAIN: ctx is
+ *         ready already (not held, go on); APR_ENOTIMPL: the tunnel runs
+ *         synchronously (no done callback, the request can't suspend, or
+ *         the tunnel fell back to synchronous) or the wait is refused: the
+ *         hook does its work blocking; APR_EBUSY: the direction is held
+ *         already; APR_EINVAL: not from a tunnel_forward hook of c_i's
+ *         direction, or a context of another request.
+ * @remark The hold's outcome, when the hook is called again:
+ *         ap_proxy_tunnel_hold_status().
+ * @remark Every hold is bounded: a context giving no timeout (e.g. a
+ *         notifier's) gets the tunnel's idle timeout (the server's Timeout
+ *         if the tunnel has none) for the hold's wait, the hook called
+ *         again with APR_TIMEUP when it's reached.
+ * @remark While a direction is held its idle time doesn't count: the
+ *         tunnel's idle timeout doesn't end the tunnel meanwhile, and runs
+ *         again from the hold's end.
+ * @remark The tunnel ending meanwhile (an error, a side closing with
+ *         nohalfclose, its done callback called) cancels the hold's wait:
+ *         the hook isn't called again, its context and what it holds are
+ *         its own to release (e.g. with its pool).
+ * @remark If the asynchronous tunnel falls back to synchronous meanwhile,
+ *         the hook is called again with APR_ENOTIMPL (its hold's wait
+ *         canceled): it finishes its work blocking.
+ */
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
+                                                 conn_rec *c_i,
+                                                 ap_request_waitctx_t *ctx,
+                                                 unsigned int direction,
+                                                 unsigned int flags);
+
+/**
+ * The outcome of a tunnel direction's last hold (ap_proxy_tunnel_hold()),
+ * for its tunnel_forward hook called again.
+ * @param tunnel  the tunnel
+ * @param c_i     the connection the direction's data come from
+ * @return APR_SUCCESS: the hold's wait completed (ready) or none was held;
+ *         APR_TIMEUP: its timeout was reached; APR_ENOTIMPL: the tunnel
+ *         runs synchronously from now on (finish blocking); APR_EGENERAL:
+ *         the MPM failed to wait (the tunnel ends); APR_EINVAL: c_i is
+ *         neither side of the tunnel.
+ */
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold_status(const proxy_tunnel_rec *tunnel,
+                                                        const conn_rec *c_i);
 
 /**
  * Clear the headers referenced by the Connection header from the given
