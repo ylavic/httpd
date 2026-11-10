@@ -6746,7 +6746,6 @@ PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
     tcs[0] = tunnel->client;
     tcs[1] = tunnel->origin;
     for (;;) {
-        apr_off_t moved = tunnel->client->bytes_in + tunnel->origin->bytes_in;
         int pending = 0;
 
         for (i = 0; i < 2; i++) {
@@ -6788,12 +6787,12 @@ PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
         }
 
         /* Data held by the input filters (e.g. what TLS decrypted already)
-         * is not reported by any poll: process it now rather than waiting,
-         * unless this pass moved nothing (e.g. a partial record set aside by
-         * a filter, more is needed from the network), not to spin.
+         * is not reported by any poll: process it now rather than waiting.
+         * Only readable input counts (not what a filter keeps until more
+         * comes from the network, ap_filter_pending_more()), so this
+         * doesn't spin.
          */
-        for (i = 0; i < 2 && moved != (tunnel->client->bytes_in
-                                       + tunnel->origin->bytes_in); i++) {
+        for (i = 0; i < 2; i++) {
             if ((tcs[i]->pfd->reqevents & APR_POLLIN)
                 && ap_check_input_pending(tcs[i]->c) == AGAIN) {
                 pending = 1;
