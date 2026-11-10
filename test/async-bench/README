@@ -203,6 +203,17 @@ checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
   refused, the filter sleeping: the same responses), "async" also checks
   that no worker is held (mod_status). Ports 18460-18462.
 
+checks/async-pace-check.py PREFIX WORKDIR
+  Paced output (ap_filter_pending_until()): mod_ratelimit (rate-limit
+  200KB/s) pacing a 200KB static file and a proxied stream for 8 clients on
+  4 threads (the rate kept, no worker held), a FLUSH reaching it (mod_proxy
+  streaming blocking with ProxyAsyncDelay -1: it sleeps as before),
+  mod_dialup's pulses a second apart (V.92) on timer waits, pipelined paced
+  responses in order, and the core's invariants in the error log. "sync" is
+  AsyncRequests Off (the filters sleep: the same bytes and rates), "async"
+  also checks that no worker is held (mod_status). Ports 18463-18464 (the
+  backend's -addr on 18464).
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
