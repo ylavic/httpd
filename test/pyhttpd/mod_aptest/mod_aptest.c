@@ -58,6 +58,11 @@
 #define APTEST_WAIT_NO_FLAGS 0
 #endif
 
+/* Request filters holding their output or input (ap_filter_pending_wait()) */
+#if AP_MODULE_MAGIC_AT_LEAST(20260601, 15)
+#define APTEST_HAS_HOLD 1
+#endif
+
 /* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
 typedef struct {
     int set;
@@ -85,7 +90,20 @@ typedef struct {
     int subreq_capture;             /* "captured", else "passed" */
     int subreq_declined;            /* "declined", else "ok" */
     apr_interval_time_t subreq_timeout; /* "timeout <ms>", else 0 */
+    int hold_mode;                  /* APTEST_HOLD_* (AptestHold, see "the
+                                     * holding filters") */
+    apr_interval_time_t hold_time;  /* how long a hold lasts */
+    apr_size_t hold_size;           /* "room": the pieces passed */
+    int hold_proto;                 /* "proto": a protocol filter */
 } aptest_dir_conf;
+
+/* AptestHold's modes */
+#define APTEST_HOLD_UNSET    0
+#define APTEST_HOLD_TIMER    1 /* at the EOS, on a timer */
+#define APTEST_HOLD_NOTIFIER 2 /* at the EOS, on a notifier */
+#define APTEST_HOLD_CHUNK    3 /* each brigade with data, on a timer */
+#define APTEST_HOLD_ROOM     4 /* pieces passed, held for room */
+#define APTEST_HOLD_INPUT    5 /* each input read, on a timer */
 
 /* AptestBody's modes */
 #define APTEST_BODY_UNSET   0
@@ -153,6 +171,18 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
         conf->subreq_capture = base->subreq_capture;
         conf->subreq_declined = base->subreq_declined;
         conf->subreq_timeout = base->subreq_timeout;
+    }
+    if (add->hold_mode != APTEST_HOLD_UNSET) {
+        conf->hold_mode = add->hold_mode;
+        conf->hold_time = add->hold_time;
+        conf->hold_size = add->hold_size;
+        conf->hold_proto = add->hold_proto;
+    }
+    else {
+        conf->hold_mode = base->hold_mode;
+        conf->hold_time = base->hold_time;
+        conf->hold_size = base->hold_size;
+        conf->hold_proto = base->hold_proto;
     }
     return conf;
 }
@@ -341,6 +371,48 @@ static const char *aptest_set_subreq(cmd_parms *cmd, void *dconf,
 }
 #endif /* APTEST_HAS_SUBREQ */
 
+#ifdef APTEST_HAS_HOLD
+static const char *aptest_set_hold(cmd_parms *cmd, void *dconf,
+                                   int argc, char *const argv[])
+{
+    static const char *const modes[] = {
+        "", "timer", "notifier", "chunk", "room", "input", NULL
+    };
+    aptest_dir_conf *conf = dconf;
+    apr_int64_t n;
+    int i;
+
+    if (argc < 2 || !apr_isdigit(*argv[1])) {
+        return "AptestHold timer|notifier|chunk|input <ms> [proto] "
+               "or room <bytes>";
+    }
+    for (i = 1; modes[i]; i++) {
+        if (strcmp(argv[0], modes[i]) == 0) {
+            break;
+        }
+    }
+    if (!modes[i]) {
+        return apr_pstrcat(cmd->pool, "AptestHold: unknown mode ", argv[0],
+                           NULL);
+    }
+    conf->hold_mode = i;
+    n = apr_atoi64(argv[1]);
+    conf->hold_time = 0;
+    conf->hold_size = 0;
+    if (i == APTEST_HOLD_ROOM) {
+        conf->hold_size = (n > 0) ? (apr_size_t)n : 1;
+    }
+    else {
+        conf->hold_time = apr_time_from_msec(n);
+    }
+    conf->hold_proto = (argc > 2 && strcmp(argv[2], "proto") == 0);
+    if (argc > 3 || (argc > 2 && !conf->hold_proto)) {
+        return "AptestHold: unknown option";
+    }
+    return NULL;
+}
+#endif /* APTEST_HAS_HOLD */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
@@ -363,6 +435,11 @@ static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE_ARGV("AptestSubreq", aptest_set_subreq, NULL, OR_ALL,
                       "the subrequests run before the handlers: <uri> <n> "
                       "passed|captured [ok|declined] [timeout <ms>]"),
+#endif
+#ifdef APTEST_HAS_HOLD
+    AP_INIT_TAKE_ARGV("AptestHold", aptest_set_hold, NULL, OR_ALL,
+                      "how the holding filters hold: timer|notifier|chunk|"
+                      "input <ms> [proto] or room <bytes>"),
 #endif
     {NULL}
 };
@@ -2543,6 +2620,330 @@ respond:
 }
 #endif /* APTEST_HAS_PFDFLAGS */
 
+#ifdef APTEST_HAS_HOLD
+/*
+ * The holding filters ("AptestHold"), request filters holding their output
+ * or input without holding the thread (ap_filter_pending_wait()), inserted
+ * by the insert_filter hook:
+ *  - "timer <ms>": the output filter keeps the EOS (and what comes with
+ *    it) and holds it on a timer context of ms, then passes it;
+ *  - "notifier <ms>": the same on a notifier, notified by a thread after ms
+ *    (ap_filter_pending_notify(), the notifier re-armed for each hold);
+ *  - "chunk <ms>": each brigade with data is held on the timer, then passed
+ *    (holds mid-stream, the producer backing off meanwhile);
+ *  - "room <bytes>": what it's passed goes on in pieces of bytes with a WC
+ *    bucket each, the rest held for room when the filters after it have
+ *    pending output (ap_filter_pending_wait() without a context, the rest
+ *    given to the core to hold);
+ *  - "input <ms>": the input filter keeps what each nonblocking read gets
+ *    and holds it on the timer (EAGAIN meanwhile), then returns it.
+ * With "proto" the output filter is a protocol filter (AP_FTYPE_PROTOCOL):
+ * it sees ap_die()'s error responses too (the second hold point). A hold
+ * refused (e.g. AsyncRequests Off, a subrequest of the request in progress)
+ * or not made (a FLUSH bucket) sleeps ms instead, as a synchronous filter
+ * would: the same bytes in every mode. What each filter did is logged at
+ * the request's end (aptest:info): holds, refusals, sleeps.
+ */
+static ap_filter_rec_t *aptest_hold_handle;
+static ap_filter_rec_t *aptest_hold_proto_handle;
+static ap_filter_rec_t *aptest_hold_in_handle;
+
+typedef struct {
+    ap_filter_t *f;
+    const aptest_dir_conf *conf;
+    apr_bucket_brigade *kept;      /* what it holds itself */
+    ap_request_waitctx_t *timer;  /* made once */
+#if APR_HAS_THREADS
+    ap_mpm_notifier_t *notifier;   /* made once, re-armed for each hold */
+    apr_thread_t *thread;          /* notifying it */
+#endif
+    int holds, refused, sleeps, failed;
+    unsigned int holding :1;
+} aptest_hold_t;
+
+static apr_status_t aptest_hold_report(void *data)
+{
+    aptest_hold_t *h = data;
+
+    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, h->f->r, APLOGNO()
+                  "aptest-hold: '%s' filter: holds=%d refused=%d sleeps=%d "
+                  "failed=%d", h->f->frec->name, h->holds, h->refused,
+                  h->sleeps, h->failed);
+    return APR_SUCCESS;
+}
+
+#if APR_HAS_THREADS
+static void *APR_THREAD_FUNC aptest_hold_thread(apr_thread_t *thd, void *data)
+{
+    aptest_hold_t *h = data;
+
+    apr_sleep(h->conf->hold_time);
+    ap_mpm_notify(h->notifier);
+    apr_thread_exit(thd, APR_SUCCESS);
+    return NULL;
+}
+
+static apr_status_t aptest_hold_join(void *data)
+{
+    aptest_hold_t *h = data;
+    apr_status_t rv;
+
+    if (h->thread) {
+        apr_thread_join(&rv, h->thread);
+        h->thread = NULL;
+    }
+    return APR_SUCCESS;
+}
+#endif
+
+static aptest_hold_t *aptest_hold_get(ap_filter_t *f)
+{
+    aptest_hold_t *h = f->ctx;
+    request_rec *r = f->r;
+
+    if (!h) {
+        f->ctx = h = apr_pcalloc(r->pool, sizeof(*h));
+        h->f = f;
+        h->conf = ap_get_module_config(r->per_dir_config, &aptest_module);
+        h->kept = apr_brigade_create(r->pool, f->c->bucket_alloc);
+        h->timer = ap_request_waitctx_timer(r, r->pool);
+        apr_pool_cleanup_register(r->pool, h, aptest_hold_report,
+                                  apr_pool_cleanup_null);
+#if APR_HAS_THREADS
+        apr_pool_pre_cleanup_register(r->pool, h, aptest_hold_join);
+#endif
+    }
+    return h;
+}
+
+/* Hold on the timer or the notifier: APR_SUCCESS if held */
+static apr_status_t aptest_hold_wait(aptest_hold_t *h)
+{
+    apr_status_t rv;
+
+#if APR_HAS_THREADS
+    if (h->conf->hold_mode == APTEST_HOLD_NOTIFIER) {
+        aptest_hold_join(h);
+        if (!h->notifier) {
+            rv = ap_mpm_notifier_create(&h->notifier, h->f->c, h->f->r->pool);
+            if (rv != APR_SUCCESS) {
+                h->notifier = NULL;
+                return rv;
+            }
+        }
+        else if ((rv = ap_mpm_notifier_rearm(h->notifier)) != APR_SUCCESS) {
+            return rv;
+        }
+        rv = ap_filter_pending_notify(h->f, NULL, h->notifier);
+        if (rv == APR_SUCCESS) {
+            rv = apr_thread_create(&h->thread, NULL, aptest_hold_thread, h,
+                                   h->f->r->pool);
+            if (rv != APR_SUCCESS) {
+                h->thread = NULL;
+                ap_mpm_notify(h->notifier); /* the hold ends at once */
+                rv = APR_SUCCESS;
+            }
+        }
+        return rv;
+    }
+#endif
+    h->timer->timeout = h->conf->hold_time;
+    return ap_filter_pending_wait(h->f, NULL, h->timer, 0, 0);
+}
+
+static apr_status_t aptest_hold_room(aptest_hold_t *h, apr_bucket_brigade *bb)
+{
+    ap_filter_t *f = h->f;
+    apr_bucket *e;
+    apr_status_t rv;
+
+    while (!APR_BRIGADE_EMPTY(bb)) {
+        rv = apr_brigade_partition(bb, h->conf->hold_size, &e);
+        if (rv != APR_SUCCESS && rv != APR_INCOMPLETE) {
+            return rv;
+        }
+        apr_brigade_split_ex(bb, e, h->kept);
+        if (!APR_BRIGADE_EMPTY(h->kept)) {
+            APR_BRIGADE_INSERT_TAIL(bb, ap_bucket_wc_create(f->c->bucket_alloc));
+        }
+        rv = ap_pass_brigade(f->next, bb);
+        apr_brigade_cleanup(bb);
+        if (rv != APR_SUCCESS) {
+            apr_brigade_cleanup(h->kept);
+            return rv;
+        }
+        APR_BRIGADE_CONCAT(bb, h->kept);
+        if (!APR_BRIGADE_EMPTY(bb) && ap_filter_should_yield(f->next)) {
+            rv = ap_filter_pending_wait(f, bb, NULL, 0, 0);
+            if (rv == APR_SUCCESS) {
+                h->holds++;
+                return APR_SUCCESS;
+            }
+            if (rv != APR_EAGAIN) {
+                h->refused++;
+            }
+        }
+    }
+    return APR_SUCCESS;
+}
+
+static apr_status_t aptest_hold_filter(ap_filter_t *f, apr_bucket_brigade *bb)
+{
+    aptest_hold_t *h = aptest_hold_get(f);
+    int want = 0, flush = 0, eos = 0, data = 0;
+    apr_bucket *e;
+    apr_status_t rv;
+
+    if (h->conf->hold_mode == APTEST_HOLD_ROOM) {
+        return aptest_hold_room(h, bb);
+    }
+    if (h->holding) {
+        if (!APR_BRIGADE_EMPTY(bb)) {
+            /* More from a producer not backing off: behind what's held
+             * (metadata buckets without setaside are kept as is)
+             */
+            rv = ap_save_brigade(f, &h->kept, &bb, f->r->pool);
+            return APR_STATUS_IS_ENOTIMPL(rv) ? APR_SUCCESS : rv;
+        }
+        /* Called again by the core (an empty brigade): what's held goes on,
+         * as is
+         */
+        h->holding = 0;
+        if (h->conf->hold_mode != APTEST_HOLD_NOTIFIER
+            && !ap_request_waitctx_ready(h->timer)) {
+            h->failed++;
+        }
+        APR_BRIGADE_CONCAT(bb, h->kept);
+        return ap_pass_brigade(f->next, bb);
+    }
+    for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+         e = APR_BUCKET_NEXT(e)) {
+        if (APR_BUCKET_IS_EOS(e)) {
+            eos = 1;
+        }
+        else if (APR_BUCKET_IS_FLUSH(e) && !AP_BUCKET_IS_WC(e)) {
+            flush = 1;
+        }
+        else if (!APR_BUCKET_IS_METADATA(e)) {
+            data = 1;
+        }
+    }
+    switch (h->conf->hold_mode) {
+    case APTEST_HOLD_CHUNK:
+        want = data;
+        break;
+    case APTEST_HOLD_TIMER:
+    case APTEST_HOLD_NOTIFIER:
+        want = eos;
+        break;
+    }
+    if (want && !flush) {
+        rv = ap_save_brigade(f, &h->kept, &bb, f->r->pool);
+        if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+            return rv;
+        }
+        rv = aptest_hold_wait(h);
+        if (rv == APR_SUCCESS) {
+            h->holds++;
+            h->holding = 1;
+            return APR_SUCCESS;
+        }
+        h->refused++;
+        APR_BRIGADE_CONCAT(bb, h->kept);
+    }
+    if (want) {
+        h->sleeps++;
+        apr_sleep(h->conf->hold_time);
+    }
+    return ap_pass_brigade(f->next, bb);
+}
+
+static apr_status_t aptest_hold_in_filter(ap_filter_t *f,
+                                          apr_bucket_brigade *bb,
+                                          ap_input_mode_t mode,
+                                          apr_read_type_e block,
+                                          apr_off_t readbytes)
+{
+    aptest_hold_t *h = aptest_hold_get(f);
+    apr_status_t rv;
+    apr_bucket *e;
+    int data = 0;
+
+    if (mode != AP_MODE_READBYTES) {
+        return ap_get_brigade(f->next, bb, mode, block, readbytes);
+    }
+    if (h->holding) {
+        if (!ap_request_waitctx_ready(h->timer) && block == APR_NONBLOCK_READ) {
+            return APR_EAGAIN; /* still held */
+        }
+        h->holding = 0;
+    }
+    if (APR_BRIGADE_EMPTY(h->kept)) {
+        rv = ap_get_brigade(f->next, h->kept, mode, block, readbytes);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        for (e = APR_BRIGADE_FIRST(h->kept);
+             e != APR_BRIGADE_SENTINEL(h->kept); e = APR_BUCKET_NEXT(e)) {
+            if (!APR_BUCKET_IS_METADATA(e)) {
+                data = 1;
+            }
+        }
+        if (data) {
+            /* What's read is checked before it's returned */
+            for (e = APR_BRIGADE_FIRST(h->kept);
+                 e != APR_BRIGADE_SENTINEL(h->kept); e = APR_BUCKET_NEXT(e)) {
+                rv = apr_bucket_setaside(e, f->r->pool);
+                if (APR_STATUS_IS_ENOTIMPL(rv)) {
+                    const char *str;
+                    apr_size_t len;
+                    rv = apr_bucket_read(e, &str, &len, APR_BLOCK_READ);
+                    if (rv == APR_SUCCESS) {
+                        rv = apr_bucket_setaside(e, f->r->pool);
+                    }
+                }
+                if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+                    return rv;
+                }
+            }
+            if (block == APR_NONBLOCK_READ) {
+                h->timer->timeout = h->conf->hold_time;
+                rv = ap_filter_pending_wait(f, NULL, h->timer, 0, 0);
+                if (rv == APR_SUCCESS) {
+                    h->holds++;
+                    h->holding = 1;
+                    return APR_EAGAIN;
+                }
+                h->refused++;
+            }
+            h->sleeps++;
+            apr_sleep(h->conf->hold_time);
+        }
+    }
+    APR_BRIGADE_CONCAT(bb, h->kept);
+    return APR_SUCCESS;
+}
+
+static void aptest_hold_insert(request_rec *r)
+{
+    const aptest_dir_conf *conf = ap_get_module_config(r->per_dir_config,
+                                                       &aptest_module);
+
+    if (r->main || conf->hold_mode == APTEST_HOLD_UNSET) {
+        return;
+    }
+    if (conf->hold_mode == APTEST_HOLD_INPUT) {
+        ap_add_input_filter_handle(aptest_hold_in_handle, NULL, r,
+                                   r->connection);
+    }
+    else {
+        ap_add_output_filter_handle(conf->hold_proto ? aptest_hold_proto_handle
+                                                     : aptest_hold_handle,
+                                    NULL, r, r->connection);
+    }
+}
+#endif /* APTEST_HAS_HOLD */
+
 /* Install this module into the apache2 infrastructure.
  */
 static void aptest_hooks(apr_pool_t *pool)
@@ -2579,6 +2980,20 @@ static void aptest_hooks(apr_pool_t *pool)
                                                       aptest_capture_filter,
                                                       NULL,
                                                       AP_FTYPE_RESOURCE);
+#endif
+#ifdef APTEST_HAS_HOLD
+    ap_hook_insert_filter(aptest_hold_insert, NULL, NULL, APR_HOOK_MIDDLE);
+    aptest_hold_handle = ap_register_output_filter("APTEST_HOLD",
+                                                   aptest_hold_filter, NULL,
+                                                   AP_FTYPE_CONTENT_SET);
+    aptest_hold_proto_handle = ap_register_output_filter("APTEST_HOLD_PROTO",
+                                                         aptest_hold_filter,
+                                                         NULL,
+                                                         AP_FTYPE_PROTOCOL);
+    aptest_hold_in_handle = ap_register_input_filter("APTEST_HOLD_IN",
+                                                     aptest_hold_in_filter,
+                                                     NULL,
+                                                     AP_FTYPE_CONTENT_SET);
 #endif
 
 }
