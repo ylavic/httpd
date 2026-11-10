@@ -890,6 +890,33 @@ AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
                                                   struct ap_mpm_notifier_t *notifier);
 
 /**
+ * Pace the output of a request in one of its output filters: hold it until
+ * a time, as ap_filter_pending_wait() holds it until a wait completes. The
+ * filter keeps what it holds itself and returns APR_SUCCESS; once the time
+ * is reached the core's output walk calls it with a WC bucket (it passes
+ * what's due without blocking, and paces again for the rest). The producers
+ * back off meanwhile (ap_filter_should_yield()), their waits for the
+ * client's output being for that time rather than for room (a timer), and
+ * the request's end waits for it (at both hold points). E.g. a rate limit
+ * not sleeping between its chunks.
+ * @param f The filter: a request filter (f->r) of a top-level request
+ * @param when The time (apr_time_now() base) the filter passes more
+ * @return APR_SUCCESS: paced (a filter paced already gets the new time);
+ *         APR_EAGAIN: when has passed already (go on passing);
+ *         APR_ENOTIMPL: the output can't be paced so (as
+ *         ap_filter_pending_wait()'s refusals, logged at debug): the filter
+ *         sleeps as without this function; APR_EBUSY: f holds its output
+ *         on a wait or for room already.
+ * @remark FLUSH keeps its meaning: a filter passed a FLUSH bucket paces
+ *         what comes before it blocking (it sleeps), without this function.
+ * @remark Request filters only for now (APR_EINVAL for input filters,
+ *         APR_ENOTIMPL for connection filters): a time is a request's wait
+ *         target only, not write completion's.
+ */
+AP_DECLARE(apr_status_t) ap_filter_pending_until(ap_filter_t *f,
+                                                 apr_time_t when);
+
+/**
  * Whether a request filter can hold its output now, and if so, with ctx
  * not NULL, make the hold's wait (ap_request_wait() on ctx), whose
  * continuation releases the hold (ap_filter_hold_done()), core's own (for

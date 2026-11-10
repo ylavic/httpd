@@ -1728,6 +1728,36 @@ AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
     return ap_filter_pending_wait(f, bb, fp->notifier_ctx, 0, 0);
 }
 
+AP_DECLARE(apr_status_t) ap_filter_pending_until(ap_filter_t *f,
+                                                 apr_time_t when)
+{
+    struct ap_filter_private *fp = f->priv;
+
+    if (f->frec->direction != AP_FILTER_OUTPUT) {
+        return APR_EINVAL;
+    }
+    if (fp->why & (FILTER_PENDING_HELD | FILTER_PENDING_ROOM)) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
+                      "'%s' output filter can't pace its output: it holds "
+                      "already", f->frec->name);
+        return APR_EBUSY;
+    }
+    if (when <= apr_time_now()) {
+        return APR_EAGAIN; /* due already */
+    }
+    if (!(fp->why & FILTER_PENDING_DUE)
+        && ap_request_filter_hold(f, NULL, 0, 0) != OK) {
+        return APR_ENOTIMPL;
+    }
+    ap_filter_prepare_brigade(f);
+    fp->why = FILTER_PENDING_DUE;
+    fp->due = when;
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
+                  "'%s' output filter paces its output: due in %" APR_TIME_T_FMT
+                  "us", f->frec->name, when - apr_time_now());
+    return APR_SUCCESS;
+}
+
 AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status)
 {
     struct ap_filter_private *fp = f->priv;
