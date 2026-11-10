@@ -60,6 +60,9 @@
 #define FILTER_PENDING_DUE  (1u << 1) /* fp->due reached */
 #define FILTER_PENDING_HELD (1u << 2) /* fp->ctx's wait completed */
 #define FILTER_PENDING_MORE (1u << 3) /* input: not readable yet */
+#define FILTER_PENDING_DELEGATED (1u << 4) /* with _HELD: no wait of its own,
+                                            * released by the end of the
+                                            * work it's delegated to */
 
 struct ap_filter_private {
     /* Link to a pending_ring (keep first preferably) */
@@ -90,6 +93,11 @@ struct ap_filter_private {
     /* FILTER_PENDING_HELD: the status of the hold's wait, once completed */
     apr_status_t held_status;
     unsigned int held_done :1;
+    /* FILTER_PENDING_DELEGATED: the brigade the filter gave to hold, while
+     * its call lasts, where what it holds goes back if its hold is undone
+     * (ap_filter_hold_undo())
+     */
+    apr_bucket_brigade *given;
     /* ap_filter_pending_notify(): the notifier's context, reused for the
      * same notifier
      */
@@ -120,6 +128,11 @@ struct ap_filter_conn_ctx {
      * nested: non-zero when code runs from a filter (ap_filter_calls())
      */
     int calls;
+
+    /* The request filter whose delegated hold awaits its work (made by the
+     * filter's call in progress, ap_filter_hold_delegate())
+     */
+    ap_filter_t *delegating;
 
     struct spare_ring *spare_containers,
                       *spare_brigades,
@@ -670,10 +683,14 @@ static apr_status_t pending_filter_cleanup(void *arg)
 {
     ap_filter_t *f = arg;
     struct ap_filter_private *fp = f->priv;
+    struct ap_filter_conn_ctx *x = f->c->filter_conn_ctx;
 
     if (is_pending_filter(f)) {
         APR_RING_REMOVE(fp, pending);
         APR_RING_ELEM_INIT(fp, pending);
+    }
+    if (x && x->delegating == f) {
+        x->delegating = NULL;
     }
 
     /* Nothing kept points to the request (its context, its held data) */
@@ -683,6 +700,7 @@ static apr_status_t pending_filter_cleanup(void *arg)
     fp->held = NULL;
     fp->held_status = APR_SUCCESS;
     fp->held_done = 0;
+    fp->given = NULL;
     fp->notifier = NULL;
     fp->notifier_ctx = NULL;
 
@@ -806,6 +824,26 @@ AP_DECLARE(apr_status_t) ap_remove_output_filter_byhandle(ap_filter_t *next,
 }
 
 
+/* A request filter returned without the asynchronous work its delegated
+ * hold was for (ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED, not
+ * followed by ap_run_sub_req_async()): nothing would release the hold, so
+ * it's released now (logged), the core calling the filter again with what
+ * it holds.
+ */
+static void filter_hold_unpaired(ap_filter_t *f)
+{
+    struct ap_filter_conn_ctx *x = f->c->filter_conn_ctx;
+    struct ap_filter_private *fp = f->priv;
+
+    x->delegating = NULL;
+    ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, f->c, APLOGNO()
+                  "'%s' output filter returned without the work its "
+                  "delegated hold was for: releasing the hold",
+                  f->frec->name);
+    fp->held_done = 1;
+    fp->given = NULL;
+}
+
 /*
  * Read data from the next filter in the filter stack.  Data should be
  * modified in the bucket brigade that is passed in.  The core allocates the
@@ -870,6 +908,9 @@ AP_DECLARE(apr_status_t) ap_pass_brigade(ap_filter_t *next,
         x->calls++;
         rv = next->frec->filter_func.out_func(next, bb);
         x->calls--;
+        if (x->delegating == next) {
+            filter_hold_unpaired(next);
+        }
         return rv;
     }
     return AP_NOBODY_WROTE;
@@ -1461,6 +1502,7 @@ static apr_status_t pending_filter_call(ap_filter_t *f,
     fp->ctx = NULL;
     fp->held_done = 0;
     fp->held_status = APR_SUCCESS;
+    fp->given = NULL;
     if (fp->held) {
         APR_BRIGADE_CONCAT(bb, fp->held);
     }
@@ -1676,10 +1718,24 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
                                                 unsigned int flags)
 {
     struct ap_filter_private *fp = f->priv;
+    struct ap_filter_conn_ctx *x = NULL;
     apr_status_t rv;
     int rc;
 
-    if (f->frec->direction == AP_FILTER_INPUT) {
+    if (flags & AP_FILTER_HOLD_DELEGATED) {
+        if (f->frec->direction != AP_FILTER_OUTPUT || ctx) {
+            return APR_EINVAL;
+        }
+        x = get_conn_ctx(f->c);
+        if (x->delegating) {
+            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO()
+                          "'%s' output filter can't delegate its hold: '%s' "
+                          "output filter's awaits its work", f->frec->name,
+                          x->delegating->frec->name);
+            return APR_EBUSY;
+        }
+    }
+    else if (f->frec->direction == AP_FILTER_INPUT) {
         return filter_hold_input(f, bb, ctx, direction, flags);
     }
     if (fp->why) {
@@ -1688,7 +1744,8 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
                       "already", f->frec->name);
         return APR_EBUSY;
     }
-    if (!ctx && f->r && !ap_filter_should_yield(f->next)) {
+    if (!ctx && !(flags & AP_FILTER_HOLD_DELEGATED)
+        && f->r && !ap_filter_should_yield(f->next)) {
         return APR_EAGAIN; /* room already */
     }
     rc = ap_request_filter_hold(f, ctx, direction, flags);
@@ -1710,16 +1767,74 @@ AP_DECLARE(apr_status_t) ap_filter_pending_wait(ap_filter_t *f,
         }
     }
     ap_filter_prepare_brigade(f);
-    fp->why = (ctx) ? FILTER_PENDING_HELD : FILTER_PENDING_ROOM;
     fp->ctx = ctx;
     fp->held_status = APR_SUCCESS;
     fp->held_done = (ctx && rc == OK); /* ready already */
+    if (flags & AP_FILTER_HOLD_DELEGATED) {
+        /* Released by the end of its work, paired with the hold by the
+         * filter's next call (ap_filter_hold_delegate())
+         */
+        fp->why = FILTER_PENDING_HELD | FILTER_PENDING_DELEGATED;
+        fp->given = bb;
+        x->delegating = f;
+    }
+    else {
+        fp->why = (ctx) ? FILTER_PENDING_HELD : FILTER_PENDING_ROOM;
+    }
     ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
                   "'%s' output filter holds its output%s",
-                  f->frec->name, (!ctx) ? " for room"
-                                        : (fp->held_done) ? " (ready already)"
-                                                          : "");
+                  f->frec->name, (fp->why & FILTER_PENDING_DELEGATED)
+                                 ? " (delegated)"
+                                 : (!ctx) ? " for room"
+                                          : (fp->held_done)
+                                            ? " (ready already)" : "");
     return APR_SUCCESS;
+}
+
+AP_CORE_DECLARE(ap_filter_t *) ap_filter_hold_delegate(conn_rec *c,
+                                                       request_rec *r)
+{
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+    ap_filter_t *f;
+
+    if (!x || !x->delegating || x->delegating->r != r) {
+        return NULL;
+    }
+    f = x->delegating;
+    x->delegating = NULL;
+    return f;
+}
+
+AP_CORE_DECLARE(void) ap_filter_hold_undo(ap_filter_t *f)
+{
+    struct ap_filter_private *fp = f->priv;
+
+    if (!(fp->why & FILTER_PENDING_DELEGATED)) {
+        return;
+    }
+    if (fp->held && !APR_BRIGADE_EMPTY(fp->held)) {
+        if (fp->given) {
+            APR_BRIGADE_PREPEND(fp->given, fp->held);
+        }
+        else {
+            /* Nowhere to give it back: drop it, the response is cut */
+            ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, f->c, APLOGNO()
+                          "'%s' output filter's delegated hold undone with "
+                          "output held but no brigade to give it back to: "
+                          "dropping it", f->frec->name);
+            AP_DEBUG_ASSERT(fp->given != NULL);
+            apr_brigade_cleanup(fp->held);
+            f->c->keepalive = AP_CONN_CLOSE;
+        }
+    }
+    fp->why = 0;
+    fp->held_done = 0;
+    fp->held_status = APR_SUCCESS;
+    fp->given = NULL;
+    pending_filter_unlink_request(fp);
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
+                  "'%s' output filter's delegated hold undone (its work "
+                  "ended at once)", f->frec->name);
 }
 
 AP_DECLARE(apr_status_t) ap_filter_pending_notify(ap_filter_t *f,
@@ -1801,6 +1916,7 @@ AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status)
             fp->held_done = 1;
         }
         fp->held_status = status;
+        fp->given = NULL;
     }
 }
 
@@ -1852,10 +1968,14 @@ AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
             if (fp->held) {
                 apr_brigade_cleanup(fp->held);
             }
+            if (x->delegating == fp->f) {
+                x->delegating = NULL;
+            }
             fp->why = 0;
             fp->due = 0;
             fp->ctx = NULL;
             fp->held_done = 0;
+            fp->given = NULL;
             pending_filter_unlink_request(fp);
         }
     }

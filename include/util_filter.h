@@ -771,6 +771,28 @@ AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
 AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
 
 /**
+ * The request filter of r whose delegated hold (ap_filter_pending_wait()
+ * with AP_FILTER_HOLD_DELEGATED) awaits the asynchronous work it's delegated
+ * to, made by the filter's call in progress, now given that work (no longer
+ * awaiting it), core's own: the core releases the hold when the work ends
+ * (ap_filter_hold_done()), or undoes it if the work ends at once
+ * (ap_filter_hold_undo()).
+ * @param c The connection
+ * @param r The request whose filter may delegate
+ * @return The filter, or NULL if none of r awaits its work
+ */
+AP_CORE_DECLARE(ap_filter_t *) ap_filter_hold_delegate(conn_rec *c,
+                                                       request_rec *r);
+
+/**
+ * Undo a request filter's delegated hold whose work ended at once, core's
+ * own: what the filter gave to hold is back in its brigade, the filter goes
+ * on in its call as if it hadn't held.
+ * @param f The filter
+ */
+AP_CORE_DECLARE(void) ap_filter_hold_undo(ap_filter_t *f);
+
+/**
  * Whether a request input filter of the connection holds its input on a
  * context (ap_filter_pending_wait()), core's own: the waits for the
  * connection's input wait for that hold too.

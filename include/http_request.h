@@ -436,8 +436,10 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  * @param timeout The longest the subrequest may run from now on, its waits
  *        capped to what's left: once reached, its pending waits complete
  *        with APR_TIMEUP and done gets HTTP_GATEWAY_TIME_OUT whatever the
- *        subrequest's own status; zero or negative for none. Only the
- *        asynchronous waits are capped (not a subrequest running blocking).
+ *        subrequest's own status; zero or negative for none (the server's
+ *        Timeout for the work of a request output filter's delegated hold,
+ *        which is always bounded). Only the asynchronous waits are capped
+ *        (not a subrequest running blocking).
  * @param done Called once the subrequest completes asynchronously
  * @param baton For done
  * @param module_index The module whose log level the log lines follow (a
@@ -451,10 +453,15 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         runs blocking (ap_run_sub_req()).
  * @remark Only from a handler of the main request (or a continuation of
  *         it, e.g. the done function of a previous subrequest), which
- *         returns SUSPENDED up: not from a filter, which can't (for now
- *         this isn't detected, the subrequest's wait would be lost; a call
- *         while a wait of the main request's tree is pending is refused,
- *         logged, and runs blocking). One subrequest at a time per request.
+ *         returns SUSPENDED up, or from a request output filter of the main
+ *         request right after it delegated its hold to the subrequest
+ *         (ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED: the
+ *         filter returns APR_SUCCESS on SUSPENDED, the core releasing its
+ *         hold after done). Not from a filter otherwise, which can't (for
+ *         now this isn't detected, the subrequest's wait would be lost; a
+ *         call while a wait of the main request's tree is pending is
+ *         refused, logged, and runs blocking). One subrequest at a time per
+ *         request.
  * @remark Don't destroy rsub (refused, logged), nor pass output for the main
  *         request, until done is called. The subrequest may run on other
  *         threads than the caller's, as continuations do.
@@ -791,6 +798,11 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *ctx);
  */
 AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ctx);
 
+/** Flag for ap_filter_pending_wait(): the hold is delegated to the
+ *  asynchronous work the filter starts next (a subrequest), released when
+ *  that work ends */
+#define AP_FILTER_HOLD_DELEGATED (1u << 1)
+
 /**
  * Hold the output of a request in one of its output filters until the wait
  * of a context completes, or until the filters after it have room: the
@@ -809,7 +821,8 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *        (ap_filter_should_yield(f->next) false)
  * @param direction AP_WAIT_IN or AP_WAIT_OUT for a connection or a
  *        descriptor, ignored by a timer or a notifier
- * @param flags AP_REQUEST_WAIT_DRAINED or 0
+ * @param flags AP_REQUEST_WAIT_DRAINED or 0, or AP_FILTER_HOLD_DELEGATED
+ *        (ctx NULL) to delegate the hold to the work the filter starts next
  * @return APR_SUCCESS: held, the filter returns APR_SUCCESS (it may pass
  *         nothing meanwhile); APR_ENOTIMPL: the output can't be held now
  *         (logged at debug: a connection filter, a subrequest's, one below
@@ -818,7 +831,9 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *         a subrequest of the request in progress, or the MPM refusing the
  *         wait): the filter does its work now, blocking as without this
  *         function; APR_EAGAIN: no context and nothing pending after f
- *         (go on passing); APR_EBUSY: f holds already.
+ *         (go on passing); APR_EBUSY: f holds already (or, for a delegated
+ *         hold, another filter's awaits its work); APR_EINVAL: a delegated
+ *         hold for an input filter, or with a context.
  * @remark The hold points: while the handlers run (mid-stream holds
  *         included), and at the request's end: once the handlers are done
  *         (e.g. a filter holding at the EOS), the end waits for the holds
@@ -845,7 +860,12 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *         is dropped (with what it held) and the connection is closed after
  *         the response.
  * @remark Every hold is bounded: a context giving no timeout (e.g. a
- *         notifier's) gets the server's Timeout for the hold's wait.
+ *         notifier's) gets the server's Timeout for the hold's wait, and
+ *         the request's end waits for held output with the server's
+ *         Timeout. A delegated hold is bounded by its work's timeout
+ *         instead (ap_run_sub_req_async()'s, the server's Timeout if it
+ *         gives none): the request's end waits for its release without a
+ *         timeout of its own meanwhile.
  * @remark FLUSH keeps its meaning: a filter passed a FLUSH bucket does its
  *         work and passes on blocking, without holding.
  * @remark A held filter passed more data (by a producer not backing off)
@@ -853,6 +873,34 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  *         bound it.
  * @remark Don't release or destroy ctx while the hold is pending; removing
  *         the filter cancels its hold (and drops what it held).
+ * @remark A delegated hold (AP_FILTER_HOLD_DELEGATED) has no wait of its
+ *         own: the filter holds its output while asynchronous work it
+ *         starts right after, in the same call, runs, and the core releases
+ *         the hold when that work ends, calling the filter again (with an
+ *         empty brigade, what it held prepended). The work is a subrequest
+ *         run by ap_run_sub_req_async() (e.g. a filter checking the
+ *         response with a service, or including another resource's output
+ *         below it): if it returns SUSPENDED the filter returns
+ *         APR_SUCCESS, and the subrequest's done function is called when it
+ *         completes, before the filter (it records the outcome for the
+ *         filter: it doesn't pass output, start other work or end the
+ *         request); any other status means the work ended at once: the hold
+ *         is undone, what the filter gave is back in bb, and the filter
+ *         goes on in its call (done isn't called). After a refusal
+ *         (APR_ENOTIMPL) the filter does the work blocking
+ *         (ap_run_sub_req()). A filter returning without starting the work
+ *         has its hold released (logged as an error). One delegated hold
+ *         at a time per request (holds are refused while a subrequest is in
+ *         progress), while the handlers run, mid-stream too: the producer backs
+ *         off meanwhile (ap_filter_should_yield()) and its waits for the
+ *         client's output complete when the hold is released, so it stays
+ *         paused until then (one ordered stream).
+ * @remark A delegated hold's subrequest dropped before it completes (the
+ *         request's end giving up the held output, its wait failing, or
+ *         the connection closed) doesn't call its done function, and the
+ *         hold is dropped with what it held: keep the filter's state for
+ *         the subrequest in the request's pool (as what it holds), which
+ *         goes with the request.
  * @remark A request input filter can hold its input too (e.g. validating
  *         what it read before returning it, waiting for a backend of its
  *         own), on a context only, keeping what it holds itself (bb NULL),

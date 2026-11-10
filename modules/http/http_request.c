@@ -572,6 +572,8 @@ static void async_request_end_eor(request_rec *r, ap_request_async_t *async,
         if (async->waitset) {
             request_waitset_drop(async->waitset, NULL, 0);
         }
+        async->delegate = NULL;
+        async->subreqs = async->subreqs_delegated = 0;
         async->hold_point = ASYNC_HOLD_NONE;
         async->running = 0;
         async->suspended = 0;
@@ -642,7 +644,10 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
             request_waitset_drop(async->waitset, NULL, REQUEST_WAITS_KEEP_HOLDS);
         }
         async->phase = AP_REQUEST_PHASE_DONE;
-        async->subreqs = 0; /* the suspended ones' waits dropped */
+        /* The suspended subrequests' waits dropped, but those of the work of
+         * a filter's delegated hold
+         */
+        async->subreqs = async->subreqs_delegated;
         async->end_status = status;
         async->hold_point = ASYNC_HOLD_FIRST;
         if (async_request_hold(r, async, flags) == SUSPENDED) {
@@ -1359,30 +1364,40 @@ static void request_waitreg_finish(request_waitreg_t *g, int mode,
  * REQUEST_WAITS_KEEP_HOLDS (the handlers' end), the request output filters'
  * holds stay pending, waited for by the request's end.
  */
+/* Whether a request is owner or one of its subrequests at any depth */
+static int request_is_or_under(const request_rec *rr, const request_rec *owner)
+{
+    while (rr && rr != owner) {
+        rr = rr->main;
+    }
+    return (rr != NULL);
+}
+
 static void request_waitset_drop(struct ap_request_waitset *w,
                                  request_rec *owner, unsigned int flags)
 {
     request_waitreg_t **pg = &w->waits, *g;
+    const request_rec *delegate = NULL;
 
+    if (flags & REQUEST_WAITS_KEEP_HOLDS) {
+        ap_request_async_t *top = request_async_get(w->r);
+        if (top && top->delegate) {
+            delegate = top->delegate->r;
+        }
+    }
     while ((g = *pg) != NULL) {
         if ((flags & REQUEST_WAITS_KEEP_HOLDS)
-            && g->fn == request_filter_hold_continuation
-            && ((ap_filter_t *)g->baton)->frec->direction
-               == AP_FILTER_OUTPUT) {
+            && ((g->fn == request_filter_hold_continuation
+                 && ((ap_filter_t *)g->baton)->frec->direction
+                    == AP_FILTER_OUTPUT)
+                || (delegate && request_is_or_under(g->waiter, delegate)))) {
+            /* A filter's hold, or the work of a delegated hold */
             pg = &g->next;
             continue;
         }
-        if (owner) {
-            const request_rec *rr = g->waiter;
-
-            /* Is the waiter owner, or one of its subrequests at any depth? */
-            while (rr && rr != owner) {
-                rr = rr->main;
-            }
-            if (!rr) {
-                pg = &g->next;
-                continue;
-            }
+        if (owner && !request_is_or_under(g->waiter, owner)) {
+            pg = &g->next;
+            continue;
         }
         *pg = g->next;
         request_waitreg_finish(g, (flags & REQUEST_WAITS_ENDING)
@@ -2333,6 +2348,10 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
     else if (async->subreqs) {
         why = "a subrequest of the request is in progress";
     }
+    else if ((flags & AP_FILTER_HOLD_DELEGATED)
+             && async->phase != AP_REQUEST_PHASE_HANDLER) {
+        why = "a delegated hold outside the handlers";
+    }
     if (why) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
                       "'%s' %sput filter can't hold: %s", f->frec->name,
@@ -2367,8 +2386,24 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
 static void async_request_drop_holds(request_rec *r, ap_request_async_t *async)
 {
     struct ap_request_waitset *w = async->top->waitset;
+    ap_request_async_t *top = async->top;
     request_waitreg_t **pg, *g;
 
+    if (top->delegate) {
+        /* The work of a filter's delegated hold is abandoned: its waits
+         * dropped (its done isn't called), the hold dropped below
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "abandoning the subrequest of '%s' output filter's "
+                      "delegated hold", top->delegate->holder->frec->name);
+        if (w) {
+            request_waitset_drop(w, top->delegate->r, 0);
+        }
+        top->delegate->holder = NULL;
+        top->delegate = NULL;
+        top->subreqs -= top->subreqs_delegated;
+        top->subreqs_delegated = 0;
+    }
     if (w) {
         pg = &w->waits;
         while ((g = *pg) != NULL) {
@@ -2425,10 +2460,13 @@ static int async_request_hold(request_rec *r, ap_request_async_t *async,
             return OK;
         }
         /* The client's output with the server's Timeout, whatever it waits
-         * for (every hold is bounded)
+         * for (every hold is bounded), but with no timeout of its own while
+         * the work of a filter's delegated hold runs: that work's timeout
+         * bounds it (its end releases the hold)
          */
         ctx = ap_request_waitctx_client(r);
-        ctx->timeout = AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
+        ctx->timeout = (async->top->delegate) ? -1
+                                              : AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
         ctx->delay = 0;
         rc = request_wait(&ctx, 1, &out, 0, async_request_hold_continuation,
                           async, 0, REQUEST_WAIT_AT_HOLD);
@@ -2588,6 +2626,20 @@ void ap_process_async_request(request_rec *r)
  * end, after which its done function goes on with its main request.
  */
 
+/* Whether a subrequest runs as the work of a filter's delegated hold (it,
+ * or one of its main requests)
+ */
+static int request_async_delegated(ap_request_async_t *async)
+{
+    for (; async && async != async->top;
+         async = request_async_get(async->r->main)) {
+        if (async->holder) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Enter a run of the top-level request of a request's tree, unless one is
  * running (from the continuation of a module's own MPM wait,
  * ap_mpm_register_wait(), rather than of a request's wait): *ended is set
@@ -2614,6 +2666,12 @@ static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
     async->phase = AP_REQUEST_PHASE_DONE;
     async->suspended = 0;
     async->top->subreqs--;
+    if (request_async_delegated(async)) {
+        async->top->subreqs_delegated--;
+    }
+    if (async->top->delegate == async) {
+        async->top->delegate = NULL;
+    }
     if (status == DONE) {
         status = OK;
     }
@@ -2655,9 +2713,19 @@ static int async_subreq_finish(request_rec *rsub, ap_request_async_t *async,
 static void async_subreq_end(request_rec *rsub, ap_request_async_t *async,
                              int status)
 {
+    ap_filter_t *holder = async->holder; /* async is in rsub's pool */
+    int *ended = async->top->ended;
+
     status = async_subreq_finish(rsub, async, status);
     async->done(rsub, status, async->done_baton);
     /* don't dereference rsub from here! (done may destroy it) */
+
+    if (holder && !(ended && *ended)) {
+        /* The work of the filter's delegated hold ended: the hold is over,
+         * the filter called again by the next output walk
+         */
+        request_filter_hold_continuation(holder->r, APR_SUCCESS, holder);
+    }
 }
 
 AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
@@ -2666,9 +2734,14 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
                                       int module_index)
 {
     request_rec *r = rsub->main;
+    conn_rec *c = rsub->connection;
     core_request_config *req_cfg;
     ap_request_async_t *main_async, *async;
-    int status;
+    ap_filter_t *holder;
+    int status, calls;
+
+    /* The work of a filter's delegated hold made by the filter calling? */
+    holder = (r) ? ap_filter_hold_delegate(c, r) : NULL;
 
     req_cfg = ap_get_core_module_config(rsub->request_config);
     if (!r || !done || !req_cfg || req_cfg->async) {
@@ -2681,9 +2754,14 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
                       (!r) ? "not a subrequest"
                            : (!done) ? "no done function"
                                      : "run already");
-        return ap_run_sub_req(rsub);
+        status = ap_run_sub_req(rsub);
+        if (holder) {
+            ap_filter_hold_undo(holder);
+        }
+        return status;
     }
-    if (!ap_request_can_suspend(r)) {
+    /* A delegated hold was accepted where the main request can suspend */
+    if (!holder && !ap_request_can_suspend(r)) {
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE2, 0, rsub,
                       "subrequest run blocking: its main request can't "
                       "suspend");
@@ -2698,7 +2776,11 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
                       APLOGNO() "can't run the subrequest asynchronously "
                       "while a wait of its request is in flight (called by "
                       "a filter?): running it blocking");
-        return ap_run_sub_req(rsub);
+        status = ap_run_sub_req(rsub);
+        if (holder) {
+            ap_filter_hold_undo(holder);
+        }
+        return status;
     }
 
     async = apr_pcalloc(rsub->pool, sizeof(*async));
@@ -2713,8 +2795,20 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
     }
     req_cfg->async = async;
     async->top->subreqs++; /* until async_subreq_finish() */
+    if (holder) {
+        /* One at a time: holds are refused while a subrequest runs */
+        AP_DEBUG_ASSERT(!async->top->delegate);
+        async->holder = holder;
+        async->top->delegate = async;
+    }
+    if (request_async_delegated(async)) {
+        async->top->subreqs_delegated++;
+    }
 
-    /* As ap_run_sub_req() */
+    /* As ap_run_sub_req(), its handlers not run from a filter (they may
+     * return SUSPENDED up to here)
+     */
+    calls = ap_filter_calls(c, 0);
     status = DECLINED;
     if (!(rsub->filename && rsub->finfo.filetype != APR_NOFILE)) {
         status = ap_run_quick_handler(rsub, 0);
@@ -2722,14 +2816,21 @@ AP_DECLARE(int) ap_run_sub_req_async_(request_rec *rsub,
     if (status == DECLINED) {
         status = ap_invoke_handler(rsub);
     }
+    ap_filter_calls(c, calls);
     if (status == SUSPENDED) {
         /* Its continuations go on with it, then done */
         async->suspended = 1;
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE5, 0, rsub,
-                      "subrequest suspended");
+                      "subrequest suspended%s", (holder) ? " (the work of a "
+                      "filter's delegated hold)" : "");
         return SUSPENDED;
     }
-    return async_subreq_finish(rsub, async, status);
+    status = async_subreq_finish(rsub, async, status);
+    if (holder) {
+        /* Ended at once: the filter goes on in its call */
+        ap_filter_hold_undo(holder);
+    }
+    return status;
 }
 
 AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
