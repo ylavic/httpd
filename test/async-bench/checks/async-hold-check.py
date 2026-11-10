@@ -1,7 +1,9 @@
 """Check request filters holding their output or input (ap_filter_pending_wait())
 through mod_aptest's holding filters ("AptestHold"): a static file's EOS held
 on a timer and on a notifier by many clients on few threads, then by two
-filters of a request in turn, each on a notifier of its own, a proxied
+filters of a request in turn, each on a notifier of its own, a burst of
+new connections waiting for a worker longer than Timeout (served late, not
+dropped), a proxied
 response streamed through a filter holding each chunk (the producer backing
 off), a large response passed in pieces held for room to a crawling reader,
 ap_die()'s error response held by a protocol filter (the request's second
@@ -405,6 +407,19 @@ for mode in os.environ.get("MODES", "sync async").split():
                       "workers held %s, statuses %s, bodies %s, holds/refused/sleeps/failed %s and %s: %s"
                       % (mode, n, HOLD * 1000, t, busy, sorted(set(str(r[0]) for r in res)),
                          "same" if same else "DIFFER", tot1, tot2, verdict(ok)))
+
+        # A burst of new connections queued for a worker longer than Timeout
+        # (sync: 16 requests of two sleeps on 4 threads, the last ones wait
+        # 2.4s): served late, none dropped
+        n = 16
+        res, t = parallel(n, lambda i: get("/twice/file.txt?b=%d" % i))
+        same = all(r == (200, FILES["file.txt"]) for r in res)
+        late = 2 * HOLD * n / THREADS
+        ok = same and (t < HOLD * 4 if asyn else t >= late * 0.9 and late > TIMEOUT)
+        report.append("%s: a burst of %d clients, the last served after %ss in sync (Timeout %ds): "
+                      "%.2fs, statuses %s, bodies %s: %s"
+                      % (mode, n, late, TIMEOUT, t, sorted(set(str(r[0]) for r in res)),
+                         "same" if same else "DIFFER", verdict(ok)))
 
         # Each chunk of a proxied streamed response held (mid-stream holds)
         n = 8
