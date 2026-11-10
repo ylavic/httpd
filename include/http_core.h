@@ -443,6 +443,14 @@ typedef struct ap_request_async_t {
      *  ap_run_sub_req_async() until done), whose output may go through the
      *  main request's filters; the top-level request's */
     int subreqs;
+    /** Where the end of the top-level request is (its handlers done): 1
+     *  before its error response if any (ap_die()), 2 from it until the end
+     *  (the EOR), 0 before; its filters may hold their output at both
+     *  points (ap_filter_pending_wait()), the end waiting for them */
+    unsigned int hold_point :2;
+    /** The handlers' status, for ap_die() once the filters' holds before it
+     *  are over */
+    int end_status;
     /** For a subrequest run by ap_run_sub_req_async(): its done function
      * (ap_sub_req_done_fn) and baton, its deadline (zero for none), and the
      * module whose log level its log lines follow */

@@ -340,6 +340,17 @@ AP_DECLARE(void) ap_process_request_after_handler(request_rec *r)
     apr_bucket *b;
     conn_rec *c = r->connection;
 
+    /* No request filter holds output anymore: the EOR would overtake it,
+     * and free the request's pool it lives in
+     */
+    if (ap_output_pending_request(c, 0)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "request filters hold output at the request's end: "
+                      "dropping it");
+        AP_DEBUG_ASSERT(0);
+        ap_request_drop_holds(r);
+    }
+
     bb = ap_acquire_brigade(c);
 
     /* Send an EOR bucket through the output filter chain.  When
@@ -474,14 +485,33 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
 struct ap_request_waitset;
 static void request_waitset_run_end(ap_request_async_t *top);
 static void request_waitset_drop(struct ap_request_waitset *w,
-                                 request_rec *owner, int ending);
+                                 request_rec *owner, unsigned int flags);
+
+/* request_waitset_drop() flags */
+#define REQUEST_WAITS_ENDING     (1u << 0) /* the request's pool goes */
+#define REQUEST_WAITS_KEEP_HOLDS (1u << 1) /* but the filters' holds */
 
 /* async_request_end() flags */
-#define ASYNC_REQUEST_END_FIRST  (1u << 0) /* in the first run, which gives
-                                            * the connection back to the MPM
-                                            * by returning */
-#define ASYNC_REQUEST_END_NOLOCK (1u << 1) /* not entered (r->invoke_mtx not
-                                            * held) */
+#define ASYNC_REQUEST_END_FIRST   (1u << 0) /* in the first run, which gives
+                                             * the connection back to the
+                                             * MPM by returning */
+#define ASYNC_REQUEST_END_NOLOCK  (1u << 1) /* not entered (r->invoke_mtx
+                                             * not held) */
+#define ASYNC_REQUEST_END_ENTERED (1u << 2) /* the run entered for this end
+                                             * (a module's own MPM wait's
+                                             * continuation), left if it
+                                             * waits for held output */
+
+/* async->hold_point values */
+#define ASYNC_HOLD_NONE   0
+#define ASYNC_HOLD_FIRST  1 /* the handlers done, before ap_die() */
+#define ASYNC_HOLD_SECOND 2 /* from ap_die() to the EOR */
+
+static int async_request_hold(request_rec *r, ap_request_async_t *async,
+                              unsigned int flags);
+static void request_filter_hold_continuation(request_rec *r,
+                                             apr_status_t status,
+                                             void *baton);
 
 static void async_request_enter(request_rec *r, ap_request_async_t *async)
 {
@@ -513,7 +543,7 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
     if (async) {
         request_waitset_run_end(async);
         async->running = 0;
-        async->suspended = 1;
+        async->suspended = !async->hold_point; /* not its handlers' after */
         async->ended = NULL;
     }
     AP_PROCESS_REQUEST_RETURN((uintptr_t)r, r->uri, SUSPENDED);
@@ -528,14 +558,13 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
 #endif
 }
 
-/* End the request, its handlers done with status: drop the waits of its
- * tree still pending (their continuations not called), answer an error if
- * any (ap_die()), then end the request (its EOR bucket frees it, its
+/* The end of the request once no filter holds output: drop the waits of
+ * its tree still pending, then end it (its EOR bucket frees it, its
  * PROCESS_REQUEST RETURN probe and the end of the run's timing), then give
  * the connection back to the MPM unless in the first run.
  */
-static void async_request_end(request_rec *r, ap_request_async_t *async,
-                              int status, unsigned int flags)
+static void async_request_end_eor(request_rec *r, ap_request_async_t *async,
+                                  unsigned int flags)
 {
     conn_rec *c = r->connection;
 
@@ -543,7 +572,7 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
         if (async->waitset) {
             request_waitset_drop(async->waitset, NULL, 0);
         }
-        async->phase = AP_REQUEST_PHASE_DONE;
+        async->hold_point = ASYNC_HOLD_NONE;
         async->running = 0;
         async->suspended = 0;
         if (async->ended) {
@@ -557,11 +586,6 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
     }
 #endif
 
-    /* As if the handler had returned this status in the first run: an
-     * error is not a recursive one.
-     */
-    ap_die_r(status, r, HTTP_OK);
-
     ap_process_request_after_handler(r);
     /* don't dereference r from here! */
 
@@ -574,6 +598,58 @@ static void async_request_end(request_rec *r, ap_request_async_t *async,
         }
         ap_mpm_resume_suspended(c);
     }
+}
+
+/* Answer the handlers' error status if any (ap_die()), then wait for the
+ * filters holding output from then on (the second hold point), then end the
+ * request. ap_die() is called once, its response the request's final one.
+ */
+static void async_request_end_die(request_rec *r, ap_request_async_t *async,
+                                  int status, unsigned int flags)
+{
+    if (async) {
+        async->hold_point = ASYNC_HOLD_SECOND;
+    }
+
+    /* As if the handler had returned this status in the first run: an
+     * error is not a recursive one.
+     */
+    ap_die_r(status, r, HTTP_OK);
+
+    if (async && async_request_hold(r, async, flags) == SUSPENDED) {
+        return;
+    }
+    async_request_end_eor(r, async, flags);
+}
+
+/* End the request, its handlers done with status: drop the waits of its
+ * tree still pending (their continuations not called) but the request
+ * filters' holds of output, wait for those holds (the first hold point),
+ * then answer an error if any and end the request (async_request_end_die()).
+ *
+ * The request filters holding output are drained before the request's end
+ * (and before ap_die()'s response): trunk's request-level retention (the
+ * request core filter) was removed because its data outlived the request's
+ * handling, past the EOR into write completion, with the request's pool
+ * gone; held output here stays within the request, in its pool, and the
+ * EOR is created only once no request filter holds anything (asserted).
+ */
+static void async_request_end(request_rec *r, ap_request_async_t *async,
+                              int status, unsigned int flags)
+{
+    if (async) {
+        if (async->waitset) {
+            request_waitset_drop(async->waitset, NULL, REQUEST_WAITS_KEEP_HOLDS);
+        }
+        async->phase = AP_REQUEST_PHASE_DONE;
+        async->subreqs = 0; /* the suspended ones' waits dropped */
+        async->end_status = status;
+        async->hold_point = ASYNC_HOLD_FIRST;
+        if (async_request_hold(r, async, flags) == SUSPENDED) {
+            return;
+        }
+    }
+    async_request_end_die(r, async, status, flags);
 }
 
 /*
@@ -735,7 +811,7 @@ static void request_waitctx_detach_notifier(request_waitctx_t *ctx)
 
 static void request_waitctx_release_pfd(request_waitctx_t *ctx);
 static void request_waitset_drop(struct ap_request_waitset *w,
-                                 request_rec *owner, int ending);
+                                 request_rec *owner, unsigned int flags);
 
 /* The top-level request's pool is being destroyed (its pre-cleanups run
  * before its subpools are destroyed): the pending waits are dropped (the
@@ -747,7 +823,7 @@ static apr_status_t request_waitset_cleanup(void *data)
     struct ap_request_waitset *w = data;
 
     w->ending = 1;
-    request_waitset_drop(w, NULL, 1);
+    request_waitset_drop(w, NULL, REQUEST_WAITS_ENDING);
     return APR_SUCCESS;
 }
 
@@ -1281,14 +1357,23 @@ static void request_waitreg_finish(request_waitreg_t *g, int mode,
 
 /* Drop the pending waits of a request and its subrequests (of every request
  * of the tree if owner is NULL), their continuations not called: the
- * request ends (or its pool goes)
+ * request ends (or its pool goes: REQUEST_WAITS_ENDING). With
+ * REQUEST_WAITS_KEEP_HOLDS (the handlers' end), the request output filters'
+ * holds stay pending, waited for by the request's end.
  */
 static void request_waitset_drop(struct ap_request_waitset *w,
-                                 request_rec *owner, int ending)
+                                 request_rec *owner, unsigned int flags)
 {
     request_waitreg_t **pg = &w->waits, *g;
 
     while ((g = *pg) != NULL) {
+        if ((flags & REQUEST_WAITS_KEEP_HOLDS)
+            && g->fn == request_filter_hold_continuation
+            && ((ap_filter_t *)g->baton)->frec->direction
+               == AP_FILTER_OUTPUT) {
+            pg = &g->next;
+            continue;
+        }
         if (owner) {
             const request_rec *rr = g->waiter;
 
@@ -1302,8 +1387,8 @@ static void request_waitset_drop(struct ap_request_waitset *w,
             }
         }
         *pg = g->next;
-        request_waitreg_finish(g, (ending) ? REQUEST_WAITREG_ENDING
-                                        : REQUEST_WAITREG_DROPPED,
+        request_waitreg_finish(g, (flags & REQUEST_WAITS_ENDING)
+                               ? REQUEST_WAITREG_ENDING : REQUEST_WAITREG_DROPPED,
                                AP_MPM_WAIT_READY);
         request_waitreg_put(w, g);
     }
@@ -1993,6 +2078,8 @@ static void request_waitreg_deadline(ap_request_async_t *async,
 
 /* request_wait() internal flags */
 #define REQUEST_WAIT_BOUNDED (1u << 0) /* no timeout: the server's Timeout */
+#define REQUEST_WAIT_AT_HOLD (1u << 1) /* at a hold point of the request's
+                                        * end too */
 
 /* Wait for the targets of nctxs contexts, the first ready completing the
  * wait (ap_request_wait(), ap_request_wait_any() if any): a pending wait
@@ -2013,7 +2100,12 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     apr_status_t rv;
 
     if (!ap_request_can_suspend(r)) {
-        return DECLINED;
+        /* Or the core's waits for held output at the request's end */
+        async = request_async_get(r);
+        if (!(internal & REQUEST_WAIT_AT_HOLD) || !async
+            || !async->hold_point) {
+            return DECLINED;
+        }
     }
     /* The pending waits of r's tree, not in the MPM from its runs */
     async = request_async_get(r);
@@ -2218,8 +2310,8 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
               d->async_requests == AP_CORE_CONFIG_OFF)) {
         why = "AsyncRequests off";
     }
-    else if (async->phase != AP_REQUEST_PHASE_HANDLER) {
-        why = "not at a hold point (the handlers)";
+    else if (async->phase != AP_REQUEST_PHASE_HANDLER && !async->hold_point) {
+        why = "not at a hold point (the handlers, the request's end)";
     }
     else if (async->subreqs) {
         why = "a subrequest of the request is in progress";
@@ -2240,13 +2332,153 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
     }
     rc = request_wait(&ctx, 1, &direction, flags,
                       request_filter_hold_continuation, f, 0,
-                      REQUEST_WAIT_BOUNDED);
+                      REQUEST_WAIT_BOUNDED | REQUEST_WAIT_AT_HOLD);
     if (rc == DECLINED) {
         ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO()
                       "'%s' output filter can't hold its output: its wait "
                       "is refused", f->frec->name);
     }
     return rc;
+}
+
+/* Give up the output held by the request filters: their holds' waits are
+ * canceled, what they hold dropped, the connection closed after the
+ * response (it may lack that output)
+ */
+static void async_request_drop_holds(request_rec *r, ap_request_async_t *async)
+{
+    struct ap_request_waitset *w = async->top->waitset;
+    request_waitreg_t **pg, *g;
+
+    if (w) {
+        pg = &w->waits;
+        while ((g = *pg) != NULL) {
+            if (g->fn == request_filter_hold_continuation
+                && ((ap_filter_t *)g->baton)->frec->direction
+                   == AP_FILTER_OUTPUT) {
+                *pg = g->next;
+                g->next = NULL;
+                request_waitreg_finish(g, REQUEST_WAITREG_CANCELED,
+                                       AP_MPM_WAIT_READY);
+                request_waitreg_put(w, g);
+                continue;
+            }
+            pg = &g->next;
+        }
+    }
+    if (ap_output_pending_request(r->connection, 1)) {
+        r->connection->keepalive = AP_CONN_CLOSE;
+    }
+}
+
+static void async_request_hold_continuation(request_rec *r,
+                                            apr_status_t status,
+                                            void *baton);
+
+/* At a hold point of the request's end: while a request filter holds
+ * output, wait for the client's output, i.e. its targets (the holds' waits,
+ * a due time, room), then check again from the continuation. Returns
+ * SUSPENDED if waiting (leaving the run if it's the first one or one
+ * entered for this end), OK once no request filter holds output.
+ */
+static int async_request_hold(request_rec *r, ap_request_async_t *async,
+                              unsigned int flags)
+{
+    conn_rec *c = r->connection;
+    unsigned int out = AP_WAIT_OUT;
+    ap_request_waitctx_t *ctx;
+    int rc;
+
+    for (;;) {
+        if (!ap_output_pending_request(c, 0)) {
+            return OK; /* the common case, no walk */
+        }
+        rc = ap_check_output_pending(c);
+        if (!ap_output_pending_request(c, 0)) {
+            return OK;
+        }
+        if (rc != AGAIN) {
+            /* A write failed: what's held can't be passed */
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                          "the request's filters hold output that can't "
+                          "be written (%i): dropping it", rc);
+            async_request_drop_holds(r, async);
+            return OK;
+        }
+        /* The client's output with the server's Timeout, whatever it waits
+         * for (every hold is bounded)
+         */
+        ctx = ap_request_waitctx_client(r);
+        ctx->timeout = AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
+        ctx->delay = 0;
+        rc = request_wait(&ctx, 1, &out, 0, async_request_hold_continuation,
+                          async, 0, REQUEST_WAIT_AT_HOLD);
+        if (rc == SUSPENDED) {
+            break;
+        }
+        if (rc != OK) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                          "can't wait for the output held by the request's "
+                          "filters: dropping it");
+            async_request_drop_holds(r, async);
+            return OK;
+        }
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "request's end waiting for its filters' held output "
+                  "(%s ap_die())", (async->hold_point == ASYNC_HOLD_FIRST)
+                                   ? "before" : "after");
+    if (flags & (ASYNC_REQUEST_END_FIRST | ASYNC_REQUEST_END_ENTERED)) {
+        async_request_leave(r, async, !!(flags & ASYNC_REQUEST_END_FIRST));
+    }
+    return SUSPENDED;
+}
+
+/* The continuation of the request's end waiting for held output: check
+ * again, then go on with the end from where it waited. After a failed wait
+ * (a timeout, the MPM failing or stopping) the filters whose holds are over
+ * are called once, and what's still held is dropped.
+ */
+static void async_request_hold_continuation(request_rec *r,
+                                            apr_status_t status,
+                                            void *baton)
+{
+    ap_request_async_t *async = baton;
+
+    if (status != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, status, r, APLOGNO()
+                      "waiting for the output held by the request's filters "
+                      "failed: dropping it");
+        (void)ap_check_output_pending(r->connection);
+        async_request_drop_holds(r, async);
+    }
+    if (async_request_hold(r, async, 0) == SUSPENDED) {
+        return;
+    }
+    if (async->hold_point == ASYNC_HOLD_FIRST) {
+        async_request_end_die(r, async, async->end_status, 0);
+    }
+    else {
+        async_request_end_eor(r, async, 0);
+    }
+}
+
+AP_CORE_DECLARE(void) ap_request_drop_holds(request_rec *r)
+{
+    ap_request_async_t *async;
+    request_rec *top = r;
+
+    while (top->main) {
+        top = top->main;
+    }
+    async = request_async_get(top);
+    if (async) {
+        async_request_drop_holds(top, async);
+    }
+    else if (ap_output_pending_request(r->connection, 1)) {
+        r->connection->keepalive = AP_CONN_CLOSE;
+    }
 }
 
 /* Whether some waits of the tree of a request are pending */
@@ -2517,6 +2749,8 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
      */
     if (!async->running) {
         async_request_enter(r, async);
+        async_request_end(r, async, status, ASYNC_REQUEST_END_ENTERED);
+        return;
     }
     async_request_end(r, async, status, 0);
 }
@@ -2586,7 +2820,8 @@ AP_DECLARE(void) ap_request_resume_suspended_(request_rec *r, int status,
         }
         return;
     }
-    async_request_end(r, async, status, 0);
+    async_request_end(r, async, status,
+                      (entered) ? ASYNC_REQUEST_END_ENTERED : 0);
 }
 
 AP_DECLARE(void) ap_process_request(request_rec *r)
@@ -2645,6 +2880,17 @@ static request_rec *internal_internal_redirect(const char *new_uri,
     if (ap_is_recursion_limit_exceeded(r)) {
         ap_die(HTTP_INTERNAL_SERVER_ERROR, r);
         return NULL;
+    }
+
+    /* The new request starts with no output held by the old one's filters
+     * (they're the new one's, which can't hold output)
+     */
+    if (ap_output_pending_request(r->connection, 0)) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "request filters hold output at an internal redirect: "
+                      "dropping it");
+        AP_DEBUG_ASSERT(0);
+        ap_request_drop_holds(r);
     }
 
     new = (request_rec *) apr_pcalloc(r->pool, sizeof(request_rec));

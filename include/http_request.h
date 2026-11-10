@@ -813,11 +813,22 @@ AP_DECLARE(unsigned int) ap_request_waitctx_ready(const ap_request_waitctx_t *ct
  * @return APR_SUCCESS: held, the filter returns APR_SUCCESS (it may pass
  *         nothing meanwhile); APR_ENOTIMPL: the output can't be held now
  *         (logged at debug: a connection filter, a subrequest's, one below
- *         AsyncFilter, a request that can't suspend, outside the handlers,
+ *         AsyncFilter, a request that can't suspend, outside the hold
+ *         points,
  *         a subrequest of the request in progress, or the MPM refusing the
  *         wait): the filter does its work now, blocking as without this
  *         function; APR_EAGAIN: no context and nothing pending after f
  *         (go on passing); APR_EBUSY: f holds already.
+ * @remark The hold points: while the handlers run (mid-stream holds
+ *         included), and at the request's end: once the handlers are done
+ *         (e.g. a filter holding at the EOS), the end waits for the holds
+ *         before answering the handlers' error status (ap_die()), then
+ *         again after it (e.g. a filter holding ap_die()'s error response,
+ *         or for room), before the request's EOR and write completion
+ *         (ap_die() isn't called again). So the EOR never overtakes held
+ *         output, and the request's pool, which the held data and the
+ *         filter's state live in, stays until it's passed. Meanwhile the
+ *         request is suspended (no thread held).
  * @remark Who calls the filter again, and when: the core's output walk
  *         (ap_check_output_pending()), once its wait completed (with an
  *         empty brigade, what it held prepended) or the filters after it
@@ -880,6 +891,14 @@ AP_CORE_DECLARE(int) ap_request_filter_hold(ap_filter_t *f,
                                             ap_request_waitctx_t *ctx,
                                             unsigned int direction,
                                             unsigned int flags);
+
+/**
+ * Give up the output held by the request filters of a request's tree,
+ * core's own: their holds' waits canceled, what they hold dropped, the
+ * connection closed after the response.
+ * @param r The request
+ */
+AP_CORE_DECLARE(void) ap_request_drop_holds(request_rec *r);
 
 /** Flag for ap_request_read_body(): set the buckets read aside in the
  *  request's pool (they may be transient otherwise) */
