@@ -626,6 +626,8 @@ typedef struct request_waitctx_t {
     struct request_waitreg_t *wait;  /* the pending wait it's in, if any */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
     apr_interval_time_t timeout;  /* of its pending wait, resolved */
+    apr_interval_time_t due;      /* of its pending wait, until the output
+                                   * paced by a filter is due, if any */
     unsigned int ready;           /* AP_WAIT_* of the last wait */
     unsigned int kept     :1,     /* its pfd may be kept by the MPM */
                  attached :1,     /* its notifier attached to the tree's
@@ -637,6 +639,21 @@ typedef struct request_waitctx_t {
 #define WAITCTX_LOG_MARK(ctx) __FILE__, __LINE__, (ctx)->pub.module_index
 
 #define REQUEST_WAITCTX_DIR(direction) (((direction) & AP_WAIT_OUT) ? 1 : 0)
+
+/* The targets of a wait's direction in its connection's filters rather than
+ * its descriptor (request_waitreg_t->held), as bits: the client's output held
+ * by a request filter until the wait of a context completes (the hold's
+ * own wait), the core completing this one then; or paced by a request
+ * filter until a time (the wait's timeout then completes it as ready).
+ */
+#define REQUEST_WAIT_HELD_OUT (1u << 0)
+#define REQUEST_WAIT_DUE_OUT  (1u << 1)
+
+/* The directions of a wait's context polled on its descriptor */
+#define REQUEST_WAIT_POLLED(g, i) \
+    ((g)->directions[i] & ~(((g)->held[i] & (REQUEST_WAIT_HELD_OUT \
+                                             | REQUEST_WAIT_DUE_OUT)) \
+                            ? AP_WAIT_OUT : 0))
 
 /* A pending wait of a request (ap_request_wait(), ap_request_wait_any()):
  * its contexts and continuation, from its registration until its
@@ -658,7 +675,11 @@ typedef struct request_waitreg_t {
                                    * MPM wait (or the delay's poll), or -1 */
     unsigned int *keep;           /* of ctxs: whether the MPM may keep each
                                    * context's pfd */
-    int nctxs, nalloc;            /* ctxs used, allocated (all four) */
+    unsigned int *held;           /* of ctxs: the directions whose target
+                                   * isn't the context's descriptor but its
+                                   * connection's filters (REQUEST_WAIT_HELD_*,
+                                   * REQUEST_WAIT_DUE_OUT) */
+    int nctxs, nalloc;            /* ctxs used, allocated (all five) */
     apr_interval_time_t timeout;  /* the smallest of its contexts', capped
                                    * by a deadline, negative for none */
     apr_time_t expiry;            /* when it times out, from its first MPM
@@ -669,6 +690,7 @@ typedef struct request_waitreg_t {
     void *baton;
     apr_status_t status;          /* of its completion, for fn */
     unsigned int timer_expires :1, /* its timeout is a timer's */
+                 due_expires   :1, /* its timeout is a paced output's */
                  drained       :1, /* AP_MPM_WAIT_DRAINED for its pfds */
                  registered    :1, /* in an MPM wait already (expiry set) */
                  completed     :1; /* its continuation to be called */
@@ -778,6 +800,7 @@ static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int 
         g->pfd_index = apr_palloc(w->r->pool,
                                   g->nalloc * sizeof(*g->pfd_index));
         g->keep = apr_palloc(w->r->pool, g->nalloc * sizeof(*g->keep));
+        g->held = apr_palloc(w->r->pool, g->nalloc * sizeof(*g->held));
     }
     g->next = NULL;
     g->waiter = NULL;
@@ -789,6 +812,7 @@ static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int 
     g->baton = NULL;
     g->status = APR_SUCCESS;
     g->timer_expires = 0;
+    g->due_expires = 0;
     g->drained = 0;
     g->registered = 0;
     g->completed = 0;
@@ -1116,13 +1140,18 @@ static const char *request_waitctx_dir_name(const request_waitctx_t *ctx,
 
 /* The directions of a context ready in its connection's filters already:
  * input pending (or an error the read will report), no output pending (or
- * an error).
+ * an error). For output still pending, *held tells what it waits for when
+ * it's not room (POLLOUT): a held filter's wait (REQUEST_WAIT_HELD_OUT), or
+ * a time (REQUEST_WAIT_DUE_OUT, *due).
  */
 static unsigned int request_waitctx_check_ready(request_waitctx_t *ctx,
-                                                unsigned int directions)
+                                                unsigned int directions,
+                                                unsigned int *held, apr_time_t *due)
 {
     unsigned int ready = 0;
 
+    *held = 0;
+    *due = 0;
     if (!ctx->c) {
         return 0;
     }
@@ -1144,6 +1173,18 @@ static unsigned int request_waitctx_check_ready(request_waitctx_t *ctx,
     if (directions & AP_WAIT_OUT) {
         if (ap_check_output_pending(ctx->c) != AGAIN) {
             ready |= AP_WAIT_OUT;
+        }
+        else {
+            ap_output_targets_t t;
+
+            ap_output_pending_targets(ctx->c, &t);
+            if (t.held) {
+                *held |= REQUEST_WAIT_HELD_OUT;
+            }
+            else if (t.due) {
+                *held |= REQUEST_WAIT_DUE_OUT;
+                *due = t.due;
+            }
         }
     }
     return ready;
@@ -1312,13 +1353,20 @@ static void request_waitreg_completion(struct ap_request_waitset *w,
             g->deadline->deadline_reached = 1;
             g->status = APR_TIMEUP;
         }
-        else if (g->timer_expires) {
+        else if (g->timer_expires || g->due_expires) {
             g->status = APR_SUCCESS;
             for (i = 0; i < g->nctxs; i++) {
                 request_waitctx_t *ctx = g->ctxs[i];
-                if (ctx && ctx->kind == REQUEST_WAITCTX_TIMER
+                if (!ctx) {
+                    continue;
+                }
+                if (g->timer_expires && ctx->kind == REQUEST_WAITCTX_TIMER
                     && ctx->timeout == g->timeout) {
                     ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
+                }
+                if (g->due_expires && (g->held[i] & REQUEST_WAIT_DUE_OUT)
+                    && ctx->due == g->timeout) {
+                    ctx->ready |= AP_WAIT_OUT; /* the paced output is due */
                 }
             }
         }
@@ -1470,7 +1518,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
     pg = &w->waits;
     while ((g = *pg) != NULL) {
         apr_interval_time_t left = -1;
-        int npfds = 0, nnotifiers = 0;
+        int npfds = 0, nnotifiers = 0, nheld = 0;
 
         for (i = 0; i < g->nctxs; i++) {
             request_waitctx_t *ctx = g->ctxs[i];
@@ -1479,10 +1527,14 @@ static void request_waitset_register(struct ap_request_waitset *w)
             if (!ctx) {
                 continue;
             }
+            if (g->held[i] & REQUEST_WAIT_HELD_OUT) {
+                nheld++; /* completed by the hold's wait */
+            }
             if (ctx->attached) {
                 nnotifiers++;
             }
-            else if (REQUEST_WAITCTX_HAS_PFD(ctx) && !ctx->released) {
+            else if (REQUEST_WAITCTX_HAS_PFD(ctx) && !ctx->released
+                     && REQUEST_WAIT_POLLED(g, i)) {
                 /* A readiness the MPM saw for the last wait of a kept pfd
                  * was consumed since if the wait's caller said so (or its
                  * delay's poll found none)
@@ -1494,7 +1546,8 @@ static void request_waitset_register(struct ap_request_waitset *w)
                         flags |= AP_MPM_WAIT_DRAINED;
                     }
                 }
-                g->pfd_index[i] = request_waitset_pfd(w, ctx, g->directions[i],
+                g->pfd_index[i] = request_waitset_pfd(w, ctx,
+                                                      REQUEST_WAIT_POLLED(g, i),
                                                       flags);
                 npfds++;
             }
@@ -1509,7 +1562,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
         else if (g->expiry) {
             left = (g->expiry > now) ? g->expiry - now : 0;
         }
-        if (!npfds && !nnotifiers && !g->expiry) {
+        if (!npfds && !nnotifiers && !nheld && !g->expiry) {
             /* Its descriptors were released: nothing would complete it */
             *pg = g->next;
             request_waitreg_finish(g, REQUEST_WAITREG_DROPPED, AP_MPM_WAIT_READY);
@@ -1579,6 +1632,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
  */
 typedef struct {
     int notifiers;                /* notifier contexts */
+    int held;                     /* contexts waiting for held output */
     apr_interval_time_t delay;    /* the smallest of the pfds', if any */
 } request_waitreg_plan_t;
 
@@ -1599,11 +1653,13 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
                                    const unsigned int *directions, int any,
                                    request_waitreg_plan_t *plan)
 {
-    apr_interval_time_t timer_timeout = -1;
+    apr_interval_time_t timer_timeout = -1, due_timeout = -1;
+    apr_time_t now = 0;
     unsigned int ready = 0;
     int i;
 
     plan->notifiers = 0;
+    plan->held = 0;
     plan->delay = -1;
     apr_array_clear(w->pfds);
 
@@ -1629,6 +1685,8 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         g->directions[i] = directions[i];
         g->pfd_index[i] = -1;
         g->keep[i] = 1;
+        g->held[i] = 0;
+        ctx->due = -1;
         if (ctx->notifier) {
             /* Attached to the tree's notifier by
              * request_waitreg_attach_notifiers()
@@ -1649,11 +1707,30 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             }
         }
 
-        /* Ready in the connection's filters already? */
-        ctx->ready = request_waitctx_check_ready(ctx, directions[i]);
-        ready |= ctx->ready;
-        if (ready) {
-            continue; /* OK below: the next contexts are only checked */
+        /* Ready in the connection's filters already? Otherwise the
+         * client's output may wait for a request filter holding or pacing
+         * it rather than for room.
+         */
+        {
+            apr_time_t due;
+            ctx->ready = request_waitctx_check_ready(ctx, directions[i], &g->held[i],
+                                                     &due);
+            ready |= ctx->ready;
+            if (ready) {
+                continue; /* OK below: the next contexts are only checked */
+            }
+            if (g->held[i] & REQUEST_WAIT_HELD_OUT) {
+                plan->held++;
+            }
+            if (g->held[i] & REQUEST_WAIT_DUE_OUT) {
+                if (!now) {
+                    now = apr_time_now();
+                }
+                ctx->due = (due > now) ? due - now : 0;
+                if (due_timeout < 0 || ctx->due < due_timeout) {
+                    due_timeout = ctx->due;
+                }
+            }
         }
 
         t = request_waitctx_timeout(ctx, directions[i]);
@@ -1666,21 +1743,21 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
             timer_timeout = t;
         }
 
-        if (REQUEST_WAITCTX_HAS_PFD(ctx)) {
+        if (REQUEST_WAITCTX_HAS_PFD(ctx) && REQUEST_WAIT_POLLED(g, i)) {
             apr_pollfd_t *pfd;
 
             g->pfd_index[i] = w->pfds->nelts;
             pfd = apr_array_push(w->pfds);
             *pfd = ctx->pfd;
             pfd->reqevents = 0;
-            if (directions[i] & AP_WAIT_IN) {
+            if (REQUEST_WAIT_POLLED(g, i) & AP_WAIT_IN) {
                 pfd->reqevents |= APR_POLLIN;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_IN)].waits) {
                     g->keep[i] = 0;
                 }
             }
-            if (directions[i] & AP_WAIT_OUT) {
+            if (REQUEST_WAIT_POLLED(g, i) & AP_WAIT_OUT) {
                 pfd->reqevents |= APR_POLLOUT;
                 if (!any
                     && !ctx->sock->dirs[REQUEST_WAITCTX_DIR(AP_WAIT_OUT)].waits) {
@@ -1698,7 +1775,12 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
     if (ready) {
         return OK;
     }
+    /* Paced output completes the wait as ready once due */
+    if (due_timeout >= 0 && (g->timeout < 0 || due_timeout < g->timeout)) {
+        g->timeout = due_timeout;
+    }
     g->timer_expires = (timer_timeout >= 0 && timer_timeout == g->timeout);
+    g->due_expires = (due_timeout >= 0 && due_timeout == g->timeout);
     return AGAIN;
 }
 
@@ -1772,9 +1854,13 @@ static void request_waitreg_commit(struct ap_request_waitset *w,
         }
         ap_log_rerror(WAITCTX_LOG_MARK(ctx),
                       APLOG_TRACE5, 0, ctx->pub.r,
-                      "waiting for the %s%s (async)",
+                      "waiting for the %s%s%s (async)",
                       request_waitctx_kind_names[ctx->kind],
-                      request_waitctx_dir_name(ctx, g->directions[i]));
+                      request_waitctx_dir_name(ctx, g->directions[i]),
+                      (g->held[i] & REQUEST_WAIT_HELD_OUT)
+                      ? ", its output held by a filter"
+                      : (g->held[i] & REQUEST_WAIT_DUE_OUT)
+                        ? ", its output paced by a filter" : "");
     }
     g->waiter = g->ctxs[0]->pub.r;
     g->fn = fn;
@@ -1897,6 +1983,7 @@ static void request_waitreg_deadline(ap_request_async_t *async,
     if (g->timeout < 0 || left < g->timeout) {
         g->timeout = left;
         g->timer_expires = 0;
+        g->due_expires = 0;
         g->deadline = which;
     }
     if (plan->delay > left) {
@@ -1962,7 +2049,7 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     }
 
     /* Something must complete it (the MPM would refuse the wait) */
-    if (!w->pfds->nelts && !plan.notifiers && g->timeout < 0) {
+    if (!w->pfds->nelts && !plan.notifiers && !plan.held && g->timeout < 0) {
         const request_waitctx_t *first = g->ctxs[0];
 
         ap_log_rerror(WAITCTX_LOG_MARK(first),

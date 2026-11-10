@@ -719,6 +719,12 @@ AP_DECLARE(void) ap_request_waitctx_release(ap_request_waitctx_t *ctx);
  *         previous wait): go on blocking (or sleep for a timer).
  * @remark From the second wait in a direction, the MPM keeps the target's
  *         descriptor registered (AP_MPM_WAIT_KEEP_PFDS).
+ * @remark The output pending in a connection's filters may wait for
+ *         something else than room: a request filter holding it until the
+ *         wait of a context completes (the core completes this wait then,
+ *         as ready), or pacing it until a time (this wait completes then,
+ *         as ready, unless its own timeout is earlier). The caller checks
+ *         the output again and waits again as usual.
  * @remark Input that the filters keep after the caller's last read returned
  *         EAGAIN (e.g. mod_ssl's part of a line) is pending but not readable:
  *         such a wait answers OK once, then waits.
