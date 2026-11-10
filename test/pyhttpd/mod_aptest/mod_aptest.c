@@ -63,6 +63,28 @@
 #define APTEST_HAS_HOLD 1
 #endif
 
+/* Request filters delegating their holds to subrequests
+ * (AP_FILTER_HOLD_DELEGATED)
+ */
+#if defined(APTEST_HAS_HOLD) && defined(APTEST_HAS_SUBREQ) \
+    && AP_MODULE_MAGIC_AT_LEAST(20260601, 18)
+#define APTEST_HAS_FSUBREQ 1
+#endif
+
+/* AptestFilterSubreq (see "the filter running subrequests") */
+typedef struct {
+    const char *uri;            /* NULL if unset */
+    int n;
+    int capture;                /* "captured", else "below" */
+    unsigned int flags;         /* APTEST_FSUBREQ_* */
+    apr_interval_time_t timeout; /* "timeout <ms>", else 0 */
+} aptest_fsubreq_conf;
+
+#define APTEST_FSUBREQ_MID      (1u << 0) /* before the first data */
+#define APTEST_FSUBREQ_PROTO    (1u << 1) /* a protocol filter, errors */
+#define APTEST_FSUBREQ_NOHOLD   (1u << 2) /* no delegated hold (misuse) */
+#define APTEST_FSUBREQ_UNPAIRED (1u << 3) /* a hold without work (misuse) */
+
 /* AptestSuspend and AptestSuspend2 (see "the suspending handlers") */
 typedef struct {
     int set;
@@ -95,6 +117,7 @@ typedef struct {
     apr_interval_time_t hold_time;  /* how long a hold lasts */
     apr_size_t hold_size;           /* "room": the pieces passed */
     int hold_proto;                 /* "proto": a protocol filter */
+    aptest_fsubreq_conf fsubreq;    /* AptestFilterSubreq */
 } aptest_dir_conf;
 
 /* AptestHold's modes */
@@ -184,6 +207,7 @@ static void *aptest_merge_dir_conf(apr_pool_t *p, void *basev, void *addv)
         conf->hold_size = base->hold_size;
         conf->hold_proto = base->hold_proto;
     }
+    conf->fsubreq = (add->fsubreq.uri) ? add->fsubreq : base->fsubreq;
     return conf;
 }
 
@@ -413,6 +437,50 @@ static const char *aptest_set_hold(cmd_parms *cmd, void *dconf,
 }
 #endif /* APTEST_HAS_HOLD */
 
+#ifdef APTEST_HAS_FSUBREQ
+static const char *aptest_set_fsubreq(cmd_parms *cmd, void *dconf,
+                                      int argc, char *const argv[])
+{
+    aptest_fsubreq_conf *fs = &((aptest_dir_conf *)dconf)->fsubreq;
+    int i;
+
+    if (argc < 3 || !apr_isdigit(*argv[1])
+        || (strcmp(argv[2], "captured") != 0
+            && strcmp(argv[2], "below") != 0)) {
+        return "AptestFilterSubreq <uri> <n> captured|below [mid] [proto] "
+               "[nohold|unpaired] [timeout <ms>]";
+    }
+    fs->uri = argv[0];
+    fs->n = (int)apr_atoi64(argv[1]);
+    fs->capture = (*argv[2] == 'c');
+    fs->flags = 0;
+    fs->timeout = 0;
+    for (i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "mid") == 0) {
+            fs->flags |= APTEST_FSUBREQ_MID;
+        }
+        else if (strcmp(argv[i], "proto") == 0) {
+            fs->flags |= APTEST_FSUBREQ_PROTO;
+        }
+        else if (strcmp(argv[i], "nohold") == 0) {
+            fs->flags |= APTEST_FSUBREQ_NOHOLD;
+        }
+        else if (strcmp(argv[i], "unpaired") == 0) {
+            fs->flags |= APTEST_FSUBREQ_UNPAIRED;
+        }
+        else if (strcmp(argv[i], "timeout") == 0 && i + 1 < argc
+                 && apr_isdigit(*argv[i + 1])) {
+            fs->timeout = apr_time_from_msec(apr_atoi64(argv[++i]));
+        }
+        else {
+            return apr_pstrcat(cmd->pool, "AptestFilterSubreq: unknown "
+                               "option ", argv[i], NULL);
+        }
+    }
+    return NULL;
+}
+#endif /* APTEST_HAS_FSUBREQ */
+
 static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE12("AptestWait", aptest_set_wait, NULL, OR_ALL,
                    "how the \"aptest-wait\" handler waits: timer <ms>, echo, "
@@ -440,6 +508,12 @@ static const command_rec aptest_cmds[] = {
     AP_INIT_TAKE_ARGV("AptestHold", aptest_set_hold, NULL, OR_ALL,
                       "how the holding filters hold: timer|notifier|chunk|"
                       "input <ms> [proto] or room <bytes>"),
+#endif
+#ifdef APTEST_HAS_FSUBREQ
+    AP_INIT_TAKE_ARGV("AptestFilterSubreq", aptest_set_fsubreq, NULL, OR_ALL,
+                      "the filter running subrequests: <uri> <n> "
+                      "captured|below [mid] [proto] [nohold|unpaired] "
+                      "[timeout <ms>]"),
 #endif
     {NULL}
 };
@@ -2943,6 +3017,254 @@ static void aptest_hold_insert(request_rec *r)
 }
 #endif /* APTEST_HAS_HOLD */
 
+#ifdef APTEST_HAS_FSUBREQ
+/*
+ * The filter running subrequests ("AptestFilterSubreq <uri> <n>
+ * captured|below [mid] [proto] [nohold|unpaired] [timeout <ms>]"), a request
+ * output filter (a resource filter, as mod_include's, seeing a subrequest's
+ * EOS) inserted by the insert_filter hook (subrequests' included):
+ * at the EOS, or with "mid" before the first data it's passed (mid-stream,
+ * the producer backing off meanwhile), it delegates its hold to a
+ * subrequest of uri (ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED,
+ * what it was passed given to the core to hold, then ap_run_sub_req_async()),
+ * n times in turn: the next one when the core calls it again after the
+ * previous one's done function, then it passes what it holds. The
+ * subrequests' output is "captured" (counted and digested, as
+ * "aptest-subreq" does) or passed "below" the filter (before what it holds,
+ * as mod_include's include virtual). A line "aptest-fsubreq: n=<n>
+ * statuses=<s1,...>[ captured=<bytes>:<md5 prefix>]" goes before the EOS
+ * (the response's Content-Length unset). With "proto" it's a protocol filter
+ * acting on error responses only (ap_die()'s, the request's second hold
+ * point), adding no line. A hold refused (e.g. AsyncRequests Off, a
+ * subrequest's filter) runs the subrequests blocking (ap_run_sub_req()):
+ * the same bytes in every mode. Misuses, for the core's checks: "nohold"
+ * calls ap_run_sub_req_async() without the hold (run blocking by the core,
+ * logged), "unpaired" delegates its hold the first time without running a
+ * subrequest (released by the core, logged), then goes on. What it did is
+ * logged at the request's end (aptest:info): holds, subrequests suspended,
+ * ended at once, refused holds, the statuses.
+ */
+static ap_filter_rec_t *aptest_fsubreq_handle;
+static ap_filter_rec_t *aptest_fsubreq_proto_handle;
+
+typedef struct {
+    ap_filter_t *f;
+    const aptest_fsubreq_conf *conf;
+    aptest_subreq_t cap;           /* the capture's state, statuses */
+    apr_bucket_brigade *more;      /* passed while its work runs */
+    int holds, nasync, ninline, refused, unpaired;
+    unsigned int started   :1,     /* the subrequests begun */
+                 finished  :1,     /* all done */
+                 waiting   :1,     /* a delegated hold's work runs */
+                 done      :1,     /* its done function was called */
+                 unpairing :1,     /* the unpaired hold released next */
+                 unpaired_tried :1; /* "unpaired": tried once */
+} aptest_fsubreq_t;
+
+static apr_status_t aptest_fsubreq_report(void *data)
+{
+    aptest_fsubreq_t *s = data;
+
+    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, s->f->r, APLOGNO()
+                  "aptest-fsubreq: '%s' filter: holds=%d async=%d inline=%d "
+                  "refused=%d unpaired=%d n=%d statuses=%s", s->f->frec->name,
+                  s->holds, s->nasync, s->ninline, s->refused, s->unpaired,
+                  s->cap.i, s->cap.statuses);
+    return APR_SUCCESS;
+}
+
+static void aptest_fsubreq_done(request_rec *rsub, int status, void *baton)
+{
+    aptest_fsubreq_t *s = baton;
+
+    /* Recorded for the filter, which goes on when called again */
+    aptest_subreq_record(&s->cap, rsub, status);
+    s->done = 1;
+}
+
+/* Run the subrequests left: APR_SUCCESS with bb given to the core to hold
+ * if one suspended (s->waiting), else with bb as it was once all are done
+ */
+static apr_status_t aptest_fsubreq_run(aptest_fsubreq_t *s,
+                                       apr_bucket_brigade *bb)
+{
+    ap_filter_t *f = s->f;
+    request_rec *r = f->r;
+    request_rec *rsub;
+    apr_status_t rv;
+    int rc;
+
+    if ((s->conf->flags & APTEST_FSUBREQ_UNPAIRED) && !s->unpaired_tried) {
+        /* A hold without its work: the core releases it */
+        s->unpaired_tried = 1;
+        rv = ap_filter_pending_wait(f, bb, NULL, 0, AP_FILTER_HOLD_DELEGATED);
+        if (rv == APR_SUCCESS) {
+            s->unpaired++;
+            s->unpairing = 1;
+            return APR_SUCCESS;
+        }
+    }
+    while (s->cap.i < s->conf->n) {
+        s->cap.i++;
+        if (s->conf->capture) {
+            rsub = ap_sub_req_lookup_uri(s->conf->uri, r, NULL);
+            ap_add_output_filter_handle(aptest_capture_handle, &s->cap, rsub,
+                                        rsub->connection);
+        }
+        else {
+            rsub = ap_sub_req_lookup_uri(s->conf->uri, r, f->next);
+        }
+        if (rsub->status != HTTP_OK) {
+            aptest_subreq_record(&s->cap, rsub, rsub->status);
+            continue;
+        }
+        if (s->conf->flags & APTEST_FSUBREQ_NOHOLD) {
+            /* Without the hold: the core runs it blocking (logged) */
+            rc = ap_run_sub_req_async(rsub, s->conf->timeout,
+                                      aptest_fsubreq_done, s);
+            if (rc == SUSPENDED) {
+                /* Lost under a filter: what the core prevents */
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                              "aptest-fsubreq: a subrequest suspended "
+                              "without a delegated hold");
+                return APR_EGENERAL;
+            }
+            aptest_subreq_record(&s->cap, rsub, rc);
+            continue;
+        }
+        rv = ap_filter_pending_wait(f, bb, NULL, 0, AP_FILTER_HOLD_DELEGATED);
+        if (rv != APR_SUCCESS) {
+            s->refused++;
+            aptest_subreq_record(&s->cap, rsub, ap_run_sub_req(rsub));
+            continue;
+        }
+        s->holds++;
+        rc = ap_run_sub_req_async(rsub, s->conf->timeout,
+                                  aptest_fsubreq_done, s);
+        if (rc == SUSPENDED) {
+            s->nasync++;
+            s->waiting = 1;
+            s->done = 0;
+            return APR_SUCCESS;
+        }
+        /* Ended at once: the hold undone, bb back */
+        s->ninline++;
+        aptest_subreq_record(&s->cap, rsub, rc);
+    }
+    s->finished = 1;
+    return APR_SUCCESS;
+}
+
+static apr_status_t aptest_fsubreq_filter(ap_filter_t *f,
+                                          apr_bucket_brigade *bb)
+{
+    aptest_fsubreq_t *s = f->ctx;
+    request_rec *r = f->r;
+    apr_bucket *e, *eos = NULL;
+    int data = 0;
+    apr_status_t rv;
+
+    if (!s) {
+        const aptest_dir_conf *conf;
+        conf = ap_get_module_config(r->per_dir_config, &aptest_module);
+        f->ctx = s = apr_pcalloc(r->pool, sizeof(*s));
+        s->f = f;
+        s->conf = &conf->fsubreq;
+        apr_md5_init(&s->cap.md5);
+        s->cap.r = r;
+        s->more = apr_brigade_create(r->pool, f->c->bucket_alloc);
+        apr_pool_cleanup_register(r->pool, s, aptest_fsubreq_report,
+                                  apr_pool_cleanup_null);
+        if (!(s->conf->flags & APTEST_FSUBREQ_PROTO)) {
+            apr_table_unset(r->headers_out, "Content-Length");
+        }
+    }
+    if ((s->conf->flags & APTEST_FSUBREQ_PROTO) && r->status < 400) {
+        return ap_pass_brigade(f->next, bb);
+    }
+
+    if (s->waiting && !s->done) {
+        /* More from a producer not backing off: behind what's held (metadata
+         * buckets without setaside are kept as is)
+         */
+        rv = ap_save_brigade(f, &s->more, &bb, r->pool);
+        return APR_STATUS_IS_ENOTIMPL(rv) ? APR_SUCCESS : rv;
+    }
+    if (s->waiting || s->unpairing) {
+        /* Called again by the core: what it held prepended, then what came
+         * meanwhile; the next subrequests
+         */
+        s->waiting = s->done = s->unpairing = 0;
+        APR_BRIGADE_CONCAT(bb, s->more);
+        rv = aptest_fsubreq_run(s, bb);
+        if (rv != APR_SUCCESS || !s->finished) {
+            return rv;
+        }
+    }
+
+    for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+         e = APR_BUCKET_NEXT(e)) {
+        if (APR_BUCKET_IS_EOS(e)) {
+            eos = e;
+        }
+        else if (!APR_BUCKET_IS_METADATA(e)) {
+            data = 1;
+        }
+    }
+    if (!s->started && (eos || (data && (s->conf->flags
+                                         & APTEST_FSUBREQ_MID)))) {
+        s->started = 1;
+        rv = aptest_fsubreq_run(s, bb);
+        if (rv != APR_SUCCESS || !s->finished) {
+            return rv;
+        }
+        /* bb is back as it was (the subrequests ended at once) */
+        eos = NULL;
+        for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+             e = APR_BUCKET_NEXT(e)) {
+            if (APR_BUCKET_IS_EOS(e)) {
+                eos = e;
+            }
+        }
+    }
+    if (eos && s->finished && !(s->conf->flags & APTEST_FSUBREQ_PROTO)) {
+        unsigned char digest[APR_MD5_DIGESTSIZE];
+        char line[256];
+        apr_size_t len;
+
+        len = apr_snprintf(line, sizeof(line),
+                           "aptest-fsubreq: n=%d statuses=%s", s->cap.i,
+                           s->cap.statuses);
+        if (s->conf->capture) {
+            apr_md5_final(digest, &s->cap.md5);
+            len += apr_snprintf(line + len, sizeof(line) - len,
+                                " captured=%" APR_OFF_T_FMT
+                                ":%02x%02x%02x%02x", s->cap.captured,
+                                digest[0], digest[1], digest[2], digest[3]);
+        }
+        len += apr_snprintf(line + len, sizeof(line) - len, "\n");
+        APR_BUCKET_INSERT_BEFORE(eos,
+                                 apr_bucket_heap_create(line, len, NULL,
+                                                        f->c->bucket_alloc));
+    }
+    return ap_pass_brigade(f->next, bb);
+}
+
+static void aptest_fsubreq_insert(request_rec *r)
+{
+    const aptest_dir_conf *conf = ap_get_module_config(r->per_dir_config,
+                                                       &aptest_module);
+
+    if (!conf->fsubreq.uri) {
+        return;
+    }
+    ap_add_output_filter_handle((conf->fsubreq.flags & APTEST_FSUBREQ_PROTO)
+                                ? aptest_fsubreq_proto_handle
+                                : aptest_fsubreq_handle, NULL, r,
+                                r->connection);
+}
+#endif /* APTEST_HAS_FSUBREQ */
+
 /* Install this module into the apache2 infrastructure.
  */
 static void aptest_hooks(apr_pool_t *pool)
@@ -2993,6 +3315,17 @@ static void aptest_hooks(apr_pool_t *pool)
                                                      aptest_hold_in_filter,
                                                      NULL,
                                                      AP_FTYPE_CONTENT_SET);
+#endif
+#ifdef APTEST_HAS_FSUBREQ
+    ap_hook_insert_filter(aptest_fsubreq_insert, NULL, NULL, APR_HOOK_MIDDLE);
+    aptest_fsubreq_handle = ap_register_output_filter("APTEST_FSUBREQ",
+                                                      aptest_fsubreq_filter,
+                                                      NULL,
+                                                      AP_FTYPE_RESOURCE);
+    aptest_fsubreq_proto_handle = ap_register_output_filter("APTEST_FSUBREQ_PROTO",
+                                                            aptest_fsubreq_filter,
+                                                            NULL,
+                                                            AP_FTYPE_PROTOCOL);
 #endif
 
 }
