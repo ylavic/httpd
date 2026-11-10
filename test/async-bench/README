@@ -236,6 +236,25 @@ checks/async-pace-check.py PREFIX WORKDIR
   also checks that no worker is held (mod_status). Ports 18463-18464 (the
   backend's -addr on 18464).
 
+checks/async-tunnel-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Tunnels held by their forward hooks (ap_proxy_tunnel_hold()) through
+  mod_aptest's AptestTunnelHold hook (mod_aptest built as for
+  async-wait-check), on mod_proxy_http's Upgrade tunnels to an echo backend
+  sending ticks or not: 8 tunnels on 2 threads holding each message 300ms,
+  the ticks flowing while the client's message is held (and not with
+  "pause"), a hold longer than the idle timeout (each direction on its own
+  idle clock: the other direction quiet ends the tunnel at the idle
+  timeout, flowing it keeps the tunnel until both are idle), a service's
+  answer timing out (APR_TIMEUP to the hook), a hold without timeout
+  bounded by the idle timeout, a delegated subrequest per message (proxied,
+  the ticks flowing meanwhile; static, ended at once), a TLS front with two
+  messages decrypted at once, holds on sockets in both directions (no
+  EVENT_KEPT_MAX line) and a graceful stop while held. "sync"
+  is ProxyAsyncDelay -1 (a synchronous tunnel: the holds refused, the hook
+  working blocking: the same bytes), "async" also checks that no worker is
+  held (mod_status), the times and the ticks. Ports 18467-18471 (the
+  backend's -addr on 18471).
+
 checks/h1-head-check.py PREFIX WORKDIR
   The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
   from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
