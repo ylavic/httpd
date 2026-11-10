@@ -468,6 +468,14 @@ typedef void ap_sub_req_done_fn(request_rec *rsub, int status, void *baton);
  *         may be suspended at once, each done called when it completes: the
  *         main request's handlers are resumed (or it's ended) once, after
  *         the last one it waits for.
+ * @remark The core doesn't order the output of the producers running
+ *         meanwhile: with other waits pending whose continuations write
+ *         (e.g. a tunnel's other direction, another subrequest passing its
+ *         output, the main request's own producer), keeping what reaches
+ *         the client in order is the caller's job, e.g. by capturing the
+ *         subrequest's output, or by pausing the other producers until done
+ *         (a filter's delegated hold pauses the main request's producer, a
+ *         tunnel's hold can pause both directions).
  * @remark Don't destroy rsub (refused, logged), nor pass output for the main
  *         request, until done is called. The subrequest may run on other
  *         threads than the caller's, as continuations do.
