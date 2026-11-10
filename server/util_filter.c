@@ -53,11 +53,13 @@
 
 /* Why a request filter is pending besides its set-aside data (fp->bb), as
  * bits of fp->why: its output is held until the filters after it have room,
- * until a time, or until the wait of a context completes.
+ * until a time, or until the wait of a context completes. For an input
+ * filter: its pending data needs more input to be readable.
  */
 #define FILTER_PENDING_ROOM (1u << 0) /* the filters after it drained */
 #define FILTER_PENDING_DUE  (1u << 1) /* fp->due reached */
 #define FILTER_PENDING_HELD (1u << 2) /* fp->ctx's wait completed */
+#define FILTER_PENDING_MORE (1u << 3) /* input: not readable yet */
 
 struct ap_filter_private {
     /* Link to a pending_ring (keep first preferably) */
@@ -1117,6 +1119,21 @@ AP_DECLARE(apr_status_t) ap_filter_setaside_brigade(ap_filter_t *f,
     return rv;
 }
 
+AP_DECLARE(void) ap_filter_pending_more(ap_filter_t *f, int more)
+{
+    struct ap_filter_private *fp = f->priv;
+
+    if (f->frec->direction != AP_FILTER_INPUT) {
+        return;
+    }
+    if (more) {
+        fp->why |= FILTER_PENDING_MORE;
+    }
+    else {
+        fp->why &= ~FILTER_PENDING_MORE;
+    }
+}
+
 AP_DECLARE(void) ap_filter_adopt_brigade(ap_filter_t *f,
                                          apr_bucket_brigade *bb)
 {
@@ -1738,9 +1755,13 @@ AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c)
         apr_bucket *e;
 
         /* if there is a leading non-opaque (length != -1) bucket
-         * in place, then we have data pending
+         * in place, then we have data pending, readable unless the filter
+         * needs more input for it (e.g. the start of a line)
          */
         AP_DEBUG_ASSERT(fp->bb);
+        if (fp->why & FILTER_PENDING_MORE) {
+            continue;
+        }
         e = APR_BRIGADE_FIRST(fp->bb);
         if (e != APR_BRIGADE_SENTINEL(fp->bb) && e->length != (apr_size_t)-1) {
             rc = AGAIN;

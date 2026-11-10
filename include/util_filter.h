@@ -621,6 +621,19 @@ AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
                                                      apr_bucket **flush_upto);
 
 /**
+ * Say whether the input an input filter keeps pending (set aside with
+ * ap_filter_adopt_brigade()) needs more input from the network before it's
+ * readable, e.g. the start of a line kept after a nonblocking AP_MODE_GETLINE
+ * read returned EAGAIN: ap_check_input_pending() then doesn't count it as
+ * readable (AGAIN), so a caller waits for the socket rather than reading
+ * again at once. Readable by default; the filter says so again when what it
+ * keeps changes.
+ * @param f The current (input) filter
+ * @param more Non-zero if more input is needed, zero once readable
+ */
+AP_DECLARE(void) ap_filter_pending_more(ap_filter_t *f, int more);
+
+/**
  * Adopt a bucket brigade as is (no setaside nor copy).
  * @param f The current filter
  * @param bb The bucket brigade adopted.  This brigade is always empty
@@ -669,7 +682,8 @@ AP_DECLARE(int) ap_check_output_pending(conn_rec *c);
  *
  * AGAIN has the input's meaning, the opposite of the output's: data can be
  * read now without the socket being readable, so the caller reads rather
- * than waiting for the socket.
+ * than waiting for the socket. Data a filter keeps but needs more input for
+ * (ap_filter_pending_more()) is not readable.
  *
  * @param c The connection.
  * @return OK if no pending data remain (wait for the socket before
