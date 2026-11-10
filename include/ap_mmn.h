@@ -857,6 +857,9 @@
  *                         hook take AP_MPM_WAIT_KEEP_PFDS and
  *                         AP_MPM_WAIT_DRAINED per pfd (pfds_flags) instead
  *                         of flags for the whole wait
+ * 20260601.11 (2.5.1-dev) Add ap_output_targets_t,
+ *                         ap_output_pending_targets() and
+ *                         ap_output_pending_request() to util_filter.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -864,7 +867,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 10    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 11    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

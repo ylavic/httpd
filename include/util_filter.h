@@ -633,7 +633,8 @@ AP_DECLARE(void) ap_filter_adopt_brigade(ap_filter_t *f,
 
 /**
  * This function calculates whether there are any as yet unsent
- * buffered brigades in downstream filters, and returns non zero
+ * buffered brigades in downstream filters, or request filters holding their
+ * output (until a time, room or the wait of a context), and returns non zero
  * if so.
  *
  * A filter should use this to determine whether the passing of data
@@ -704,6 +705,47 @@ AP_DECLARE_HOOK(int, input_pending, (conn_rec *c))
  * The core output_pending hook.
  */
 AP_DECLARE_NONSTD(int) ap_core_output_pending(conn_rec *c);
+
+/**
+ * @brief What the output pending in a connection's filters waits for, core's
+ * own (ap_output_pending_targets())
+ */
+typedef struct {
+    /** APR_POLLOUT if it waits for the connection to be writable (room),
+     *  else 0 */
+    apr_int16_t events;
+    /** Else, if not zero, the time a request filter pacing its output
+     *  passes more (apr_time_now() base) */
+    apr_time_t due;
+    /** Else, if not zero, a request filter holds its output until the wait
+     *  of a context completes (a pending wait of its own) */
+    int held;
+} ap_output_targets_t;
+
+/**
+ * What the output pending in a connection's filters waits for, after
+ * ap_check_output_pending() returned AGAIN: the lowest pending filter's
+ * target (the one closest to the network), as recorded by that call (no
+ * second walk): room, a time, or a held filter's wait. Core's own, for the
+ * waits of a request's client context (ap_request_wait()).
+ * @param c The connection
+ * @param t Filled with the targets
+ * @remark Room when an output_pending hook other than the core's said
+ *         AGAIN.
+ */
+AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
+                                                ap_output_targets_t *t);
+
+/**
+ * Whether a request filter of the connection is pending in its output
+ * filters, with data or a reason (holding its output), core's own.
+ * @param c The connection
+ * @param drop Non-zero to drop what those filters hold (their reasons
+ *        cleared, the held data destroyed), a hold's wait being canceled or
+ *        completed already
+ * @return Non-zero if some is (or was, when dropped)
+ */
+AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
 
 /**
  * The core input_pending hook.
@@ -818,7 +860,8 @@ AP_DECLARE(void) ap_filter_protocol(ap_filter_t* f, unsigned int proto_flags);
  * about write completion (calling ap_filter_reinstate_brigade() with non-NULL
  * flush_upto), those can setaside WC buckets and the preceding data provided
  * they have first determined that the next filter(s) have pending data
- * already, usually by calling ap_filter_should_yield(f->next).
+ * already, usually by calling ap_filter_should_yield(f->next), or that they
+ * are pending themselves (a request filter holding its output for a reason).
  */
 
 /** Write Completion (WC) bucket data mark */

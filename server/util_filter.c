@@ -51,6 +51,14 @@
 #undef APLOG_MODULE_INDEX
 #define APLOG_MODULE_INDEX AP_CORE_MODULE_INDEX
 
+/* Why a request filter is pending besides its set-aside data (fp->bb), as
+ * bits of fp->why: its output is held until the filters after it have room,
+ * until a time, or until the wait of a context completes.
+ */
+#define FILTER_PENDING_ROOM (1u << 0) /* the filters after it drained */
+#define FILTER_PENDING_DUE  (1u << 1) /* fp->due reached */
+#define FILTER_PENDING_HELD (1u << 2) /* fp->ctx's wait completed */
+
 struct ap_filter_private {
     /* Link to a pending_ring (keep first preferably) */
     APR_RING_ENTRY(ap_filter_private) pending;
@@ -62,6 +70,24 @@ struct ap_filter_private {
     apr_bucket_brigade *bb;
     /* Dedicated pool to use for deferred writes. */
     apr_pool_t *deferred_pool;
+
+    /* Why it's pending besides fp->bb (FILTER_PENDING_*), cleared when the
+     * core calls it (it holds again if it still has to), or when its request
+     * ends (pending_filter_cleanup()): nothing below points to its request
+     * past that.
+     */
+    unsigned int why;
+    /* FILTER_PENDING_DUE: when (apr_time_now() base) */
+    apr_time_t due;
+    /* FILTER_PENDING_HELD: the context whose wait releases the hold */
+    ap_request_waitctx_t *ctx;
+    /* What the filter gave to hold, in its request's pool (created once),
+     * given back to it (prepended) when the core calls it again
+     */
+    apr_bucket_brigade *held;
+    /* FILTER_PENDING_HELD: the status of the hold's wait, once completed */
+    apr_status_t held_status;
+    unsigned int held_done :1;
 };
 APR_RING_HEAD(pending_ring, ap_filter_private);
 
@@ -74,6 +100,14 @@ APR_RING_HEAD(spare_ring, spare_data);
 struct ap_filter_conn_ctx {
     struct pending_ring *pending_input_filters;
     struct pending_ring *pending_output_filters;
+
+    /* What the last output walk (ap_core_output_pending()) stopped on, the
+     * lowest pending filter: FILTER_PENDING_HELD or _DUE (with out_due), or
+     * zero for room (data to write, or a filter waiting for that). Fields
+     * reused by each walk: nothing is allocated per walk or per hold.
+     */
+    unsigned int out_why;
+    apr_time_t out_due;
 
     struct spare_ring *spare_containers,
                       *spare_brigades,
@@ -614,6 +648,14 @@ static apr_status_t pending_filter_cleanup(void *arg)
         APR_RING_REMOVE(fp, pending);
         APR_RING_ELEM_INIT(fp, pending);
     }
+
+    /* Nothing kept points to the request (its context, its held data) */
+    fp->why = 0;
+    fp->due = 0;
+    fp->ctx = NULL;
+    fp->held = NULL;
+    fp->held_status = APR_SUCCESS;
+    fp->held_done = 0;
 
     if (fp->bb) {
         ap_release_brigade(f->c, fp->bb);
@@ -1266,11 +1308,12 @@ AP_DECLARE(int) ap_filter_should_yield(ap_filter_t *f)
     /*
      * This is either a main request or internal redirect, or it is a
      * connection filter. Yield if there is any buffered data downstream
-     * from us.
+     * from us, or a request filter holding its output (for room, a time or
+     * a wait context).
      */
     while (f) {
         struct ap_filter_private *fp = f->priv;
-        if (fp->bb && !APR_BRIGADE_EMPTY(fp->bb)) {
+        if (fp->why || (fp->bb && !APR_BRIGADE_EMPTY(fp->bb))) {
             return 1;
         }
         f = f->next;
@@ -1278,26 +1321,108 @@ AP_DECLARE(int) ap_filter_should_yield(ap_filter_t *f)
     return 0;
 }
 
+/* Whether the core may call a request filter holding its output, from the
+ * output walk: only from a run of its top-level request (the request in
+ * progress, not e.g. a walk run for a subrequest of its tree). Otherwise the
+ * filter stays pending, a wait target only.
+ */
+static int pending_filter_callable(ap_filter_t *f)
+{
+    core_request_config *req_cfg;
+    ap_request_async_t *async;
+
+    if (!f->r) {
+        return 1;
+    }
+    req_cfg = ap_get_core_module_config(f->r->request_config);
+    async = (req_cfg) ? req_cfg->async : NULL;
+    return (async && async->r == f->r && async->top == async
+            && async->running);
+}
+
+/* Record what the output walk stopped on, the lowest pending filter from f
+ * (included) to the network
+ */
+static void pending_output_record(struct ap_filter_conn_ctx *x,
+                                  ap_filter_t *f)
+{
+    struct ap_filter_private *lowest = NULL;
+
+    for (; f; f = f->next) {
+        struct ap_filter_private *fp = f->priv;
+        if (fp->why || (fp->bb && !APR_BRIGADE_EMPTY(fp->bb))) {
+            lowest = fp;
+        }
+    }
+    x->out_why = 0;
+    x->out_due = 0;
+    if (lowest && !(lowest->bb && !APR_BRIGADE_EMPTY(lowest->bb))) {
+        if (lowest->why & FILTER_PENDING_HELD) {
+            x->out_why = FILTER_PENDING_HELD;
+        }
+        else if (lowest->why & FILTER_PENDING_DUE) {
+            x->out_why = FILTER_PENDING_DUE;
+            x->out_due = lowest->due;
+        }
+    }
+}
+
+/* Call a request filter whose hold is over (its wait completed, its time
+ * reached, room below it), what it held given back: with an empty brigade if
+ * its wait completed, else a WC bucket (it passes what it can without
+ * blocking). Its reason is cleared first: it holds again if it has to.
+ */
+static apr_status_t pending_filter_call(ap_filter_t *f,
+                                        apr_bucket_brigade *bb)
+{
+    struct ap_filter_private *fp = f->priv;
+    int was_held = !!(fp->why & FILTER_PENDING_HELD);
+
+    fp->why = 0;
+    fp->due = 0;
+    fp->ctx = NULL;
+    fp->held_done = 0;
+    if (fp->held) {
+        APR_BRIGADE_CONCAT(bb, fp->held);
+    }
+    if (!was_held) {
+        APR_BRIGADE_INSERT_TAIL(bb, ap_bucket_wc_create(bb->bucket_alloc));
+    }
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE6, 0, f->c,
+                  "calling '%s' output filter, its output %s",
+                  f->frec->name, (was_held) ? "held" : "paced or for room");
+    return ap_pass_brigade(f, bb);
+}
+
 AP_DECLARE_NONSTD(int) ap_core_output_pending(conn_rec *c)
 {
     struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
     struct ap_filter_private *fp, *prev;
     apr_bucket_brigade *bb;
+    apr_time_t now = 0;
     int rc = DECLINED;
 
     if (!x || !x->pending_output_filters) {
         goto cleanup;
     }
+    x->out_why = 0;
+    x->out_due = 0;
 
     /* Flush outer most filters first for ap_filter_should_yield(f->next)
      * to be relevant in the previous ones (async filters won't pass their
-     * buckets if their next filters yield already).
+     * buckets if their next filters yield already). A request filter holding
+     * its output stops the walk until its hold is over (the lowest pending
+     * filter first): its wait completed, its time reached, or room below it
+     * (the walk got there).
      */
     bb = ap_acquire_brigade(c);
     for (fp = APR_RING_LAST(x->pending_output_filters);
          fp != APR_RING_SENTINEL(x->pending_output_filters,
                                  ap_filter_private, pending);
          fp = prev) {
+        ap_filter_t *f = fp->f;
+        apr_status_t rv;
+
         /* If a filter removes itself from the filters stack (when run), it
          * also orphans itself from the ring, so save "prev" here to avoid
          * an infinite loop in this case.
@@ -1305,27 +1430,51 @@ AP_DECLARE_NONSTD(int) ap_core_output_pending(conn_rec *c)
         prev = APR_RING_PREV(fp, pending);
 
         AP_DEBUG_ASSERT(fp->bb);
-        if (!APR_BRIGADE_EMPTY(fp->bb)) {
-            ap_filter_t *f = fp->f;
-            apr_status_t rv;
+        if (fp->why) {
+            int over;
+
+            if (fp->why & FILTER_PENDING_HELD) {
+                over = fp->held_done;
+            }
+            else if (fp->why & FILTER_PENDING_DUE) {
+                if (!now) {
+                    now = apr_time_now();
+                }
+                over = (fp->due <= now);
+            }
+            else {
+                over = 1; /* room: nothing is pending below it */
+            }
+            if (!over || !pending_filter_callable(f)) {
+                pending_output_record(x, f);
+                rc = AGAIN;
+                break;
+            }
+            rv = pending_filter_call(f, bb);
+        }
+        else if (!APR_BRIGADE_EMPTY(fp->bb)) {
             apr_bucket *b;
 
             b = ap_bucket_wc_create(bb->bucket_alloc);
             APR_BRIGADE_INSERT_TAIL(bb, b);
             rv = ap_pass_brigade(f, bb);
-            apr_brigade_cleanup(bb);
+        }
+        else {
+            continue;
+        }
+        apr_brigade_cleanup(bb);
 
-            if (rv != APR_SUCCESS) {
-                ap_log_cerror(APLOG_MARK, APLOG_DEBUG, rv, c, APLOGNO(00470)
-                        "write failure in '%s' output filter", f->frec->name);
-                rc = AP_FILTER_ERROR;
-                break;
-            }
+        if (rv != APR_SUCCESS) {
+            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, rv, c, APLOGNO(00470)
+                    "write failure in '%s' output filter", f->frec->name);
+            rc = AP_FILTER_ERROR;
+            break;
+        }
 
-            if (ap_filter_should_yield(f)) {
-                rc = AGAIN;
-                break;
-            }
+        if (ap_filter_should_yield(f)) {
+            pending_output_record(x, f);
+            rc = AGAIN;
+            break;
         }
     }
     ap_release_brigade(c, bb);
@@ -1340,7 +1489,17 @@ cleanup:
 }
 AP_DECLARE(int) ap_check_output_pending(conn_rec *c)
 {
-    int rc = ap_run_output_pending(c);
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+    int rc;
+
+    /* Room unless the core's walk records otherwise (another output_pending
+     * hook's AGAIN means room)
+     */
+    if (x) {
+        x->out_why = 0;
+        x->out_due = 0;
+    }
+    rc = ap_run_output_pending(c);
     if (rc == DECLINED) {
         rc = OK;
     }
@@ -1348,6 +1507,63 @@ AP_DECLARE(int) ap_check_output_pending(conn_rec *c)
         rc = DONE;
     }
     return rc;
+}
+
+AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
+                                                ap_output_targets_t *t)
+{
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+
+    t->events = 0;
+    t->due = 0;
+    t->held = 0;
+    if (x && x->out_why == FILTER_PENDING_HELD) {
+        t->held = 1;
+    }
+    else if (x && x->out_why == FILTER_PENDING_DUE) {
+        t->due = x->out_due;
+    }
+    else {
+        t->events = APR_POLLOUT;
+    }
+}
+
+AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop)
+{
+    struct ap_filter_conn_ctx *x = c->filter_conn_ctx;
+    struct ap_filter_private *fp, *next;
+    int pending = 0;
+
+    if (!x || !x->pending_output_filters) {
+        return 0;
+    }
+    for (fp = APR_RING_FIRST(x->pending_output_filters);
+         fp != APR_RING_SENTINEL(x->pending_output_filters,
+                                 ap_filter_private, pending);
+         fp = next) {
+        next = APR_RING_NEXT(fp, pending);
+        if (fp->f->r
+            && (fp->why || (fp->bb && !APR_BRIGADE_EMPTY(fp->bb)))) {
+            pending = 1;
+            if (!drop) {
+                break;
+            }
+            ap_log_cerror(APLOG_MARK, APLOG_TRACE2, 0, c,
+                          "dropping what '%s' output filter holds",
+                          fp->f->frec->name);
+            if (fp->bb) {
+                apr_brigade_cleanup(fp->bb);
+            }
+            if (fp->held) {
+                apr_brigade_cleanup(fp->held);
+            }
+            fp->why = 0;
+            fp->due = 0;
+            fp->ctx = NULL;
+            fp->held_done = 0;
+        }
+    }
+    return pending;
 }
 
 AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c)
