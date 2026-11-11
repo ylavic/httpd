@@ -3137,9 +3137,17 @@ static int kept_pfds_et;
  * the peer's half-close too (APR_POLLRDHUP), and tell their waits (the pfd's
  * reqevents, its rtnevents when reported): the end of file can't then be
  * queued unseen behind data that a short read emptied, its edge would come.
- * Cleared if the pollset refuses it (APR_ENOTIMPL).
+ * Set at the child's start from the pollset's method options.
  */
 static int kept_pfds_rdhup;
+
+#ifdef APR_POLLRDHUP
+/* Whether apr_poll() reports the peer's half-close (APR_POLLRDHUP), set at
+ * the child's start from its method's options: the arm-time check of a kept
+ * pfd asks for it then, else counts its input as a possible half-close.
+ */
+static int poll_rdhup;
+#endif
 
 /* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
  * nothing remains to remove from conn_pollset: not with kqueue, a filter per
@@ -3374,6 +3382,11 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
             apr_pollfd_t pfd = kept->pfd;
             apr_int32_t n = 0;
             pfd.reqevents = reqevents & ~APR_POLLET;
+#ifdef APR_POLLRDHUP
+            if (!poll_rdhup) {
+                pfd.reqevents &= ~APR_POLLRDHUP;
+            }
+#endif
             pfd.rtnevents = 0;
             if (apr_poll(&pfd, 1, &n, 0) == APR_SUCCESS && n && pfd.rtnevents
                 && apr_atomic_cas32(&kept->state, KEPT_FIRED,
@@ -3383,9 +3396,10 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                  */
                 *rtnevents = pfd.rtnevents;
 #ifdef APR_POLLRDHUP
-                if ((reqevents & APR_POLLRDHUP) && (*rtnevents & APR_POLLIN)) {
-                    /* apr_poll() may not report the half-close (poll()
-                     * without POLLRDHUP): a possible one for the reader
+                if ((reqevents & APR_POLLRDHUP) && !poll_rdhup
+                    && (*rtnevents & APR_POLLIN)) {
+                    /* apr_poll() doesn't report the half-close: a possible
+                     * one for the reader
                      */
                     *rtnevents |= APR_POLLRDHUP;
                 }
@@ -3419,8 +3433,9 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
         if (rv != APR_ENOTIMPL) {
             return rv;
         }
-        /* Not supported by the pollset: without it from now on */
-        kept_pfds_rdhup = 0;
+        /* Refused though in the method's options: this pfd goes without
+         * it
+         */
         kept->pfd.reqevents &= ~APR_POLLRDHUP;
     }
 #endif
@@ -7534,12 +7549,28 @@ static void setup_threads_runtime(void)
                          "workers polling at most %u at once%s",
                          worker_poll_slots_max, (worker_pollers > 0) ? "" : " (auto)");
 #if defined(APR_POLLET) && defined(EVENT_WORKER_NOTIFY)
+#ifdef APR_POLLRDHUP /* with apr_poll_method_options() */
+            {
+                /* Edge-triggered kept pfds where the pollset's method
+                 * honors it, asking for the peer's half-close too where
+                 * it reports it
+                 */
+                apr_int16_t options =
+                    apr_poll_method_options(apr_pollset_method_get(ps));
+                kept_pfds_et = !!(options & APR_POLLET);
+                kept_pfds_rdhup = kept_pfds_et && (options & APR_POLLRDHUP);
+                poll_rdhup = !!(apr_poll_method_options(apr_poll_method_get())
+                                & APR_POLLRDHUP);
+                ap_log_error(APLOG_MARK, APLOG_TRACE1, 0, ap_server_conf,
+                             "peer half-close (APR_POLLRDHUP) reported by "
+                             "the pollset: %s, by apr_poll(): %s",
+                             kept_pfds_rdhup ? "yes" : "no",
+                             poll_rdhup ? "yes" : "no");
+            }
+#else
             /* Edge-triggered kept pfds where APR supports them */
             kept_pfds_et = (strcmp(apr_pollset_method_name(ps), "epoll") == 0
                             || strcmp(apr_pollset_method_name(ps), "kqueue") == 0);
-#ifdef APR_POLLRDHUP
-            /* Asked with them, until the pollset refuses it */
-            kept_pfds_rdhup = kept_pfds_et;
 #endif
 #endif
         }
@@ -7550,8 +7581,13 @@ static void setup_threads_runtime(void)
         }
     }
 #endif
+#ifdef APR_POLLRDHUP /* with apr_pollset_method_get() */
+    oneshot_disarms_fd = (apr_pollset_method_get(conn_pollset)
+                          != APR_POLLSET_KQUEUE);
+#else
     oneshot_disarms_fd = (strcmp(apr_pollset_method_name(conn_pollset),
                                  "kqueue") != 0);
+#endif
 
     /* Add listeners to the main pollset */
     listener_pollfd = apr_pcalloc(pruntime,
