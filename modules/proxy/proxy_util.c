@@ -6911,6 +6911,13 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
     }
     pollset = tunnel->pollset;
 
+    /* The pollset is level-triggered: what's left to read on a side, its
+     * end of file included, is reported again by the next poll, so a short
+     * read of the side's socket empties it (no read again for EAGAIN).
+     */
+    ap_core_input_short_drains(client->c, 1);
+    ap_core_input_short_drains(origin->c, 1);
+
     ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(10212)
                   "proxy: %s: tunnel running (timeout %lf)",
                   scheme, timeout >= 0 ? (double)timeout / APR_USEC_PER_SEC
@@ -6986,6 +6993,8 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
 done:
     ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(10223)
                   "proxy: %s: tunneling returns (%i)", scheme, status);
+    ap_core_input_short_drains(client->c, 0);
+    ap_core_input_short_drains(origin->c, 0);
     if (client->bytes_out > 0) {
         tunnel->replied = 1;
     }

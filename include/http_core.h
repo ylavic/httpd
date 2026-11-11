@@ -912,8 +912,10 @@ AP_DECLARE(int) ap_core_input_drained(conn_rec *c);
  * poll that found the socket readable reports the peer's half-close
  * (APR_POLLRDHUP) and didn't, the socket staying registered (e.g. kept
  * edge-triggered by the MPM), so that an end of file can't be queued unseen
- * behind the data (a next poll reports it). Otherwise a short recv() doesn't
- * tell, the read goes on until EAGAIN (or the end of file).
+ * behind the data (a next poll reports it); or when the caller polls the
+ * socket level-triggered itself (the next poll reports what's left, an end of
+ * file included). Otherwise a short recv() doesn't tell, the read goes on
+ * until EAGAIN (or the end of file).
  * @param c The connection
  * @param on Non-zero if a short recv() empties the socket, zero otherwise
  * (the default)
