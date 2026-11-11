@@ -1298,6 +1298,31 @@ static unsigned int ready_directions(apr_int16_t rtnevents,
     return ready;
 }
 
+/* Whether a short read of the input of a context's connection empties its
+ * socket, from the MPM's poll of its pfd (ap_core_input_short_drains()):
+ * found readable without the peer's half-close by a poll that reports it
+ * (APR_POLLRDHUP in its reqevents, set by the MPM), else not known.
+ */
+static void request_wait_short_drains(request_waitctx_t *ctx,
+                                      const apr_pollfd_t *pfd,
+                                      unsigned int directions)
+{
+    int on = 0;
+
+    if (!ctx->c || !(directions & AP_WAIT_IN)) {
+        return;
+    }
+#ifdef APR_POLLRDHUP
+    on = ((pfd->reqevents & APR_POLLRDHUP)
+          && (pfd->rtnevents & (APR_POLLIN | APR_POLLRDHUP)) == APR_POLLIN);
+#endif
+    ap_log_cerror(APLOG_MARK, APLOG_TRACE8, 0, ctx->c,
+                  "input polled (events 0x%x/0x%x): a short read %s",
+                  (unsigned int)pfd->rtnevents, (unsigned int)pfd->reqevents,
+                  on ? "drains it" : "doesn't tell");
+    ap_core_input_short_drains(ctx->c, on);
+}
+
 /* The timeout of a context's wait, AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT resolved */
 static apr_interval_time_t request_waitctx_timeout(request_waitctx_t *ctx,
                                                    unsigned int directions)
@@ -1447,6 +1472,10 @@ static void request_waitreg_completion(struct ap_request_waitset *w,
             const apr_pollfd_t *pfd = &APR_ARRAY_IDX(pfds, k, apr_pollfd_t);
             ctx->ready = ready_directions(pfd->rtnevents,
                                           g->directions[i]);
+            request_wait_short_drains(ctx, pfd, g->directions[i]);
+        }
+        else if (ctx->c && (g->directions[i] & AP_WAIT_IN)) {
+            ap_core_input_short_drains(ctx->c, 0);
         }
         if (ctx->attached && ap_mpm_notifier_notified(ctx->notifier)) {
             ctx->ready = AP_WAIT_IN | AP_WAIT_OUT;
@@ -1926,6 +1955,7 @@ static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
                                                      apr_pollfd_t);
             ctx->ready = ready_directions(pfd->rtnevents,
                                           g->directions[i]);
+            request_wait_short_drains(ctx, pfd, g->directions[i]);
         }
         else {
             ctx->ready = g->directions[i] & (AP_WAIT_IN | AP_WAIT_OUT);

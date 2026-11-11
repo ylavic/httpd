@@ -905,6 +905,21 @@ apr_status_t ap_core_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
  */
 AP_DECLARE(int) ap_core_input_drained(conn_rec *c);
 
+/**
+ * Tell the core input filter whether a recv() of the connection's socket
+ * returning less than asked empties it, so that the read doesn't recv()
+ * again for EAGAIN and counts as drained (ap_core_input_drained()): when the
+ * poll that found the socket readable reports the peer's half-close
+ * (APR_POLLRDHUP) and didn't, the socket staying registered (e.g. kept
+ * edge-triggered by the MPM), so that an end of file can't be queued unseen
+ * behind the data (a next poll reports it). Otherwise a short recv() doesn't
+ * tell, the read goes on until EAGAIN (or the end of file).
+ * @param c The connection
+ * @param on Non-zero if a short recv() empties the socket, zero otherwise
+ * (the default)
+ */
+AP_DECLARE(void) ap_core_input_short_drains(conn_rec *c, int on);
+
 
 AP_DECLARE(const char*) ap_get_server_protocol(server_rec* s);
 AP_DECLARE(void) ap_set_server_protocol(server_rec* s, const char* proto);

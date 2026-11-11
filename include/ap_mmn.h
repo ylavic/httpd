@@ -892,6 +892,7 @@
  *                         ap_proxy_tunnel_hold_status() to mod_proxy.h
  * 20260601.21 (2.5.1-dev) Add AP_PROXY_TUNNEL_HOLD_DELEGATED to mod_proxy.h
  * 20260601.22 (2.5.1-dev) Add ap_request_holder_t.timeout to http_request.h
+ * 20260601.23 (2.5.1-dev) Add ap_core_input_short_drains() to http_core.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -899,7 +900,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20260601
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 22    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 23    /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

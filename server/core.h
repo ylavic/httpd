@@ -31,6 +31,8 @@
 typedef struct conn_config_t {
     /** Socket belonging to the connection */
     apr_socket_t *socket;
+    /** A short read of the socket empties it (ap_core_input_short_drains()) */
+    int short_drains;
 } conn_config_t;
 
 #endif /* CORE_H */

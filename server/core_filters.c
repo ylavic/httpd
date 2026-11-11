@@ -86,11 +86,21 @@ typedef struct {
     apr_bucket_brigade *bb;
     apr_bucket_brigade *tmpbb;
     /* The last nonblocking READBYTES read emptied the socket: its last
-     * recv() got EAGAIN, and nothing is held besides the socket bucket
-     * (ap_core_input_drained())
+     * recv() got EAGAIN, or returned less than asked where that tells
+     * (ap_core_input_short_drains()), and nothing is held besides the
+     * socket bucket (ap_core_input_drained())
      */
     int drained;
 } core_input_ctx_t;
+
+AP_DECLARE(void) ap_core_input_short_drains(conn_rec *c, int on)
+{
+    conn_config_t *cconf = ap_get_core_module_config(c->conn_config);
+
+    if (cconf) {
+        cconf->short_drains = !!on;
+    }
+}
 
 AP_DECLARE(int) ap_core_input_drained(conn_rec *c)
 {
@@ -262,17 +272,21 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     /* read up to the amount they specified. */
     if (mode == AP_MODE_READBYTES || mode == AP_MODE_SPECULATIVE) {
         apr_bucket *e;
-        /* Whether the greedy read of the socket bucket emptied the socket:
-         * its recv() got EAGAIN (a short recv() doesn't tell, e.g. the peer's
-         * shutdown may follow the data and an edge-triggered poll wouldn't
-         * report it again)
+        /* Whether the read of the socket bucket emptied the socket: its
+         * recv() got EAGAIN, or returned less than asked if that tells
+         * (short_drains: a socket bucket reads up to APR_BUCKET_BUFF_SIZE
+         * bytes per recv()). Otherwise a short recv() doesn't tell, e.g. the
+         * peer's shutdown may follow the data and an edge-triggered poll
+         * wouldn't report it again.
          */
-        int emptied = 0;
+        int short_drains = (cconf && cconf->short_drains);
+        int socket_read = 0, emptied = 0;
 
         AP_DEBUG_ASSERT(readbytes > 0);
 
         do {
             e = APR_BRIGADE_FIRST(ctx->bb);
+            socket_read = APR_BUCKET_IS_SOCKET(e);
             rv = apr_bucket_read(e, &str, &len, block);
             if (rv != APR_SUCCESS) {
                 /* getting EAGAIN for a blocking read is an error; not for a
@@ -311,6 +325,10 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
             goto cleanup;
         }
 
+        if (short_drains && socket_read && len < APR_BUCKET_BUFF_SIZE) {
+            emptied = 1;
+        }
+
         /* Have we read as much data as we wanted (be greedy)? */
         if (len < readbytes) {
             apr_size_t bucket_len;
@@ -329,14 +347,23 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                      * Read from bucket, but non blocking. If there isn't any
                      * more data, well than this is fine as well, we will
                      * not wait for more since we already got some and we are
-                     * only checking if there isn't more.
+                     * only checking if there isn't more. Not from the socket
+                     * when its last recv() emptied it (the read would get
+                     * EAGAIN).
                      */
-                    int socket_read = APR_BUCKET_IS_SOCKET(e);
+                    socket_read = APR_BUCKET_IS_SOCKET(e);
+                    if (socket_read && emptied) {
+                        break;
+                    }
                     rv = apr_bucket_read(e, &str, &bucket_len,
                                          APR_NONBLOCK_READ);
                     if (rv == APR_SUCCESS) {
                         len += bucket_len;
                         e = APR_BUCKET_NEXT(e);
+                        if (short_drains && socket_read && bucket_len
+                            && bucket_len < APR_BUCKET_BUFF_SIZE) {
+                            emptied = 1;
+                        }
                     }
                     else if (socket_read && APR_STATUS_IS_EAGAIN(rv)) {
                         emptied = 1;
