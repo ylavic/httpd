@@ -3133,6 +3133,14 @@ static APR_INLINE void set_user_continuation(event_conn_state_t *cs,
  */
 static int kept_pfds_et;
 
+/* Whether the edge-triggered kept pfds waiting for input ask the poller for
+ * the peer's half-close too (APR_POLLRDHUP), and tell their waits (the pfd's
+ * reqevents, its rtnevents when reported): the end of file can't then be
+ * queued unseen behind data that a short read emptied, its edge would come.
+ * Cleared if the pollset refuses it (APR_ENOTIMPL).
+ */
+static int kept_pfds_rdhup;
+
 /* Whether a one-shot pfd that fired is disarmed as a whole (epoll), so that
  * nothing remains to remove from conn_pollset: not with kqueue, a filter per
  * event (EVFILT_READ, EVFILT_WRITE), the one that didn't fire stays armed.
@@ -3374,6 +3382,14 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
                  * edge claimed it meanwhile, then the event does)
                  */
                 *rtnevents = pfd.rtnevents;
+#ifdef APR_POLLRDHUP
+                if ((reqevents & APR_POLLRDHUP) && (*rtnevents & APR_POLLIN)) {
+                    /* apr_poll() may not report the half-close (poll()
+                     * without POLLRDHUP): a possible one for the reader
+                     */
+                    *rtnevents |= APR_POLLRDHUP;
+                }
+#endif
                 kept->delivered = 1;
             }
         }
@@ -3397,6 +3413,17 @@ static apr_status_t arm_kept_pfd(struct kept_pfd *kept,
      */
     kept->pfd.reqevents = reqevents;
     apr_atomic_set32(&kept->state, KEPT_WAITED);
+#ifdef APR_POLLRDHUP
+    if (reqevents & APR_POLLRDHUP) {
+        apr_status_t rv = apr_pollset_add(conn_pollset, &kept->pfd);
+        if (rv != APR_ENOTIMPL) {
+            return rv;
+        }
+        /* Not supported by the pollset: without it from now on */
+        kept_pfds_rdhup = 0;
+        kept->pfd.reqevents &= ~APR_POLLRDHUP;
+    }
+#endif
     return apr_pollset_add(conn_pollset, &kept->pfd);
 }
 
@@ -3785,6 +3812,9 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
         unsigned int flags = APR_ARRAY_IDX(user_wait->pfds_flags, i,
                                            unsigned int);
         pfd->rtnevents = 0;
+#ifdef APR_POLLRDHUP
+        pfd->reqevents &= ~APR_POLLRDHUP; /* set below if asked */
+#endif
         if (pfd->reqevents) {
             struct kept_pfd *kept = NULL;
 
@@ -3820,6 +3850,11 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 #ifdef APR_POLLET
                 if (kept_pfds_et) {
                     events = (events & ~APR_POLLONESHOT) | APR_POLLET;
+#ifdef APR_POLLRDHUP
+                    if (kept_pfds_rdhup && (events & APR_POLLIN)) {
+                        events |= APR_POLLRDHUP;
+                    }
+#endif
                 }
 #endif
 #ifdef EVENT_WORKER_NOTIFY
@@ -3840,6 +3875,12 @@ static apr_status_t arm_user_wait(event_conn_state_t *cs,
 #ifdef EVENT_WORKER_NOTIFY
                 else if (pfd->rtnevents) {
                     ready = 1;
+                }
+#endif
+#ifdef APR_POLLRDHUP
+                /* Tell the waiter that a half-close would be reported */
+                if (kept->pfd.reqevents & APR_POLLRDHUP) {
+                    pfd->reqevents |= APR_POLLRDHUP;
                 }
 #endif
                 continue;
@@ -7496,6 +7537,10 @@ static void setup_threads_runtime(void)
             /* Edge-triggered kept pfds where APR supports them */
             kept_pfds_et = (strcmp(apr_pollset_method_name(ps), "epoll") == 0
                             || strcmp(apr_pollset_method_name(ps), "kqueue") == 0);
+#ifdef APR_POLLRDHUP
+            /* Asked with them, until the pollset refuses it */
+            kept_pfds_rdhup = kept_pfds_et;
+#endif
 #endif
         }
         else {
