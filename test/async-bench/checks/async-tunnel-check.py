@@ -351,6 +351,43 @@ for mode in os.environ.get("MODES", "sync default async wstunnel connect").split
         check(mode, "client closes: backend sees it", seen is not None and seen - t0 < 1,
               "%s" % ("%.2fs" % (seen - t0) if seen else "not seen"))
 
+        # The client sends a message and shuts its side down right after (the
+        # FIN queued behind the data), 20 times: the backend sees the
+        # half-close well before the idle timeout every time, the echo
+        # forwarded, then the tunnel over
+        slow_seen, bad, worst = 0, 0, 0.0
+        for k in range(20):
+            tag = "%s-fin%d" % (mode, k)
+            s, ok, rest = upgrade(tag)
+            s.settimeout(IDLE + 5)
+            time.sleep(0.05)  # the tunnel waiting for input
+            msg = b"fin message %d\n" % k
+            t0 = time.monotonic()
+            s.sendall(msg)
+            s.shutdown(socket.SHUT_WR)
+            data = rest
+            try:
+                while True:
+                    b = s.recv(4096)
+                    if not b:
+                        break
+                    data += b
+            except OSError:
+                pass
+            s.close()
+            seen = backend_closed.get(tag)
+            took = seen - t0 if seen is not None else None
+            if took is None or took >= IDLE / 2:
+                slow_seen += 1
+            else:
+                worst = max(worst, took)
+            if not ok or data != msg:
+                bad += 1
+        check(mode, "message then FIN at once, 20 times: half-close seen",
+              slow_seen == 0 and bad == 0,
+              "late or unseen %d/20, echo missing %d/20, worst seen %.3fs"
+              % (slow_seen, bad, worst))
+
         # The backend closes: the client sees it
         s, ok, _ = upgrade("%s-bclose" % mode, "close")
         s.settimeout(5)
