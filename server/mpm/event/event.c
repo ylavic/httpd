@@ -668,7 +668,9 @@ static APR_INLINE const char *cs_state_str(event_conn_state_t *cs)
  */
 static apr_time_t event_time_now(void)
 {
-#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
+#if defined(APR_HAS_MONOTONIC_TIME) && APR_HAS_MONOTONIC_TIME
+    return apr_time_monotonic();
+#elif HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return apr_time_from_sec(ts.tv_sec) + ts.tv_nsec / 1000;
