@@ -161,8 +161,9 @@ typedef struct {
                                      *   "HTTP/2.0") a status-line may have
                                      *   besides HTTP/1.x, also as "HTTP/x"
                                      *   for an "HTTP/x.0" (a gateway echoing
-                                     *   the request's protocol); the head is
-                                     *   then read as HTTP/1.1 */
+                                     *   the request's protocol), only from
+                                     *   HTTP/2 on; the head is then read as
+                                     *   HTTP/1.1 */
 } ap_h1_head_opts_t;
 
 /** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */

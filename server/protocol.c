@@ -1042,19 +1042,20 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
 
         /* RFC 9112 4: HTTP/1.x, SP, 3DIGIT, then SP and the reason phrase
          * if any (tolerated without), with no control characters but HTAB;
-         * or opts.echo_protocol (a gateway echoing the request's protocol),
-         * also as "HTTP/x" for an "HTTP/x.0".
+         * or opts.echo_protocol (a gateway echoing the request's protocol)
+         * if HTTP/2 or later, also as "HTTP/x" for an "HTTP/x.0".
          */
         if (len >= 12 && apr_date_checkmask(line, "HTTP/#.# ###*")) {
             if (line[5] == '1') {
                 plen = 8;
             }
-            else if (echo && !strncmp(line, echo, 8) && !echo[8]) {
+            else if (echo && line[5] >= '2' && !strncmp(line, echo, 8)
+                     && !echo[8]) {
                 plen = 8;
                 echoed = 1;
             }
         }
-        else if (echo && len >= 10 && line[5] != '1'
+        else if (echo && len >= 10 && line[5] >= '2'
                  && apr_date_checkmask(line, "HTTP/# ###*")
                  && !strncmp(echo, line, 6) && !strcmp(echo + 6, ".0")) {
             plen = 6;
