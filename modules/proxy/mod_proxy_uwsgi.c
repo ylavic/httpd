@@ -300,7 +300,7 @@ static request_rec *make_fake_req(conn_rec *c, request_rec *r)
 }
 
 static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
-                          proxy_server_conf * conf)
+                          proxy_server_conf * conf, apr_status_t wait_rv)
 {
     const char *buf;
     int backend_broke = 0;
@@ -334,15 +334,17 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     rc = ap_h1_head_parse(parser, rp->input_filters, APR_BLOCK_READ, &head);
     if (rc != OK) {
         apr_status_t prv = ap_h1_head_parser_status(parser);
-        if (!head && APR_STATUS_IS_TIMEUP(prv)) {
+        if (!head && APR_STATUS_IS_TIMEUP(prv)
+            && (wait_rv == APR_SUCCESS || APR_STATUS_IS_TIMEUP(wait_rv))) {
             /* No status line within the timeout: a gateway timeout, as
              * mod_proxy_http's
              */
             return HTTP_GATEWAY_TIME_OUT;
         }
         if (!head && !APR_STATUS_IS_EINVAL(prv)) {
-            /* No status line: the backend closed or failed before its end,
-             * or it is too long
+            /* No status line: the backend closed or failed before its end
+             * (or the wait for it was interrupted, not timed out), or it is
+             * too long
              */
             return HTTP_INTERNAL_SERVER_ERROR;
         }
@@ -482,7 +484,8 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
 
 /* Once the wait for the response failed: let reading it fail at once, as it
  * would have failed after waiting in the blocking path, with APR_TIMEUP (a
- * timeout of 1us, since 0 would give EAGAIN), hence the same status and log.
+ * timeout of 1us, since 0 would give EAGAIN), hence the same log. The status
+ * is the same for a wait that timed out only (uwsgi_response()).
  * Data arriving between the end of the wait and here is read as usual
  * though, the response then succeeds. Returns whether it changed the
  * timeout, the one to restore then in *timeout.
@@ -528,7 +531,7 @@ static void uwsgi_response_continuation(request_rec *r, apr_status_t rv, void *b
                       backend->hostname, backend->port);
         restore = uwsgi_fail_at_once(r, backend, &timeout);
     }
-    status = uwsgi_response(r, backend, conf);
+    status = uwsgi_response(r, backend, conf, rv);
     if (restore) {
         apr_socket_timeout_set(backend->sock, timeout);
     }
@@ -628,7 +631,7 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
                       uwsgi_response_continuation, backend) == SUSPENDED) {
         return SUSPENDED;
     }
-    status = uwsgi_response(r, backend, conf);
+    status = uwsgi_response(r, backend, conf, APR_SUCCESS);
 
   cleanup:
     if (backend) {
