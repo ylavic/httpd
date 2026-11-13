@@ -1114,7 +1114,8 @@ AP_CORE_DECLARE(void) ap_request_drop_holds(request_rec *r);
  *         (AP_CONN_CLOSE): 400 (malformed or cut), 408 (the client timed
  *         out: the read after a wait that timed out found nothing, or
  *         mod_reqtimeout's deadline), 413 (LimitRequestBody), 500 (the read
- *         after an interrupted wait found nothing: the MPM failed to wait),
+ *         after an interrupted wait found nothing: the MPM failed to wait; a
+ *         blocking read returned nothing: an input filter's bug),
  *         AP_FILTER_ERROR (a filter answered already, e.g. httpd 2.4's
  *         HTTP_IN for LimitRequestBody).
  * @remark Sends the 100 Continue the client waits for, without blocking

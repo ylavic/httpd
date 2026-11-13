@@ -1658,6 +1658,8 @@ AP_DECLARE(int) ap_request_read_body_(request_rec *r, apr_bucket_brigade *bb,
         ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
                       APLOGNO() "a blocking read of the request body "
                       "returned nothing (an input filter's bug)");
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        goto failed;
     }
     AP_DEBUG_ASSERT(!APR_BRIGADE_EMPTY(tmp_bb));
 
