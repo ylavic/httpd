@@ -8,6 +8,7 @@ usage: MODES="sync async" SCHEMES="ajp scgi uwsgi" \\
 
 import http.client
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,6 +21,13 @@ os.makedirs(work, exist_ok=True)
 FRONT = 18432
 PORTS = {"ajp": 18433, "scgi": 18434, "uwsgi": 18435}
 DOWN = 18436
+
+# HTTP/2.0 requests come from mod_http2 (h2c prior knowledge, sent by curl):
+# an HTTP/1 request line of a version above 1.x is answered with a 505
+H2 = (os.path.exists(os.path.join(prefix, "modules", "mod_http2.so"))
+      and shutil.which("curl") is not None
+      and "HTTP2" in subprocess.run(["curl", "--version"], capture_output=True,
+                                    text=True).stdout)
 here = os.path.dirname(os.path.abspath(__file__))
 backend = subprocess.Popen([os.path.join(here, "..", "schemebackend")]
                            + ["-%s=127.0.0.1:%d" % sp for sp in PORTS.items()])
@@ -38,7 +46,7 @@ LoadModule proxy_module modules/mod_proxy.so
 LoadModule proxy_ajp_module modules/mod_proxy_ajp.so
 LoadModule proxy_scgi_module modules/mod_proxy_scgi.so
 LoadModule proxy_uwsgi_module modules/mod_proxy_uwsgi.so
-ServerName localhost
+{h2conf}ServerName localhost
 StartServers 1
 ServerLimit 1
 ThreadLimit 2
@@ -52,6 +60,10 @@ CustomLog "{work}/access_log" t
 {asyncconf}
 """
 
+H2CONF = """LoadModule http2_module modules/mod_http2.so
+Protocols h2c http/1.1
+"""
+
 # Distinct worker URLs, not shared (timeout= and max= apply)
 PASS = """ProxyPass "/{s}/" "{s}://127.0.0.1:{port}/{s}/"
 ProxyPass "/{s}-to/" "{s}://127.0.0.1:{port}/{s}-to/" timeout=1
@@ -61,7 +73,8 @@ ProxyPass "/{s}-down/" "{s}://127.0.0.1:{down}/"
 
 
 def start(async_conf, schemes):
-    conf = CONF.format(prefix=prefix, work=work, front=FRONT, asyncconf=async_conf)
+    conf = CONF.format(prefix=prefix, work=work, front=FRONT, asyncconf=async_conf,
+                       h2conf=H2CONF if H2 else "")
     conf += "".join(PASS.format(s=s, port=PORTS[s], down=DOWN) for s in schemes)
     with open(os.path.join(work, "httpd.conf"), "w") as f:
         f.write(conf)
@@ -108,10 +121,22 @@ def request(method, path, body=None, timeout=20):
         c.close()
 
 
+def h2_status(path):
+    """The status of a request sent with HTTP/2 (h2c prior knowledge) by
+    curl, None without a response"""
+    try:
+        out = subprocess.run(["curl", "-s", "-o", os.devnull, "-w", "%{http_code}",
+                              "--http2-prior-knowledge", "--max-time", "5",
+                              "http://127.0.0.1:%d%s" % (FRONT, path)],
+                             capture_output=True, text=True, timeout=10).stdout
+        return int(out) or None
+    except (subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 def raw_status(protocol, path):
     """The status of a request sent with the given protocol in its request
-    line (r->protocol, the uwsgi SERVER_PROTOCOL), None without a response
-    (an error response to an HTTP/2.0 request isn't received)"""
+    line (r->protocol, the uwsgi SERVER_PROTOCOL), None without a response"""
     s = socket.create_connection(("127.0.0.1", FRONT), timeout=3)
     try:
         s.sendall(("GET %s %s\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -132,7 +157,7 @@ def raw_status(protocol, path):
 
 # (request protocol, protocol of the backend's status line, expected status):
 # the status line's protocol is HTTP/1.x or the request's (also "HTTP/x" for
-# an "HTTP/x.0")
+# an "HTTP/x.0"); an HTTP/2.0 request is sent through mod_http2
 ECHOES = [
     ("HTTP/1.1", "HTTP/1.1", 200), ("HTTP/1.1", "HTTP/1.0", 200),
     ("HTTP/1.1", "HTTP/2.0", 502), ("HTTP/1.1", "HTTP/2", 502),
@@ -146,10 +171,15 @@ ECHOES = [
 
 def echo_cases(m):
     bad = []
+    skipped = 0
     for req, rsp, exp in ECHOES:
+        if req == "HTTP/2.0" and not H2:
+            skipped += 1
+            continue
         with open(os.path.join(work, "error_log")) as f:
             pos = len(f.read())
-        got = raw_status(req, "/uwsgi/e?d=0&proto=" + rsp)
+        path = "/uwsgi/e?d=0&proto=" + rsp
+        got = h2_status(path) if req == "HTTP/2.0" else raw_status(req, path)
         with open(os.path.join(work, "error_log")) as f:
             f.seek(pos)
             refused = ("malformed status line: %s 200" % rsp) in f.read()
@@ -157,8 +187,10 @@ def echo_cases(m):
         if (got == 200) != (exp == 200) or refused != (exp != 200):
             bad.append("%s answered by %s: %s, refused: %s (expected %s)"
                        % (req, rsp, got, refused, exp))
-    return "%s: status line protocols vs the request's (%d cases): %s" % (
-        m, len(ECHOES), ", ".join(bad) if bad else "all as expected")
+    return "%s: status line protocols vs the request's (%d cases%s): %s" % (
+        m, len(ECHOES) - skipped,
+        ", %d HTTP/2.0 ones skipped: no mod_http2 or curl with HTTP/2" % skipped
+        if skipped else "", ", ".join(bad) if bad else "all as expected")
 
 
 def timed(fn, *args):
