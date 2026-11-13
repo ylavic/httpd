@@ -301,6 +301,23 @@ REQUESTS = [
     ("10 empty lines first", FRONT, req(pre=b"\r\n" * 10), 200, None, False),
     ("11 empty lines first", FRONT, req(pre=b"\r\n" * 11), 400, None, False),
     ("HTTP/0.9 answered at once", FRONT, b"GET /\r\n", 0, None, False),
+    ("HTTP/1.1 explicit", FRONT, req(line=b"GET /echo HTTP/1.1", fields=(H, b"X-A: a\r\n")),
+     200, "x-a: a", False),
+    # a 1.x minor above 1.1 is read as HTTP/1.1 (the request body is read)
+    ("HTTP/1.2 read as HTTP/1.1", FRONT, req(line=b"GET /echo HTTP/1.2", fields=(H, b"X-A: a\r\n")),
+     200, "x-a: a", False),
+    ("HTTP/1.9 read as HTTP/1.1", FRONT, req(line=b"GET /echo HTTP/1.9", fields=(H, b"X-A: a\r\n")),
+     200, "x-a: a", False),
+    # a version above 1.x isn't spoken with an HTTP/1 request line: 505
+    # at once, without waiting for the client to half-close
+    ("HTTP/2.0 (505)", FRONT, req(line=b"GET /echo HTTP/2.0"), 505, None, False),
+    ("HTTP/3.0 (505)", FRONT, req(line=b"GET /echo HTTP/3.0"), 505, None, False),
+    ("HTTP/9.9 (505)", FRONT, req(line=b"GET /echo HTTP/9.9"), 505, None, False),
+    ("HTTP/2.0 (505, Unsafe)", FRONT_UNSAFE, req(line=b"GET /echo HTTP/2.0"), 505, None,
+     False),
+    ("HTTP/2.0 POST (505)", FRONT,
+     req(line=b"POST /echo HTTP/2.0", fields=(H, b"Content-Length: 4\r\n"), end=b"\r\nabcd"),
+     505, None, False),
     ("closed in the request line", FRONT, b"GET /echo HT", None, None, True),
     ("closed in the fields", FRONT, b"GET /echo HTTP/1.1\r\n" + H, 400, None, True),
 ]
@@ -419,12 +436,18 @@ for mi, mode in enumerate(MODES):
                 bad = []
                 for split in splits_of(len(data)):
                     pos = log_size()
+                    t0 = time.monotonic()
                     status, fields, body, complete = front_request(port, data, split,
                                                                    len(data), eof)
                     ok = (status == exp or (exp == 0 and status is not None))
+                    if ok and exp == 505:
+                        # answered at once (no wait for the half-close), and
+                        # the connection closed
+                        ok = (time.monotonic() - t0 < 1
+                              and fields.get("connection") == ["close"])
                     if ok and field and status == 200 and field.encode() not in body.lower():
                         ok = False
-                    if ok and split == "whole" and exp == 400:
+                    if ok and split == "whole" and exp in (400, 505):
                         # the cause is logged (http:debug)
                         ok = "[http:debug]" in new_log(pos) or "[core:info]" in new_log(pos)
                     if not ok:

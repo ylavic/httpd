@@ -1007,7 +1007,12 @@ static int h1_head_proto_num(const char *protocol)
         && apr_isdigit(protocol[5]) && protocol[5] != '0'
         && protocol[6] == '.' && apr_isdigit(protocol[7])
         && !protocol[8]) {
-        return HTTP_VERSION(protocol[5] - '0', protocol[7] - '0');
+        int major = protocol[5] - '0', minor = protocol[7] - '0';
+
+        /* A 1.x minor above ours is read as the highest we support
+         * (RFC 9112 2.3)
+         */
+        return HTTP_VERSION(major, (major == 1 && minor > 1) ? 1 : minor);
     }
     return HTTP_VERSION(0, 9);
 }
@@ -1032,6 +1037,16 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
         head->u.req.uri = uri;
         head->protocol = protocol;
         head->proto_num = h1_head_proto_num(protocol);
+        if (HTTP_VERSION_MAJOR(head->proto_num) > 1) {
+            /* HTTP/2 and above is not spoken with an HTTP/1 request line
+             * (mod_http2 builds its requests without one)
+             */
+            ap_log_rerror(H1_LOG_MARK, parser->loglevel, 0, parser->r,
+                          APLOGNO()
+                          "HTTP Request Line; version not supported: '%.*s'",
+                          field_name_len(protocol), protocol);
+            return HTTP_VERSION_NOT_SUPPORTED;
+        }
     }
     else {
         const char *echo = parser->opts.echo_protocol;
@@ -1798,6 +1813,12 @@ static http_error r_assign_protocol(request_rec *r,
             && !protocol[8] && protocol[5] != '0') {
         r->assbackwards = 0;
         proto_num = HTTP_VERSION(protocol[5] - '0', protocol[7] - '0');
+        if (proto_num > HTTP_VERSION(1, 1) && proto_num < HTTP_VERSION(2, 0)) {
+            /* A 1.x minor above ours is treated as the highest we support
+             * (RFC 9112 2.3), r->protocol keeping what was received.
+             */
+            proto_num = HTTP_VERSION(1, 1);
+        }
     }
     else if ((protocol[0] == 'H' || protocol[0] == 'h')
                  && (protocol[1] == 'T' || protocol[1] == 't')
@@ -1808,6 +1829,9 @@ static http_error r_assign_protocol(request_rec *r,
                  && !protocol[8] && protocol[5] != '0') {
         r->assbackwards = 0;
         proto_num = HTTP_VERSION(protocol[5] - '0', protocol[7] - '0');
+        if (proto_num > HTTP_VERSION(1, 1) && proto_num < HTTP_VERSION(2, 0)) {
+            proto_num = HTTP_VERSION(1, 1);
+        }
         if (strict && error == http_error_none)
             error = http_error_badprotocol;
         else
