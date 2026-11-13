@@ -767,7 +767,8 @@
  *                         mpm_register_wait, mpm_release_pfd,
  *                         mpm_notifier_create, mpm_notify,
  *                         mpm_notifier_rearm and
- *                         mpm_register_timeouts hooks to mpm_common.h; conn_rec->partial_request,
+ *                         mpm_register_timeouts hooks to mpm_common.h;
+ *                         conn_state_t->partial_request,
  *                         conn_state_t->timed_out and
  *                         AP_EXPECT_100_NONBLOCK to httpd.h;
  *                         ap_read_request_ex(), ap_send_interim_response_ex(),
