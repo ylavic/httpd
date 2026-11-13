@@ -4181,12 +4181,12 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     if (!cs) {
         return APR_ENOTIMPL; /* not a connection of this MPM */
     }
-    if (!fn || ((!pfds || pfds->nelts <= 0) && !notifier && timeout < 0)) {
-        return APR_EINVAL; /* nothing would fire the wait */
-    }
     if (cs->pending_wait || (cs->suspended && !cs->in_continuation)) {
         /* One wait at a time, and not from another thread */
         return APR_EBUSY;
+    }
+    if (!fn || ((!pfds || pfds->nelts <= 0) && !notifier && timeout < 0)) {
+        return APR_EINVAL; /* nothing would fire the wait */
     }
 
     if (notifier) {
