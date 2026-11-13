@@ -1330,9 +1330,6 @@ struct conn_rec {
     int async_filter;
 
     int outgoing;
-
-    /** Partial request being read (non-blocking) */
-    request_rec *partial_request;
 };
 
 struct conn_slave_rec {
@@ -1380,6 +1377,9 @@ struct conn_state_t {
     conn_state_e state;
     /** Whether to read instead of write, or write instead of read */
     conn_sense_e sense;
+    /** The request being read nonblocking, kept by ap_read_request_ex()
+     *  across APR_EAGAIN until its head is complete (or it fails). */
+    request_rec *partial_request;
     /** Set by the MPM when the wait of CONN_STATE_ASYNC_WAITIO timed out, for
      *  one last pass of the process_connection hooks: they can answer the
      *  timeout (e.g. a 408 for a request not read in time) but not wait

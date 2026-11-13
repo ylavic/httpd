@@ -2002,7 +2002,7 @@ AP_DECLARE(apr_status_t) ap_read_request_ex(request_rec **out_r, conn_rec *conn,
     apr_table_t *headers;
     request_rec *r;
 
-    r = conn->partial_request;
+    r = (conn->cs) ? conn->cs->partial_request : NULL;
     if (conn->keepalive == AP_CONN_KEEPALIVE) {
         conn->keepalive = AP_CONN_UNKNOWN;
     }
@@ -2027,7 +2027,8 @@ AP_DECLARE(apr_status_t) ap_read_request_ex(request_rec **out_r, conn_rec *conn,
             access_status = HTTP_REQUEST_TIME_OUT;
             goto die_unusable_input;
         }
-        conn->partial_request = r;
+        AP_DEBUG_ASSERT(conn->cs != NULL);
+        conn->cs->partial_request = r;
         r = NULL;
         goto done;
     }
@@ -2057,7 +2058,9 @@ AP_DECLARE(apr_status_t) ap_read_request_ex(request_rec **out_r, conn_rec *conn,
     /* If there is a request, we always process it, as it defines
      * the context in which a potential error bucket is handled. */
     if (breq) {
-        conn->partial_request = NULL;
+        if (conn->cs) {
+            conn->cs->partial_request = NULL;
+        }
 
         if (apr_pool_is_ancestor(r->pool, breq->pool)) {
             method = breq->method;
@@ -2240,7 +2243,10 @@ die:
 
 ignore:
     ap_release_brigade(conn, tmp_bb);
-    *out_r = conn->partial_request = r = NULL;
+    *out_r = r = NULL;
+    if (conn->cs) {
+        conn->cs->partial_request = NULL;
+    }
     AP_READ_REQUEST_FAILURE((uintptr_t)r);
     return APR_EGENERAL;
 }
