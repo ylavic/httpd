@@ -11,7 +11,7 @@ Build the Go tools (Go >= 1.21, no module needed):
                                      # after MS ms, /?s=BYTES streams BYTES, POST reads
                                      # its body; -raw ADDR misbehaves (closes early)
   go build -o schemebackend schemebackend.go # AJP13 (-ajp), SCGI (-scgi) and uwsgi
-                                     # (-uwsgi) responders: ?d=MS, ?s=BYTES, ?close=0
+                                     # (-uwsgi) responders: ?d=MS, ?s=BYTES, ?close=0, ?proto=
 
 Build mod_aptest (its "aptest-queue" handler, controlled service times):
   cd ../pyhttpd/mod_aptest && $PREFIX/bin/apxs -c mod_aptest.c

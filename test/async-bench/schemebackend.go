@@ -2,7 +2,9 @@
 // per connection (AJP keeps its connections), whose query string says what
 // to do: d=MS sleeps MS milliseconds before answering, s=BYTES answers BYTES
 // (512 by default), close=0 closes the connection without answering after
-// the delay. A request body is read (and its length answered in X-Body).
+// the delay, proto=P (uwsgi) answers with the protocol P in its status line
+// (HTTP/1.1 by default). A request body is read (and its length answered in
+// X-Body).
 package main
 
 import (
@@ -24,11 +26,15 @@ type reply struct {
 	size    int
 	close   bool
 	bodyLen int
+	proto   string
 }
 
 func parseQuery(qs string, bodyLen int) reply {
 	q, _ := url.ParseQuery(qs)
-	rp := reply{size: 512, bodyLen: bodyLen}
+	rp := reply{size: 512, bodyLen: bodyLen, proto: "HTTP/1.1"}
+	if p := q.Get("proto"); p != "" {
+		rp.proto = p
+	}
 	if ms, err := strconv.Atoi(q.Get("d")); err == nil && ms > 0 {
 		rp.delay = time.Duration(ms) * time.Millisecond
 	}
@@ -132,7 +138,7 @@ func serveUWSGI(c net.Conn) {
 	if rp.close {
 		return
 	}
-	fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Body: %d\r\n\r\n", rp.bodyLen)
+	fmt.Fprintf(c, "%s 200 OK\r\nContent-Type: text/plain\r\nX-Body: %d\r\n\r\n", rp.proto, rp.bodyLen)
 	c.Write(body(rp.size))
 }
 

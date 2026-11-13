@@ -9,6 +9,7 @@ usage: MODES="sync async" SCHEMES="ajp scgi uwsgi" \\
 import http.client
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -107,6 +108,59 @@ def request(method, path, body=None, timeout=20):
         c.close()
 
 
+def raw_status(protocol, path):
+    """The status of a request sent with the given protocol in its request
+    line (r->protocol, the uwsgi SERVER_PROTOCOL), None without a response
+    (an error response to an HTTP/2.0 request isn't received)"""
+    s = socket.create_connection(("127.0.0.1", FRONT), timeout=3)
+    try:
+        s.sendall(("GET %s %s\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                   % (path, protocol)).encode())
+        data = b""
+        while b"\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        parts = data.split(b"\r\n", 1)[0].split()
+        return int(parts[1]) if len(parts) > 1 else None
+    except OSError as e:
+        return type(e).__name__
+    finally:
+        s.close()
+
+
+# (request protocol, protocol of the backend's status line, expected status):
+# the status line's protocol is HTTP/1.x or the request's (also "HTTP/x" for
+# an "HTTP/x.0")
+ECHOES = [
+    ("HTTP/1.1", "HTTP/1.1", 200), ("HTTP/1.1", "HTTP/1.0", 200),
+    ("HTTP/1.1", "HTTP/2.0", 502), ("HTTP/1.1", "HTTP/2", 502),
+    ("HTTP/1.1", "HTTP/1", 502),
+    ("HTTP/2.0", "HTTP/2.0", 200), ("HTTP/2.0", "HTTP/2", 200),
+    ("HTTP/2.0", "HTTP/1.1", 200),
+    ("HTTP/2.0", "HTTP/3", 502), ("HTTP/2.0", "HTTP/2.1", 502),
+    ("HTTP/2.0", "HTTP/9", 502), ("HTTP/2.0", "HTTP/1", 502),
+]
+
+
+def echo_cases(m):
+    bad = []
+    for req, rsp, exp in ECHOES:
+        with open(os.path.join(work, "error_log")) as f:
+            pos = len(f.read())
+        got = raw_status(req, "/uwsgi/e?d=0&proto=" + rsp)
+        with open(os.path.join(work, "error_log")) as f:
+            f.seek(pos)
+            refused = ("malformed status line: %s 200" % rsp) in f.read()
+        # Accepted: a 200; refused: no 200, the parser logging why
+        if (got == 200) != (exp == 200) or refused != (exp != 200):
+            bad.append("%s answered by %s: %s, refused: %s (expected %s)"
+                       % (req, rsp, got, refused, exp))
+    return "%s: status line protocols vs the request's (%d cases): %s" % (
+        m, len(ECHOES), ", ".join(bad) if bad else "all as expected")
+
+
 def timed(fn, *args):
     t0 = time.monotonic()
     r = fn(*args)
@@ -189,6 +243,8 @@ for mode in os.environ.get("MODES", "sync async").split():
             report.append("%s: backend closing without answering (0.5s): %s in %ss" % (m, r[0], t))
             r, t = timed(request, "GET", "/%s-down/d" % s)
             report.append("%s: backend down: %s in %ss" % (m, r[0], t))
+            if s == "uwsgi":
+                report.append(echo_cases(m))
             report.append("%s: pool of 1, 4 x 0.5s (elapsed, ok), quick request (status, wait): %s"
                           % (m, pool(s)))
         report.append("%s: error_log: %s" % (mode, log_findings()))

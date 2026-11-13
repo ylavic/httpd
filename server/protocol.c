@@ -1034,22 +1034,31 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
         head->proto_num = h1_head_proto_num(protocol);
     }
     else {
-        int any_version = (parser->opts.flags & AP_H1_HEAD_OPT_ANY_VERSION);
+        const char *echo = parser->opts.echo_protocol;
         const char *reason = "";
         apr_size_t plen = 0; /* the protocol's length */
+        int echoed = 0;
         int status = 0;
 
         /* RFC 9112 4: HTTP/1.x, SP, 3DIGIT, then SP and the reason phrase
          * if any (tolerated without), with no control characters but HTAB;
-         * HTTP/x.y or HTTP/x of any version with AP_H1_HEAD_OPT_ANY_VERSION.
+         * or opts.echo_protocol (a gateway echoing the request's protocol),
+         * also as "HTTP/x" for an "HTTP/x.0".
          */
-        if (len >= 12 && apr_date_checkmask(line, "HTTP/#.# ###*")
-            && (line[5] == '1' || any_version)) {
-            plen = 8;
+        if (len >= 12 && apr_date_checkmask(line, "HTTP/#.# ###*")) {
+            if (line[5] == '1') {
+                plen = 8;
+            }
+            else if (echo && !strncmp(line, echo, 8) && !echo[8]) {
+                plen = 8;
+                echoed = 1;
+            }
         }
-        else if (any_version && len >= 10
-                 && apr_date_checkmask(line, "HTTP/# ###*")) {
+        else if (echo && len >= 10 && line[5] != '1'
+                 && apr_date_checkmask(line, "HTTP/# ###*")
+                 && !strncmp(echo, line, 6) && !strcmp(echo + 6, ".0")) {
             plen = 6;
+            echoed = 1;
         }
         if (plen && (len == plen + 4 || line[plen + 4] == ' ')) {
             const char *code = line + plen + 1;
@@ -1071,9 +1080,15 @@ static int h1_head_start_line(ap_h1_head_parser_t *parser, const char *line,
                           (int)((len > 128) ? 128 : len), line);
             return HTTP_BAD_REQUEST;
         }
-        head->protocol = apr_pstrmemdup(parser->pool, line, plen);
-        head->proto_num = HTTP_VERSION(line[5] - '0',
-                                       (plen == 8) ? line[7] - '0' : 0);
+        if (echoed) {
+            /* Read as HTTP/1.1 */
+            head->protocol = "HTTP/1.1";
+            head->proto_num = HTTP_VERSION(1, 1);
+        }
+        else {
+            head->protocol = apr_pstrmemdup(parser->pool, line, plen);
+            head->proto_num = HTTP_VERSION(1, line[7] - '0');
+        }
         head->u.rsp.status = status;
         head->u.rsp.reason = reason;
     }

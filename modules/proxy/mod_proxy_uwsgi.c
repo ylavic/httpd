@@ -325,11 +325,11 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     pass_bb = apr_brigade_create(r->pool, c->bucket_alloc);
 
     /* Read the response head with the rules and limits of
-     * ap_proxy_h1_head_opts(), the status line being of any HTTP version
-     * ("HTTP/x.y" or "HTTP/x": the protocol of the request may be echoed)
+     * ap_proxy_h1_head_opts(), the status line's protocol being the
+     * request's too (SERVER_PROTOCOL may be echoed)
      */
     ap_proxy_h1_head_opts(&opts, r, backend->worker, AP_H1_HEAD_RESPONSE);
-    opts.flags |= AP_H1_HEAD_OPT_ANY_VERSION;
+    opts.echo_protocol = r->protocol;
     parser = ap_h1_head_parser_create(r->pool, r, &opts);
     rc = ap_h1_head_parse(parser, rp->input_filters, APR_BLOCK_READ, &head);
     if (rc != OK) {

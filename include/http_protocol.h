@@ -141,10 +141,6 @@ typedef enum {
  * and check the merged values against limit_field
  */
 #define AP_H1_HEAD_OPT_MERGE   (1u << 2)
-/** A status-line's protocol may be any HTTP version, as "HTTP/x.y" or
- * "HTTP/x" (a gateway echoing the request's protocol), not HTTP/1.x only
- */
-#define AP_H1_HEAD_OPT_ANY_VERSION (1u << 3)
 
 /**
  * The options of an HTTP/1 head parser. As with ap_fgetline(), a line may
@@ -161,6 +157,12 @@ typedef struct {
     unsigned int max_blank_lines;   /**< empty lines skipped before the
                                      *   start line */
     int module_index;               /**< the module logging the errors */
+    const char *echo_protocol;      /**< NULL, or the protocol (e.g.
+                                     *   "HTTP/2.0") a status-line may have
+                                     *   besides HTTP/1.x, also as "HTTP/x"
+                                     *   for an "HTTP/x.0" (a gateway echoing
+                                     *   the request's protocol); the head is
+                                     *   then read as HTTP/1.1 */
 } ap_h1_head_opts_t;
 
 /** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */
