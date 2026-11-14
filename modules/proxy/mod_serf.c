@@ -490,6 +490,7 @@ static int drive_serf(request_rec *r, modserf_dir_config_t *conf)
     apr_status_t rv = 0;
     apr_pool_t *pool;
     apr_sockaddr_t *address;
+    apr_uri_t host_info = conf->url;
     s_baton_t *baton = apr_palloc(r->pool, sizeof(s_baton_t));
     /* XXXXX: make persistent/per-process or something.*/
     serf_context_t *serfme;
@@ -562,6 +563,10 @@ static int drive_serf(request_rec *r, modserf_dir_config_t *conf)
         rv = apr_sockaddr_info_get(&address, choice->ip,
                                    APR_UNSPEC, choice->port, 0,
                                    pool);
+        host_info.scheme = "http";
+        host_info.hostname = (char *)choice->ip;
+        host_info.port = choice->port;
+        host_info.port_str = apr_itoa(pool, choice->port);
     }
     else {
         /* XXXXX: cache dns? */
@@ -645,10 +650,24 @@ static int drive_serf(request_rec *r, modserf_dir_config_t *conf)
         baton->body_bkt = serf_bucket_file_create(fp, baton->bkt_alloc);
     }
 
+#if SERF_VERSION_AT_LEAST(1, 4, 0)
+    /* serf_connection_create() doesn't set up the connection's config
+     * since serf 1.4, which serf needs to open it */
+    rv = serf_connection_create3(&conn, serfme, host_info, address,
+                                 conn_setup, baton,
+                                 closed_connection, baton,
+                                 pool);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "serf_connection_create3() for %pI", address);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+#else
     conn = serf_connection_create(serfme, address,
                                   conn_setup, baton,
                                   closed_connection, baton,
                                   pool);
+#endif
 
     /* XXX: Is it correct that we don't use the returned serf_request_t? */
     serf_connection_request_create(conn, setup_request, baton);
