@@ -69,7 +69,6 @@ AP_DECLARE(void) ap_queue_info_free_idle_pools(fd_queue_info_t *queue_info);
 enum ap_queue_event_type_e
 {
     AP_QUEUE_EVENT_SOCK,
-    AP_QUEUE_EVENT_TIMER,
     AP_QUEUE_EVENT_BATON,
 };
 typedef enum ap_queue_event_type_e ap_queue_event_type_e;
@@ -99,7 +98,6 @@ struct ap_queue_event_t
     ap_queue_event_type_e type;
     union {
         sock_event_t *se;
-        timer_event_t *te;
         void *baton;
     } data;
 

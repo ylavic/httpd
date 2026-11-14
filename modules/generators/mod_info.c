@@ -347,7 +347,6 @@ static const hook_lookup_t other_hooks[] = {
     {"Error Logging", ap_hook_get_error_log},
     {"Query MPM Attributes", ap_hook_get_mpm_query},
     {"Query MPM Name", ap_hook_get_mpm_get_name},
-    {"Register Timed Callback", ap_hook_get_mpm_register_timed_callback},
     {"Extend Expression Parser", ap_hook_get_expr_lookup},
     {"Set Management Items", ap_hook_get_get_mgmt_items},
 #if AP_ENABLE_EXCEPTION_HOOK

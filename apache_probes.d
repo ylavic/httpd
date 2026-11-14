@@ -113,10 +113,6 @@ provider ap {
   probe mpm_note_child_killed__dispatch__invoke(char *);
   probe mpm_note_child_killed__dispatch__complete(char *, uint32_t);
   probe mpm_note_child_killed__return(uint32_t);
-  probe mpm_register_timed_callback__entry();
-  probe mpm_register_timed_callback__dispatch__invoke(char *);
-  probe mpm_register_timed_callback__dispatch__complete(char *, uint32_t);
-  probe mpm_register_timed_callback__return(uint32_t);
   probe mpm_query__entry();
   probe mpm_query__dispatch__invoke(char *);
   probe mpm_query__dispatch__complete(char *, uint32_t);

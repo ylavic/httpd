@@ -68,7 +68,6 @@
     APR_HOOK_LINK(drop_privileges) \
     APR_HOOK_LINK(mpm) \
     APR_HOOK_LINK(mpm_query) \
-    APR_HOOK_LINK(mpm_register_timed_callback) \
     APR_HOOK_LINK(mpm_get_name) \
     APR_HOOK_LINK(mpm_resume_suspended) \
     APR_HOOK_LINK(mpm_register_wait) \
@@ -113,9 +112,6 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm,
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm_query,
                             (int query_code, int *result, apr_status_t *_rv),
                             (query_code, result, _rv), DECLINED)
-AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_timed_callback,
-                            (apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton),
-                            (t, cbfn, baton), APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_resume_suspended,
                             (conn_rec *c),
                             (c), APR_ENOTIMPL)
@@ -718,12 +714,6 @@ AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier)
 AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier)
 {
     (void)ap_run_mpm_notifier_detach(notifier);
-}
-
-AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(apr_time_t t,
-        ap_mpm_callback_fn_t *cbfn, void *baton)
-{
-    return ap_run_mpm_register_timed_callback(t, cbfn, baton);
 }
 
 AP_DECLARE(const char *)ap_show_mpm(void)

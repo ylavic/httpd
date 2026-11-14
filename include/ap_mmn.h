@@ -894,14 +894,20 @@
  * 20260601.21 (2.5.1-dev) Add AP_PROXY_TUNNEL_HOLD_DELEGATED to mod_proxy.h
  * 20260601.22 (2.5.1-dev) Add ap_request_holder_t.timeout to http_request.h
  * 20260601.23 (2.5.1-dev) Add ap_core_input_short_drains() to http_core.h
+ * 20261114.0  (2.5.1-dev) Axe ap_mpm_register_timed_callback() and the
+ *                         mpm_register_timed_callback hook (a request waits
+ *                         for a delay with a timer wait context,
+ *                         ap_request_waitctx_timer(), a connection with
+ *                         ap_mpm_register_wait() and only a timeout);
+ *                         AP_MPMQ_HAS_SERF is always 0 (no MPM drives serf)
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
 
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
-#define MODULE_MAGIC_NUMBER_MAJOR 20260601
+#define MODULE_MAGIC_NUMBER_MAJOR 20261114
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 23    /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 0     /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

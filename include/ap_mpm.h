@@ -176,7 +176,7 @@ AP_DECLARE(apr_status_t) ap_os_create_privileged_process(
 #define AP_MPMQ_IS_ASYNC             14
 /** MPM generation */
 #define AP_MPMQ_GENERATION           15
-/** MPM can drive serf internally  */
+/** MPM can drive serf internally (none does anymore: always 0) */
 #define AP_MPMQ_HAS_SERF             16
 /** MPM supports suspending/resuming connections */
 #define AP_MPMQ_CAN_SUSPEND          17
@@ -424,10 +424,6 @@ AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier);
  * @remark It's called from the thread processing the request.
  */
 AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier);
-
-/* only added support in the Event MPM....  check for APR_ENOTIMPL */
-AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(
-        apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton);
 
 typedef enum mpm_child_status {
     MPM_CHILD_STARTED,

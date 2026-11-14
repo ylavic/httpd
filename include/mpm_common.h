@@ -430,13 +430,6 @@ AP_DECLARE_HOOK(int, drop_privileges, (apr_pool_t * pchild, server_rec * s))
  */
 AP_DECLARE_HOOK(int, mpm_query, (int query_code, int *result, apr_status_t *rv))
 
-/**
- * register the specified callback
- * @ingroup hooks
- */
-AP_DECLARE_HOOK(apr_status_t, mpm_register_timed_callback,
-                (apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton))
-
 /** Resume the suspended connection 
  * @ingroup hooks
  */

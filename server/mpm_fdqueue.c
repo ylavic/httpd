@@ -630,7 +630,6 @@ AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
 
     switch (event->type) {
     case AP_QUEUE_EVENT_SOCK:
-    case AP_QUEUE_EVENT_TIMER:
     case AP_QUEUE_EVENT_BATON:
         push_elem(queue, NULL, event);
         if (event->cb) {

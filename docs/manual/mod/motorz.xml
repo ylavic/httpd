@@ -144,10 +144,7 @@ LoadModule mpm_motorz_module modules/mod_mpm_motorz.so
     <code>resume_connection</code> hooks is told on the worker thread that parks
     a connection (between requests, or while it waits for I/O or for output to
     drain) and again on the worker thread that continues it, which need not be
-    the same thread. The generic timed and poll callbacks of the MPM interface
-    (<code>ap_mpm_register_timed_callback()</code> and
-    <code>ap_mpm_register_poll_callback()</code>) are not provided: they return
-    <code>APR_ENOTIMPL</code>, and a module has to cope with that.</p>
+    the same thread.</p>
 </section>
 
 <section id="graceful-stop"><title>Graceful stop and restart</title>
