@@ -58,6 +58,14 @@
 #define APTEST_WAIT_NO_FLAGS 0
 #endif
 
+/* The MPM refusing the request's waits (see "the refused waits"): the
+ * hooks' signatures
+ */
+#if defined(APTEST_HAS_MULTI) && defined(APTEST_HAS_PFDFLAGS)
+#include <mpm_common.h>
+#define APTEST_HAS_REFUSE 1
+#endif
+
 /* Request filters holding their output or input (ap_filter_pending_wait()) */
 #if AP_MODULE_MAGIC_AT_LEAST(20260601, 15)
 #define APTEST_HAS_HOLD 1
@@ -1284,6 +1292,10 @@ static void aptest_notifier_continuation(request_rec *r, apr_status_t status,
 }
 #endif /* APR_HAS_THREADS */
 
+#ifdef APTEST_HAS_REFUSE
+static void aptest_refuse_own(ap_mpm_notifier_t *notifier);
+#endif
+
 static int aptest_notifier(request_rec *r)
 {
     aptest_notifier_t *n = apr_pcalloc(r->pool, sizeof(*n));
@@ -1303,6 +1315,9 @@ static int aptest_notifier(request_rec *r)
                                r->pool) != APR_SUCCESS) {
         return aptest_notifier_respond(n);
     }
+#ifdef APTEST_HAS_REFUSE
+    aptest_refuse_own(n->notifier);
+#endif
     n->ctx = ap_request_waitctx_notifier(r, r->pool, n->notifier);
     n->report = "";
     apr_pool_pre_cleanup_register(r->pool, n, aptest_notifier_join);
@@ -1327,6 +1342,112 @@ static int aptest_notifier(request_rec *r)
     return aptest_notifier_respond(n);
 #endif
 }
+
+#ifdef APTEST_HAS_REFUSE
+/*
+ * The refused waits: with an "AP-Test-Refuse-Wait: register <n>" request
+ * header, the n-th ap_mpm_register_wait() of the connection from then on
+ * fails with APR_EGENERAL, as a bug of the core or the MPM would make it;
+ * with "rearm <n>", the n-th ap_mpm_notifier_rearm() of a notifier that
+ * isn't "aptest-wait notifier"'s own (the core's, for the request's waits).
+ * The core abandons the request: its connection is closed, an error logged.
+ * The re-arms (which don't say their connection) are counted for the whole
+ * process: one such request at a time.
+ */
+typedef struct {
+    int left;                     /* calls up to the refused one, 0 after */
+} aptest_refuse_t;
+
+static int aptest_refuse_rearm_left;          /* as left, for the re-arms */
+static ap_mpm_notifier_t *aptest_refuse_mine; /* "aptest-wait notifier"'s */
+
+#define APTEST_REFUSE_KEY "aptest_refuse"
+
+static aptest_refuse_t *aptest_refuse_get(conn_rec *c)
+{
+    void *rf = NULL;
+
+    apr_pool_userdata_get(&rf, APTEST_REFUSE_KEY, c->pool);
+    return rf;
+}
+
+static void aptest_refuse_own(ap_mpm_notifier_t *notifier)
+{
+    if (aptest_refuse_rearm_left > 0) {
+        aptest_refuse_mine = notifier;
+    }
+}
+
+static int aptest_refuse_read_request(request_rec *r)
+{
+    const char *val = apr_table_get(r->headers_in, "AP-Test-Refuse-Wait");
+    conn_rec *c = r->connection;
+    aptest_refuse_t *rf;
+    int rearm;
+
+    if (!val || r->main || c->master) {
+        return DECLINED;
+    }
+    if (strncmp(val, "register ", 9) == 0) {
+        rearm = 0;
+        val += 9;
+    }
+    else if (strncmp(val, "rearm ", 6) == 0) {
+        rearm = 1;
+        val += 6;
+    }
+    else {
+        return DECLINED;
+    }
+    if (rearm) {
+        aptest_refuse_rearm_left = atoi(val);
+        aptest_refuse_mine = NULL;
+        return DECLINED;
+    }
+    rf = aptest_refuse_get(c);
+    if (!rf) {
+        rf = apr_pcalloc(c->pool, sizeof(*rf));
+        apr_pool_userdata_setn(rf, APTEST_REFUSE_KEY, NULL, c->pool);
+    }
+    rf->left = atoi(val);
+    return DECLINED;
+}
+
+/* Whether this call is the refused one (*left calls up to it) */
+static int aptest_refuse_now(int *left)
+{
+    return (*left > 0 && --*left == 0);
+}
+
+static apr_status_t aptest_refuse_register_wait(conn_rec *c, apr_pool_t *p,
+                                                const apr_array_header_t *pfds,
+                                                apr_interval_time_t timeout,
+                                                ap_mpm_notifier_t *notifier,
+                                                const unsigned int *pfds_flags,
+                                                ap_mpm_continuation_fn_t *fn,
+                                                void *baton)
+{
+    aptest_refuse_t *rf = aptest_refuse_get(c);
+
+    if (rf && aptest_refuse_now(&rf->left)) {
+        ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, c, APLOGNO()
+                      "refuse-wait: refusing ap_mpm_register_wait()");
+        return APR_EGENERAL;
+    }
+    return APR_ENOTIMPL; /* the MPM's */
+}
+
+static apr_status_t aptest_refuse_notifier_rearm(ap_mpm_notifier_t *notifier)
+{
+    if (notifier != aptest_refuse_mine
+        && aptest_refuse_now(&aptest_refuse_rearm_left)) {
+        ap_log_error(APLOG_MARK, APLOG_INFO, 0, ap_server_conf, APLOGNO()
+                     "refuse-wait: refusing ap_mpm_notifier_rearm()");
+        return APR_EGENERAL;
+    }
+    return APR_ENOTIMPL; /* the MPM's */
+}
+#endif /* APTEST_HAS_REFUSE */
 
 /*
  * The descriptor contexts in subpools ("AptestWait pfdpool <n>"): n
@@ -3876,6 +3997,14 @@ static void aptest_hooks(apr_pool_t *pool)
                                                             aptest_fsubreq_filter,
                                                             NULL,
                                                             AP_FTYPE_PROTOCOL);
+#endif
+#ifdef APTEST_HAS_REFUSE
+    ap_hook_post_read_request(aptest_refuse_read_request, NULL, NULL,
+                              APR_HOOK_MIDDLE);
+    ap_hook_mpm_register_wait(aptest_refuse_register_wait, NULL, NULL,
+                              APR_HOOK_REALLY_FIRST);
+    ap_hook_mpm_notifier_rearm(aptest_refuse_notifier_rearm, NULL, NULL,
+                               APR_HOOK_REALLY_FIRST);
 #endif
 #ifdef APTEST_HAS_THOLD
     if (proxy_hook_tunnel_forward) {
