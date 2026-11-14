@@ -125,19 +125,116 @@ static void closed_connection(serf_connection_t *conn,
     ctx->keep_reading = 0;
 }
 
-static serf_bucket_t* conn_setup(apr_socket_t *sock,
-                                 void *setup_baton,
-                                 apr_pool_t *pool)
+/* Whether the certificate's name (a subjectAltName DNS entry or the
+ * subject's CN) matches the backend's hostname, case-insensitively: a
+ * leading "*." in the name stands for one label of the hostname.
+ */
+static int name_matches(const char *name, const char *hostname)
+{
+    if (name[0] == '*' && name[1] == '.') {
+        const char *dot = ap_strchr_c(hostname, '.');
+
+        return dot && dot != hostname && !ap_cstr_casecmp(name + 1, dot);
+    }
+    return !ap_cstr_casecmp(name, hostname);
+}
+
+/* serf's server certificate callback: serf calls it for the certificate
+ * (depth 0) even when OpenSSL accepted it, and for any failure of the
+ * chain, and its status replaces OpenSSL's verdict. Fail on the chain's
+ * failures, as serf does without a callback, and at depth 0 on a
+ * certificate whose names don't match the backend's hostname: those of the
+ * subjectAltName DNS entries, else the subject's CN when it has no such
+ * entry. serf doesn't give the IP entries: a backend named by an IP
+ * address is matched textually against the DNS entries or the CN, so a
+ * certificate with only an IP entry is refused.
+ */
+static apr_status_t server_cert_check(void *baton, int failures,
+                                      const serf_ssl_certificate_t *cert)
+{
+    s_baton_t *ctx = baton;
+    const char *hostname = ctx->conf->url.hostname;
+    apr_pool_t *pool;
+    apr_hash_t *info, *subject;
+    apr_array_header_t *sans;
+    int found = 0, have_dns = 0;
+
+    if (failures || !cert) {
+        return SERF_ERROR_SSL_CERT_FAILED;
+    }
+    if (serf_ssl_cert_depth(cert) != 0) {
+        return APR_SUCCESS;
+    }
+
+    apr_pool_create(&pool, ctx->r->pool);
+    info = serf_ssl_cert_certificate(cert, pool);
+    sans = info ? apr_hash_get(info, "subjectAltName", APR_HASH_KEY_STRING)
+                : NULL;
+    if (sans) {
+        int i;
+
+        for (i = 0; i < sans->nelts && !found; i++) {
+            have_dns = 1;
+            found = name_matches(APR_ARRAY_IDX(sans, i, const char *),
+                                 hostname);
+        }
+    }
+    if (!have_dns) {
+        subject = serf_ssl_cert_subject(cert, pool);
+        if (subject) {
+            const char *cn = apr_hash_get(subject, "CN",
+                                          APR_HASH_KEY_STRING);
+
+            found = cn && name_matches(cn, hostname);
+        }
+    }
+    apr_pool_destroy(pool);
+
+    if (!found) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, ctx->r, APLOGNO()
+                      "serf: the backend's certificate doesn't match its "
+                      "hostname %s", hostname);
+        return SERF_ERROR_SSL_CERT_FAILED;
+    }
+    return APR_SUCCESS;
+}
+
+static apr_status_t conn_setup(apr_socket_t *sock,
+                               serf_bucket_t **read_bkt,
+                               serf_bucket_t **write_bkt,
+                               void *setup_baton,
+                               apr_pool_t *pool)
 {
     serf_bucket_t *c;
     s_baton_t *ctx = setup_baton;
 
     c = serf_bucket_socket_create(sock, ctx->bkt_alloc);
     if (ctx->want_ssl) {
+        apr_status_t rv;
+
         c = serf_bucket_ssl_decrypt_create(c, ctx->ssl_ctx, ctx->bkt_alloc);
+        if (!ctx->ssl_ctx) {
+            ctx->ssl_ctx = serf_bucket_ssl_decrypt_context_get(c);
+        }
+
+        /* Verify the backend's certificate against the default CAs and
+         * its hostname (a failure ends the connection with
+         * SERF_ERROR_SSL_CERT_FAILED), and send the name for SNI. */
+        rv = serf_ssl_use_default_certificates(ctx->ssl_ctx);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        serf_ssl_server_cert_callback_set(ctx->ssl_ctx, server_cert_check,
+                                          ctx);
+        serf_ssl_set_hostname(ctx->ssl_ctx, ctx->conf->url.hostname);
+
+        /* Encrypt the write side with the same context */
+        *write_bkt = serf_bucket_ssl_encrypt_create(*write_bkt, ctx->ssl_ctx,
+                                                    ctx->bkt_alloc);
     }
 
-    return c;
+    *read_bkt = c;
+    return APR_SUCCESS;
 }
 
 static int copy_headers_in(void *vbaton, const char *key, const char *value)
@@ -378,18 +475,6 @@ static apr_status_t setup_request(serf_request_t *request,
     }
 
     serf_bucket_headers_setn(hdrs_bkt, "Accept-Encoding", "gzip");
-
-    if (ctx->want_ssl) {
-        if (ctx->ssl_ctx == NULL) {
-            *req_bkt = serf_bucket_ssl_encrypt_create(*req_bkt, NULL,
-                                           ctx->bkt_alloc);
-            ctx->ssl_ctx = serf_bucket_ssl_encrypt_context_get(*req_bkt);
-        }
-        else {
-            *req_bkt = serf_bucket_ssl_encrypt_create(*req_bkt, ctx->ssl_ctx,
-                                                      ctx->bkt_alloc);
-        }
-    }
 
     *acceptor = accept_response;
     *acceptor_baton = ctx;
