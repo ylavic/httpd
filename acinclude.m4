@@ -755,14 +755,16 @@ AC_DEFUN([APACHE_CHECK_OPENSSL],[
 dnl
 dnl APACHE_CHECK_SERF
 dnl
-dnl Configure for the detected libserf, giving preference to
-dnl "--with-serf=<path>" if it was specified.
+dnl Configure for the detected libserf (serf-2, serf-1 or serf-0, in that
+dnl order), giving preference to "--with-serf=<path>" if it was specified.
+dnl The library is looked for, not linked: it needs APR's, which may not be
+dnl built yet (--with-included-apr).
 dnl
 AC_DEFUN([APACHE_CHECK_SERF], [
   AC_CACHE_CHECK([for libserf], [ac_cv_serf], [
     ac_cv_serf=no
+    ac_cv_serf_major=
     serf_prefix=/usr
-    SERF_LIBS=""
     AC_ARG_WITH(serf, APACHE_HELP_STRING([--with-serf=PATH],
                                     [Serf client library]),
     [
@@ -774,22 +776,29 @@ AC_DEFUN([APACHE_CHECK_SERF], [
     ])
 
     if test "$serf_prefix" != "no" ; then
-      save_cppflags="$CPPFLAGS"
-      CPPFLAGS="$CPPFLAGS $APR_INCLUDES $APU_INCLUDES -I$serf_prefix/include/serf-0"
-      AC_CHECK_HEADERS(serf.h,[
-        save_ldflags="$LDFLAGS"
-        LDFLAGS="$LDFLAGS -L$serf_prefix/lib"
-        AC_CHECK_LIB(serf-0, serf_context_create,[ac_cv_serf="yes"])
-        LDFLAGS="$save_ldflags"])
-      CPPFLAGS="$save_cppflags"
+      for serf_major in 2 1 0; do
+        if test -f "$serf_prefix/include/serf-$serf_major/serf.h"; then
+          for serf_libdir in "$serf_prefix/lib" "$serf_prefix/lib64"; do
+            for serf_lib in "$serf_libdir/libserf-$serf_major".*; do
+              if test -f "$serf_lib"; then
+                ac_cv_serf=yes
+                ac_cv_serf_major=$serf_major
+                ac_cv_serf_libdir=$serf_libdir
+                ac_cv_serf_incdir=$serf_prefix/include/serf-$serf_major
+                break 3
+              fi
+            done
+          done
+        fi
+      done
     fi
   ])
 
   APACHE_SUBST(SERF_LIBS)
   if test "$ac_cv_serf" = "yes"; then
     AC_DEFINE(HAVE_SERF, 1, [Define if libserf is available])
-    APR_SETVAR(SERF_LIBS, [-L$serf_prefix/lib -lserf-0])
-    APR_ADDTO(MOD_INCLUDES, [-I$serf_prefix/include/serf-0])
+    APR_SETVAR(SERF_LIBS, [-L$ac_cv_serf_libdir -lserf-$ac_cv_serf_major])
+    APR_ADDTO(MOD_INCLUDES, [-I$ac_cv_serf_incdir])
   fi
 ])
 
