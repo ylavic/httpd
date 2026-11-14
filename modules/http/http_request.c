@@ -713,7 +713,7 @@ typedef struct {
     int waits;         /* registered so far, the next ones keep the pfd */
 } request_waitctx_dir_t;
 
-struct request_waitreg_t;
+struct request_pending_wait_t;
 
 /* A wait context: the public part first */
 typedef struct request_waitctx_t {
@@ -728,7 +728,7 @@ typedef struct request_waitctx_t {
                                       * subrequest's client context the
                                       * top-level request's (one socket) */
     struct request_waitctx_t *kept_next; /* in its subrequest's kept list */
-    struct request_waitreg_t *wait;  /* the pending wait it's in, if any */
+    struct request_pending_wait_t *wait;  /* the pending wait it's in, if any */
     request_waitctx_dir_t dirs[2];   /* AP_WAIT_IN, AP_WAIT_OUT */
     apr_interval_time_t timeout;  /* of its pending wait, resolved */
     apr_interval_time_t due;      /* of its pending wait, until the output
@@ -746,8 +746,8 @@ typedef struct request_waitctx_t {
 #define REQUEST_WAITCTX_DIR(direction) (((direction) & AP_WAIT_OUT) ? 1 : 0)
 
 /* The targets of a wait's direction in its connection's filters rather than
- * its descriptor (request_waitreg_t->held), as bits: the client's output held
- * by a request filter until the wait of a context completes (the hold's
+ * its descriptor (request_pending_wait_t->held), as bits: the client's output
+ * held by a request filter until the wait of a context completes (the hold's
  * own wait), the core completing this one then; or paced by a request
  * filter until a time (the wait's timeout then completes it as ready).
  */
@@ -772,8 +772,8 @@ typedef struct request_waitctx_t {
  * own ready, its own timeout reached, or the MPM failing to wait. Allocated
  * in the top-level request's pool and reused (no allocation per wait).
  */
-typedef struct request_waitreg_t {
-    struct request_waitreg_t *next;  /* in w->waits, or w->spare */
+typedef struct request_pending_wait_t {
+    struct request_pending_wait_t *next;  /* in w->waits, or w->spare */
     request_rec *waiter;          /* the request that waits (its first
                                    * context's), given to fn */
     request_waitctx_t **ctxs;    /* its contexts, NULL once released */
@@ -801,7 +801,7 @@ typedef struct request_waitreg_t {
                  drained       :1, /* AP_MPM_WAIT_DRAINED for its pfds */
                  registered    :1, /* in an MPM wait already (expiry set) */
                  completed     :1; /* its continuation to be called */
-} request_waitreg_t;
+} request_pending_wait_t;
 
 /* The state of a request's waits (ap_request_async_t->waitset): its client
  * context, and for the top-level request the pending waits of its tree
@@ -813,8 +813,8 @@ struct ap_request_waitset {
     request_waitctx_t *kept;     /* a subrequest's contexts whose pfd the
                                    * MPM may keep (released at its end) */
     /* The pending waits, in the top-level request's state only */
-    request_waitreg_t *waits;        /* in the order of their registration */
-    request_waitreg_t *spare;        /* done, for the next ones */
+    request_pending_wait_t *waits;        /* in the order of their registration */
+    request_pending_wait_t *spare;        /* done, for the next ones */
     apr_array_header_t *pfds;     /* of the MPM wait, or of a new wait's
                                    * delay (poll), reused */
     apr_array_header_t *pfds_flags; /* AP_MPM_WAIT_* of each of pfds for the
@@ -889,9 +889,10 @@ static struct ap_request_waitset *request_waitctx_tree(request_waitctx_t *ctx)
 /* A wait for nctxs contexts, reused or allocated in the top-level request's
  * pool
  */
-static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int nctxs)
+static request_pending_wait_t *request_pending_wait_get(struct ap_request_waitset *w,
+                                                        int nctxs)
 {
-    request_waitreg_t *g = w->spare;
+    request_pending_wait_t *g = w->spare;
 
     if (g) {
         w->spare = g->next;
@@ -927,16 +928,18 @@ static request_waitreg_t *request_waitreg_get(struct ap_request_waitset *w, int 
 }
 
 /* A wait done, for reuse */
-static void request_waitreg_put(struct ap_request_waitset *w, request_waitreg_t *g)
+static void request_pending_wait_put(struct ap_request_waitset *w,
+                                     request_pending_wait_t *g)
 {
     g->next = w->spare;
     w->spare = g;
 }
 
 /* Unlink a pending wait */
-static void request_waitreg_unlink(struct ap_request_waitset *w, request_waitreg_t *g)
+static void request_pending_wait_unlink(struct ap_request_waitset *w,
+                                        request_pending_wait_t *g)
 {
-    request_waitreg_t **pg;
+    request_pending_wait_t **pg;
 
     for (pg = &w->waits; *pg; pg = &(*pg)->next) {
         if (*pg == g) {
@@ -993,7 +996,7 @@ static void request_waitctx_unkeep(request_waitctx_t *ctx)
  */
 static void request_waitctx_leave(request_waitctx_t *ctx)
 {
-    request_waitreg_t *g = ctx->wait;
+    request_pending_wait_t *g = ctx->wait;
     struct ap_request_waitset *w = request_waitctx_tree(ctx);
     int i, left = 0;
 
@@ -1012,8 +1015,8 @@ static void request_waitctx_leave(request_waitctx_t *ctx)
                       APLOG_TRACE5, 0, ctx->pub.r,
                       "dropping the wait for the %s: no target left",
                       request_waitctx_kind_names[ctx->kind]);
-        request_waitreg_unlink(w, g);
-        request_waitreg_put(w, g);
+        request_pending_wait_unlink(w, g);
+        request_pending_wait_put(w, g);
     }
 }
 
@@ -1356,17 +1359,17 @@ static apr_interval_time_t request_waitctx_timeout(request_waitctx_t *ctx,
     return r->server->timeout;
 }
 
-/* request_waitreg_finish() modes */
-#define REQUEST_WAITREG_DONE     0 /* completed, its continuation to be called */
-#define REQUEST_WAITREG_DROPPED  1 /* its request ended (or a subrequest) */
-#define REQUEST_WAITREG_CANCELED 2 /* ap_request_wait_cancel() */
-#define REQUEST_WAITREG_ENDING   3 /* the top-level request's pool goes */
+/* request_pending_wait_finish() modes */
+#define REQUEST_PENDING_WAIT_DONE     0 /* completed, its continuation to be called */
+#define REQUEST_PENDING_WAIT_DROPPED  1 /* its request ended (or a subrequest) */
+#define REQUEST_PENDING_WAIT_CANCELED 2 /* ap_request_wait_cancel() */
+#define REQUEST_PENDING_WAIT_ENDING   3 /* the top-level request's pool goes */
 
 /* A wait leaves its contexts: they can wait again (but released ones, whose
  * pfd is released then), their notifiers detached from the tree's notifier
  */
-static void request_waitreg_finish(request_waitreg_t *g, int mode,
-                                   ap_mpm_wait_result_e why)
+static void request_pending_wait_finish(request_pending_wait_t *g, int mode,
+                                        ap_mpm_wait_result_e why)
 {
     int i;
 
@@ -1380,7 +1383,7 @@ static void request_waitreg_finish(request_waitreg_t *g, int mode,
         g->ctxs[i] = NULL;
         ctx->wait = NULL;
         request_waitctx_detach_notifier(ctx);
-        if (mode == REQUEST_WAITREG_ENDING) {
+        if (mode == REQUEST_PENDING_WAIT_ENDING) {
             continue; /* no MPM call, no log: the request is going */
         }
         if (ctx->released) {
@@ -1389,11 +1392,11 @@ static void request_waitreg_finish(request_waitreg_t *g, int mode,
 
         name = request_waitctx_kind_names[ctx->kind];
         dir = request_waitctx_dir_name(ctx, g->directions[i]);
-        if (mode != REQUEST_WAITREG_DONE) {
+        if (mode != REQUEST_PENDING_WAIT_DONE) {
             ap_log_rerror(WAITCTX_LOG_MARK(ctx),
                           APLOG_TRACE5, 0, g->waiter,
                           "dropping the wait for the %s%s (%s)", name, dir,
-                          (mode == REQUEST_WAITREG_CANCELED) ? "canceled"
+                          (mode == REQUEST_PENDING_WAIT_CANCELED) ? "canceled"
                                                           : "request done");
             continue;
         }
@@ -1427,7 +1430,7 @@ static int request_is_or_under(const request_rec *rr, const request_rec *owner)
 static void request_waitset_drop(struct ap_request_waitset *w,
                                  request_rec *owner, unsigned int flags)
 {
-    request_waitreg_t **pg = &w->waits, *g;
+    request_pending_wait_t **pg = &w->waits, *g;
     const request_rec *delegate = NULL;
 
     if (flags & REQUEST_WAITS_KEEP_HOLDS) {
@@ -1451,16 +1454,17 @@ static void request_waitset_drop(struct ap_request_waitset *w,
             continue;
         }
         *pg = g->next;
-        request_waitreg_finish(g, (flags & REQUEST_WAITS_ENDING)
-                               ? REQUEST_WAITREG_ENDING : REQUEST_WAITREG_DROPPED,
-                               AP_MPM_WAIT_READY);
+        request_pending_wait_finish(g, (flags & REQUEST_WAITS_ENDING)
+                                       ? REQUEST_PENDING_WAIT_ENDING
+                                       : REQUEST_PENDING_WAIT_DROPPED,
+                                    AP_MPM_WAIT_READY);
         if (g->fn == request_filter_hold_continuation) {
             /* A filter's hold goes with its wait (an input filter is read
              * blocking from now on)
              */
             ap_filter_hold_done(g->baton, APR_EGENERAL);
         }
-        request_waitreg_put(w, g);
+        request_pending_wait_put(w, g);
     }
 }
 
@@ -1469,11 +1473,11 @@ static void request_waitset_drop(struct ap_request_waitset *w,
  * timer's completing with APR_SUCCESS), or the MPM failed to wait (all of
  * them complete). Sets its status, and its contexts' readiness.
  */
-static void request_waitreg_completion(struct ap_request_waitset *w,
-                                       request_waitreg_t *g,
-                                       ap_mpm_wait_result_e why,
-                                       const apr_array_header_t *pfds,
-                                       apr_time_t now)
+static void request_pending_wait_completion(struct ap_request_waitset *w,
+                                            request_pending_wait_t *g,
+                                            ap_mpm_wait_result_e why,
+                                            const apr_array_header_t *pfds,
+                                            apr_time_t now)
 {
     unsigned int ready = 0;
     int i, k;
@@ -1544,9 +1548,9 @@ static void request_waitreg_completion(struct ap_request_waitset *w,
 }
 
 /* The next completed wait to dispatch, unlinked: the first registered */
-static request_waitreg_t *request_waitset_next(struct ap_request_waitset *w)
+static request_pending_wait_t *request_waitset_next(struct ap_request_waitset *w)
 {
-    request_waitreg_t **pg, *g;
+    request_pending_wait_t **pg, *g;
 
     for (pg = &w->waits; (g = *pg) != NULL; pg = &g->next) {
         if (g->completed) {
@@ -1572,7 +1576,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     struct ap_request_waitset *w = baton;
     request_rec *r = w->r; /* the top-level request, whose run this is */
     ap_request_async_t *async = request_async_get(r);
-    request_waitreg_t *g;
+    request_pending_wait_t *g;
     apr_time_t now;
     int ended = 0;
 
@@ -1583,7 +1587,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
 
     now = apr_time_now();
     for (g = w->waits; g; g = g->next) {
-        request_waitreg_completion(w, g, why, pfds, now);
+        request_pending_wait_completion(w, g, why, pfds, now);
     }
 
     /* A continuation ends the request (r and w can't be touched
@@ -1598,8 +1602,8 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
         void *fn_baton = g->baton;
         apr_status_t rv = g->status;
 
-        request_waitreg_finish(g, REQUEST_WAITREG_DONE, why);
-        request_waitreg_put(w, g);
+        request_pending_wait_finish(g, REQUEST_PENDING_WAIT_DONE, why);
+        request_pending_wait_put(w, g);
         async->ended = &ended;
         fn(waiter, rv, fn_baton);
         if (ended) {
@@ -1670,7 +1674,7 @@ static int request_waitset_pfd(struct ap_request_waitset *w,
 static apr_status_t request_waitset_register(struct ap_request_waitset *w)
 {
     request_rec *r = w->r;
-    request_waitreg_t **pg, *g;
+    request_pending_wait_t **pg, *g;
     apr_interval_time_t timeout = -1;
     apr_time_t now = apr_time_now();
     int keep = 0, notifiers = 0, nwaits = 0, i, k;
@@ -1728,8 +1732,9 @@ static apr_status_t request_waitset_register(struct ap_request_waitset *w)
         if (!npfds && !nnotifiers && !nheld && !g->expiry) {
             /* Its descriptors were released: nothing would complete it */
             *pg = g->next;
-            request_waitreg_finish(g, REQUEST_WAITREG_DROPPED, AP_MPM_WAIT_READY);
-            request_waitreg_put(w, g);
+            request_pending_wait_finish(g, REQUEST_PENDING_WAIT_DROPPED,
+                                        AP_MPM_WAIT_READY);
+            request_pending_wait_put(w, g);
             continue;
         }
         if (left >= 0 && (timeout < 0 || left < timeout)) {
@@ -1801,14 +1806,14 @@ static apr_status_t request_waitset_register(struct ap_request_waitset *w)
     return APR_SUCCESS;
 }
 
-/* What request_waitreg_prepare() found for a new wait, beside the wait's own
- * fields
+/* What request_pending_wait_prepare() found for a new wait, beside the wait's
+ * own fields
  */
 typedef struct {
     int notifiers;                /* notifier contexts */
     int held;                     /* contexts waiting for held output */
     apr_interval_time_t delay;    /* the smallest of the pfds', if any */
-} request_waitreg_plan_t;
+} request_pending_wait_plan_t;
 
 /* Check the contexts of a new wait, and whether some are ready in their
  * connections' filters already, then build the wait: its contexts, the
@@ -1821,11 +1826,13 @@ typedef struct {
  * can't wait (released, or pending in another wait), OK if some are ready,
  * else AGAIN.
  */
-static int request_waitreg_prepare(struct ap_request_waitset *w,
-                                   request_waitreg_t *g,
-                                   ap_request_waitctx_t *const *ctxs, int nctxs,
-                                   const unsigned int *directions, int any,
-                                   request_waitreg_plan_t *plan)
+static int request_pending_wait_prepare(struct ap_request_waitset *w,
+                                        request_pending_wait_t *g,
+                                        ap_request_waitctx_t *const *ctxs,
+                                        int nctxs,
+                                        const unsigned int *directions,
+                                        int any,
+                                        request_pending_wait_plan_t *plan)
 {
     apr_interval_time_t timer_timeout = -1, due_timeout = -1;
     apr_time_t now = 0;
@@ -1863,7 +1870,7 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
         ctx->due = -1;
         if (ctx->notifier) {
             /* Attached to the tree's notifier by
-             * request_waitreg_attach_notifiers()
+             * request_pending_wait_attach_notifiers()
              */
             plan->notifiers++;
         }
@@ -1963,9 +1970,9 @@ static int request_waitreg_prepare(struct ap_request_waitset *w,
  * poll's failure (e.g. EINTR, which must not fail the request): the
  * caller's I/O goes on as usual and reports an error if any.
  */
-static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
-                                         request_waitreg_t *g,
-                                         apr_interval_time_t delay)
+static apr_status_t request_pending_wait_poll(struct ap_request_waitset *w,
+                                              request_pending_wait_t *g,
+                                              apr_interval_time_t delay)
 {
     apr_int32_t nready = 0;
     apr_status_t rv;
@@ -2008,11 +2015,12 @@ static apr_status_t request_waitreg_poll(struct ap_request_waitset *w,
 /* The new wait is pending: its contexts wait until its continuation (or
  * until it's dropped), given to the MPM at the end of the run
  */
-static void request_waitreg_commit(struct ap_request_waitset *w,
-                                   request_waitreg_t *g,
-                                   ap_request_continuation_fn *fn, void *baton)
+static void request_pending_wait_commit(struct ap_request_waitset *w,
+                                        request_pending_wait_t *g,
+                                        ap_request_continuation_fn *fn,
+                                        void *baton)
 {
-    request_waitreg_t **pg;
+    request_pending_wait_t **pg;
     int i;
 
     for (i = 0; i < g->nctxs; i++) {
@@ -2082,7 +2090,7 @@ static int request_waitctx_attach_notifier(struct ap_request_waitset *w,
 /* Detach the notifiers of a pending wait's contexts from the tree's
  * notifier, those attached
  */
-static void request_waitreg_detach_notifiers(request_waitreg_t *g)
+static void request_pending_wait_detach_notifiers(request_pending_wait_t *g)
 {
     int i;
 
@@ -2096,8 +2104,8 @@ static void request_waitreg_detach_notifiers(request_waitreg_t *g)
  * use. A notifier that served a wait already is refused unless re-armed
  * (ap_mpm_notifier_rearm()). Returns DECLINED if one can't be attached.
  */
-static int request_waitreg_attach_notifiers(struct ap_request_waitset *w,
-                                            request_waitreg_t *g)
+static int request_pending_wait_attach_notifiers(struct ap_request_waitset *w,
+                                                 request_pending_wait_t *g)
 {
     request_rec *r = w->r;
     apr_status_t rv;
@@ -2123,7 +2131,7 @@ static int request_waitreg_attach_notifiers(struct ap_request_waitset *w,
             continue;
         }
         if (request_waitctx_attach_notifier(w, ctx) != OK) {
-            request_waitreg_detach_notifiers(g);
+            request_pending_wait_detach_notifiers(g);
             return DECLINED;
         }
     }
@@ -2135,9 +2143,9 @@ static int request_waitreg_attach_notifiers(struct ap_request_waitset *w,
  * delay) to what's left of it, zero once reached (the MPM times out at
  * once).
  */
-static void request_waitreg_deadline(ap_request_async_t *async,
-                                     request_waitreg_t *g,
-                                     request_waitreg_plan_t *plan)
+static void request_pending_wait_deadline(ap_request_async_t *async,
+                                          request_pending_wait_t *g,
+                                          request_pending_wait_plan_t *plan)
 {
     apr_time_t deadline = 0;
     apr_interval_time_t left;
@@ -2186,8 +2194,8 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
     request_rec *r = ctxs[0]->r;
     ap_request_async_t *async;
     struct ap_request_waitset *w;
-    request_waitreg_plan_t plan;
-    request_waitreg_t *g;
+    request_pending_wait_plan_t plan;
+    request_pending_wait_t *g;
     int rc, polled = 0;
     apr_status_t rv;
 
@@ -2213,10 +2221,11 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
         return DECLINED;
     }
 
-    g = request_waitreg_get(w, nctxs);
-    rc = request_waitreg_prepare(w, g, ctxs, nctxs, directions, any, &plan);
+    g = request_pending_wait_get(w, nctxs);
+    rc = request_pending_wait_prepare(w, g, ctxs, nctxs, directions, any,
+                                      &plan);
     if (rc != AGAIN) {
-        request_waitreg_put(w, g);
+        request_pending_wait_put(w, g);
         return rc;
     }
     if ((internal & REQUEST_WAIT_BOUNDED) && g->timeout < 0) {
@@ -2227,16 +2236,16 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
         g->timer_expires = 0;
         g->due_expires = 0;
     }
-    request_waitreg_deadline(async, g, &plan);
+    request_pending_wait_deadline(async, g, &plan);
 
     /* Ready within the delay: no need to wait. Anything but a timeout lets
      * the caller do its I/O as usual (readiness, an error the I/O will
      * report, or the poll's own failure).
      */
     if (w->pfds->nelts && plan.delay > 0) {
-        rv = request_waitreg_poll(w, g, plan.delay);
+        rv = request_pending_wait_poll(w, g, plan.delay);
         if (!APR_STATUS_IS_TIMEUP(rv)) {
-            request_waitreg_put(w, g);
+            request_pending_wait_put(w, g);
             return OK;
         }
         /* Not ready, so drained */
@@ -2251,11 +2260,11 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
                       APLOG_DEBUG, 0, r, APLOGNO()
                       "can't wait for the %s asynchronously: nothing would "
                       "complete the wait", request_waitctx_kind_names[first->kind]);
-        request_waitreg_put(w, g);
+        request_pending_wait_put(w, g);
         return DECLINED; /* the caller waits synchronously */
     }
-    if (plan.notifiers && request_waitreg_attach_notifiers(w, g) != OK) {
-        request_waitreg_put(w, g);
+    if (plan.notifiers && request_pending_wait_attach_notifiers(w, g) != OK) {
+        request_pending_wait_put(w, g);
         return DECLINED; /* the caller waits synchronously */
     }
 
@@ -2263,7 +2272,7 @@ static int request_wait(ap_request_waitctx_t *const *ctxs, int nctxs,
      * since if the caller says so, or if the poll above found none.
      */
     g->drained = ((flags & AP_REQUEST_WAIT_DRAINED) || polled);
-    request_waitreg_commit(w, g, fn, baton);
+    request_pending_wait_commit(w, g, fn, baton);
     return SUSPENDED;
 }
 
@@ -2311,7 +2320,7 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
 {
     request_waitctx_t *ctx = (request_waitctx_t *)pub;
     struct ap_request_waitset *w = request_waitctx_tree(ctx);
-    request_waitreg_t *g = ctx->wait;
+    request_pending_wait_t *g = ctx->wait;
 
     if (!g || !w) {
         return APR_NOTFOUND;
@@ -2319,9 +2328,10 @@ AP_DECLARE(apr_status_t) ap_request_wait_cancel(ap_request_waitctx_t *pub)
     if (w->in_mpm) {
         return APR_EBUSY; /* not from the thread processing the request */
     }
-    request_waitreg_unlink(w, g);
-    request_waitreg_finish(g, REQUEST_WAITREG_CANCELED, AP_MPM_WAIT_READY);
-    request_waitreg_put(w, g);
+    request_pending_wait_unlink(w, g);
+    request_pending_wait_finish(g, REQUEST_PENDING_WAIT_CANCELED,
+                                AP_MPM_WAIT_READY);
+    request_pending_wait_put(w, g);
     return APR_SUCCESS;
 }
 
@@ -2335,7 +2345,7 @@ static int request_waitset_held_done(struct ap_request_waitset *w, conn_rec *c,
 {
     unsigned int bit = (direction == AP_WAIT_IN) ? REQUEST_WAIT_HELD_IN
                                                  : REQUEST_WAIT_HELD_OUT;
-    request_waitreg_t *g;
+    request_pending_wait_t *g;
     int i, n = 0;
 
     for (g = w->waits; g; g = g->next) {
@@ -2482,7 +2492,7 @@ static void async_request_drop_holds(request_rec *r, ap_request_async_t *async)
 {
     struct ap_request_waitset *w = async->top->waitset;
     ap_request_async_t *top = async->top;
-    request_waitreg_t **pg, *g;
+    request_pending_wait_t **pg, *g;
 
     if (top->delegate) {
         /* The work of a filter's delegated hold is abandoned: its waits
@@ -2507,9 +2517,9 @@ static void async_request_drop_holds(request_rec *r, ap_request_async_t *async)
                    == AP_FILTER_OUTPUT) {
                 *pg = g->next;
                 g->next = NULL;
-                request_waitreg_finish(g, REQUEST_WAITREG_CANCELED,
-                                       AP_MPM_WAIT_READY);
-                request_waitreg_put(w, g);
+                request_pending_wait_finish(g, REQUEST_PENDING_WAIT_CANCELED,
+                                            AP_MPM_WAIT_READY);
+                request_pending_wait_put(w, g);
                 continue;
             }
             pg = &g->next;
