@@ -655,9 +655,14 @@ AllowOverrideList CookieTracking CookieName
 
     <p>This can be used to rule out the asynchronous processing of some
     locations, e.g. those handled by a module known to misbehave once its
-    requests are suspended. Subrequests, internally redirected requests
-    and the requests of HTTP/2 streams are processed synchronously
-    anyway.</p>
+    requests are suspended. Internally redirected requests, the requests
+    of HTTP/2 streams and the subrequests run the usual way
+    (<code>ap_run_sub_req()</code>) are processed synchronously anyway. A
+    subrequest that a module runs asynchronously
+    (<code>ap_run_sub_req_async()</code>) can suspend only if its main
+    request can, and its own waits follow the
+    <directive>AsyncRequests</directive> of its location: with
+    <code>AsyncRequests Off</code> there, they block.</p>
 </usage>
 </directivesynopsis>
 
