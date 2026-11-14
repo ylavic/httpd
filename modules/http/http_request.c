@@ -27,6 +27,7 @@
 #include "apr_strings.h"
 #include "apr_file_io.h"
 #include "apr_fnmatch.h"
+#include "apr_atomic.h"
 
 #define APR_WANT_STRFUNC
 #include "apr_want.h"
@@ -478,8 +479,11 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
  * included, which run within its runs), each entered with
  * async_request_enter() and left with async_request_leave() if the request
  * suspends again, or ended with async_request_end(). A run is probed
- * (PROCESS_REQUEST ENTRY and RETURN), timed on the worker running it
- * (ExtendedStatus) and holds r->invoke_mtx.
+ * (PROCESS_REQUEST ENTRY and RETURN) and timed on the worker running it
+ * (ExtendedStatus). Two runs never overlap, since the MPM arms the wait of a
+ * run only once that run has ended: debug builds check it, each run setting
+ * the top-level request's async->running atomically, which must have been
+ * clear.
  */
 
 struct ap_request_waitset;
@@ -495,8 +499,8 @@ static void request_waitset_drop(struct ap_request_waitset *w,
 #define ASYNC_REQUEST_END_FIRST   (1u << 0) /* in the first run, which gives
                                              * the connection back to the
                                              * MPM by returning */
-#define ASYNC_REQUEST_END_NOLOCK  (1u << 1) /* not entered (r->invoke_mtx
-                                             * not held) */
+#define ASYNC_REQUEST_END_NOLOCK  (1u << 1) /* not entered (no run to
+                                             * leave) */
 #define ASYNC_REQUEST_END_ENTERED (1u << 2) /* the run entered for this end
                                              * (a module's own MPM wait's
                                              * continuation), left if it
@@ -527,15 +531,14 @@ static void async_request_enter(request_rec *r, ap_request_async_t *async)
     if (ap_extended_status) {
         ap_time_process_request(r->connection->sbh, START_PREQUEST);
     }
-#if APR_HAS_THREADS
-    if (!r->invoke_mtx) {
-        apr_thread_mutex_create(&r->invoke_mtx, APR_THREAD_MUTEX_DEFAULT,
-                                r->pool);
-    }
-    apr_thread_mutex_lock(r->invoke_mtx);
-#endif
     if (async) {
-        async->running = 1;
+        /* No other run of the request in progress (the CAS runs in every
+         * build, only the check is debug)
+         */
+        apr_uint32_t prev = apr_atomic_cas32(&async->running, 1, 0);
+
+        AP_DEBUG_ASSERT(prev == 0);
+        (void)prev;
     }
 }
 
@@ -554,7 +557,7 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
 
     if (async) {
         abandoned = (request_waitset_run_end(async) != APR_SUCCESS);
-        async->running = 0;
+        apr_atomic_set32(&async->running, 0);
         async->suspended = !async->hold_point; /* not its handlers' after */
         async->ended = NULL;
     }
@@ -571,9 +574,6 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
     else if (first && c->cs) {
         c->cs->state = CONN_STATE_SUSPENDED;
     }
-#if APR_HAS_THREADS
-    apr_thread_mutex_unlock(r->invoke_mtx);
-#endif
     /* r isn't touched from here (abandoned, it goes with the connection) */
 
     if (abandoned && !first) {
@@ -601,19 +601,13 @@ static void async_request_end_eor(request_rec *r, ap_request_async_t *async,
         async->delegate = NULL;
         async->subreqs = async->subreqs_delegated = 0;
         async->hold_point = ASYNC_HOLD_NONE;
-        async->running = 0;
+        apr_atomic_set32(&async->running, 0);
         async->suspended = 0;
         if (async->ended) {
             *async->ended = 1;
             async->ended = NULL;
         }
     }
-#if APR_HAS_THREADS
-    if (!(flags & ASYNC_REQUEST_END_NOLOCK)) {
-        apr_thread_mutex_unlock(r->invoke_mtx);
-    }
-#endif
-
     ap_process_request_after_handler(r);
     /* don't dereference r from here! */
 
@@ -1581,7 +1575,7 @@ static void request_waitset_continuation(conn_rec *c, request_rec *mpm_r,
     int ended = 0;
 
     AP_DEBUG_ASSERT(mpm_r == r);
-    AP_DEBUG_ASSERT(async != NULL && !async->running);
+    AP_DEBUG_ASSERT(async != NULL && !apr_atomic_read32(&async->running));
     async_request_enter(r, async);
     w->in_mpm = 0;
 
@@ -2751,7 +2745,7 @@ static int async_request_enter_top(ap_request_async_t *async, int *ended)
 {
     ap_request_async_t *top = async->top;
 
-    if (top->running) {
+    if (apr_atomic_read32(&top->running)) {
         return 0;
     }
     async_request_enter(top->r, top);
@@ -3025,7 +3019,7 @@ AP_DECLARE(void) ap_request_finish_suspended(request_rec *r, int status)
      * or from the continuation of a module's own MPM wait
      * (ap_mpm_register_wait())
      */
-    if (!async->running) {
+    if (!apr_atomic_read32(&async->running)) {
         async_request_enter(r, async);
         async_request_end(r, async, status, ASYNC_REQUEST_END_ENTERED);
         return;
@@ -3305,10 +3299,6 @@ static request_rec *internal_internal_redirect(const char *new_uri,
      * until some module interjects and changes the value.
      */
     new->used_path_info = AP_REQ_DEFAULT_PATH_INFO;
-
-#if APR_HAS_THREADS
-    new->invoke_mtx = r->invoke_mtx;
-#endif
 
     /*
      * XXX: hmm.  This is because mod_setenvif and mod_unique_id really need

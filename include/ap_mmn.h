@@ -899,7 +899,8 @@
  *                         for a delay with a timer wait context,
  *                         ap_request_waitctx_timer(), a connection with
  *                         ap_mpm_register_wait() and only a timeout);
- *                         AP_MPMQ_HAS_SERF is always 0 (no MPM drives serf)
+ *                         AP_MPMQ_HAS_SERF is always 0 (no MPM drives serf);
+ *                         r->invoke_mtx removed from request_rec
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */

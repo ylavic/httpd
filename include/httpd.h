@@ -1120,13 +1120,6 @@ struct request_rec {
     /** There is no local copy of this response */
     int no_local_copy;
 
-    /** Mutex protect callbacks registered with ap_mpm_register_timed_callback
-     * from being run before the original handler finishes running
-     */
-#if APR_HAS_THREADS
-    apr_thread_mutex_t *invoke_mtx;
-#endif
-
     /** A struct containing the components of URI */
     apr_uri_t parsed_uri;
     /**  finfo.protection (st_mode) set to zero if no such file */

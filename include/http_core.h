@@ -431,9 +431,10 @@ typedef struct ap_request_async_t {
      * flag of the thread running it, which can't touch the request once
      * ended); the top-level request's */
     int *ended;
-    /** A thread runs the request (its first run, or a continuation); the
+    /** A thread runs the request (its first run, or a continuation), set
+     * atomically at a run's entry (a run entered while set is a bug); the
      * top-level request's */
-    unsigned int running :1;
+    apr_uint32_t running;
     /** Its handlers suspended it (a run returned SUSPENDED), until it's
      * resumed or ends */
     unsigned int suspended :1;
