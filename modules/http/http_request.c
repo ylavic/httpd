@@ -483,7 +483,7 @@ AP_DECLARE(int) ap_request_can_suspend(request_rec *r)
  */
 
 struct ap_request_waitset;
-static void request_waitset_run_end(ap_request_async_t *top);
+static apr_status_t request_waitset_run_end(ap_request_async_t *top);
 static void request_waitset_drop(struct ap_request_waitset *w,
                                  request_rec *owner, unsigned int flags);
 
@@ -541,15 +541,19 @@ static void async_request_enter(request_rec *r, ap_request_async_t *async)
 
 /* Leave a run after which the request is suspended (its handlers returned
  * SUSPENDED, or a continuation waits again): the pending waits of its tree
- * are given to the MPM, as one wait.
+ * are given to the MPM, as one wait. If the MPM refuses them (a bug of the
+ * core or the MPM: they're dropped), the request is abandoned: its connection
+ * is closed, as the MPM closes a suspended connection whose continuation
+ * neither waits nor resumes it, r going with the connection.
  */
 static void async_request_leave(request_rec *r, ap_request_async_t *async,
                                 int first)
 {
     conn_rec *c = r->connection;
+    int abandoned = 0;
 
     if (async) {
-        request_waitset_run_end(async);
+        abandoned = (request_waitset_run_end(async) != APR_SUCCESS);
         async->running = 0;
         async->suspended = !async->hold_point; /* not its handlers' after */
         async->ended = NULL;
@@ -558,12 +562,26 @@ static void async_request_leave(request_rec *r, ap_request_async_t *async,
     if (ap_extended_status) {
         ap_time_process_request(c->sbh, STOP_PREQUEST);
     }
-    if (first && c->cs) {
+    if (abandoned) {
+        c->keepalive = AP_CONN_CLOSE;
+        if (c->cs) {
+            c->cs->state = CONN_STATE_LINGER;
+        }
+    }
+    else if (first && c->cs) {
         c->cs->state = CONN_STATE_SUSPENDED;
     }
 #if APR_HAS_THREADS
     apr_thread_mutex_unlock(r->invoke_mtx);
 #endif
+    /* r isn't touched from here (abandoned, it goes with the connection) */
+
+    if (abandoned && !first) {
+        /* From a continuation: the MPM closes the connection once it
+         * returns (the first run gives it back closing by returning)
+         */
+        ap_mpm_resume_suspended(c);
+    }
 }
 
 /* The end of the request once no filter holds output: drop the waits of
@@ -1641,11 +1659,15 @@ static int request_waitset_pfd(struct ap_request_waitset *w,
  * first MPM wait), each descriptor kept if the MPM may keep it for every
  * context on it, and drained if all the waits on it drained it (and it's
  * kept). Called at the end of a run of the tree (async_request_leave()). A
- * wait with nothing left to complete it is dropped. If the MPM refuses (e.g. a
- * module's own wait registered in this run), the waits stay pending, for the
- * next run's end.
+ * wait with nothing left to complete it is dropped. If the MPM refuses with
+ * APR_EBUSY (a module's own wait registered in this run), the waits stay
+ * pending, for the next run's end. Any other refusal, or a failure to re-arm
+ * the request's notifier, is a bug of the core or the MPM, which would leave
+ * the request suspended with nothing to complete its waits: they're all
+ * dropped (their continuations not called), and the error returned for the
+ * caller to abandon the request. Returns APR_SUCCESS otherwise.
  */
-static void request_waitset_register(struct ap_request_waitset *w)
+static apr_status_t request_waitset_register(struct ap_request_waitset *w)
 {
     request_rec *r = w->r;
     request_waitreg_t **pg, *g;
@@ -1718,7 +1740,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
         pg = &g->next;
     }
     if (!nwaits) {
-        return;
+        return APR_SUCCESS;
     }
     w->expiry = (timeout >= 0) ? now + timeout : 0;
 
@@ -1732,9 +1754,14 @@ static void request_waitset_register(struct ap_request_waitset *w)
          */
         rv = ap_mpm_notifier_rearm(w->notifier);
         if (rv != APR_SUCCESS) {
+            /* A refusal: the MPM would refuse the wait with APR_EBUSY (the
+             * notifier not re-armed), taken below for a module's own wait's
+             */
             ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
-                          "can't re-arm the request's notifier");
-            AP_DEBUG_ASSERT(0);
+                          "can't re-arm the request's notifier: abandoning "
+                          "the request");
+            request_waitset_drop(w, NULL, 0);
+            return rv;
         }
     }
     rv = ap_mpm_register_wait(r->connection, r->pool, w->pfds, timeout,
@@ -1742,16 +1769,21 @@ static void request_waitset_register(struct ap_request_waitset *w)
                               (const unsigned int *)w->pfds_flags->elts,
                               request_waitset_continuation, w);
     if (rv != APR_SUCCESS) {
+        int busy = APR_STATUS_IS_EBUSY(rv);
+
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
                       "can't wait for the %i pending wait(s) of the request "
-                      "asynchronously", nwaits);
-        /* Only a module's own MPM wait registered in this run makes the MPM
-         * refuse (APR_EBUSY), the waits then registered at the next run's
-         * end; anything else would leave the request suspended with nothing
-         * registered to complete its waits.
-         */
-        AP_DEBUG_ASSERT(APR_STATUS_IS_EBUSY(rv));
-        return;
+                      "asynchronously%s", nwaits,
+                      (busy) ? "" : ": abandoning the request");
+        if (busy) {
+            /* A module's own MPM wait registered in this run (the request's
+             * notifier is re-armed): the waits are registered at the next
+             * run's end
+             */
+            return APR_SUCCESS;
+        }
+        request_waitset_drop(w, NULL, 0);
+        return rv;
     }
     w->in_mpm = 1;
 
@@ -1766,6 +1798,7 @@ static void request_waitset_register(struct ap_request_waitset *w)
             }
         }
     }
+    return APR_SUCCESS;
 }
 
 /* What request_waitreg_prepare() found for a new wait, beside the wait's own
@@ -2600,14 +2633,17 @@ AP_CORE_DECLARE(void) ap_request_drop_holds(request_rec *r)
     }
 }
 
-/* A run of the tree leaves it suspended: its pending waits to the MPM */
-static void request_waitset_run_end(ap_request_async_t *top)
+/* A run of the tree leaves it suspended: its pending waits to the MPM.
+ * Returns the error if the MPM refused them (dropped), else APR_SUCCESS.
+ */
+static apr_status_t request_waitset_run_end(ap_request_async_t *top)
 {
     struct ap_request_waitset *w = top->waitset;
 
     if (w && w->waits && !w->in_mpm) {
-        request_waitset_register(w);
+        return request_waitset_register(w);
     }
+    return APR_SUCCESS;
 }
 
 void ap_process_async_request(request_rec *r)
