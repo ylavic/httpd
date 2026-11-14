@@ -36,18 +36,18 @@ typedef struct {
     int on;
     int preservehost;
     apr_uri_t url;
-} serf_config_t;
+} modserf_dir_config_t;
 
 typedef struct {
   const char *name;
   const char *provider;
   apr_table_t *params;
-} serf_cluster_t;
+} modserf_cluster_t;
 
 typedef struct {
-  /* name -> serf_cluster_t* */
+  /* name -> modserf_cluster_t* */
   apr_hash_t *clusters;
-} serf_server_config_t;
+} modserf_server_config_t;
 
 typedef struct {
     int rstatus;
@@ -57,7 +57,7 @@ typedef struct {
     request_rec *r;
     apr_pool_t *serf_pool;
     apr_bucket_brigade *tmpbb;
-    serf_config_t *conf;
+    modserf_dir_config_t *conf;
     serf_ssl_context_t *ssl_ctx;
     serf_bucket_alloc_t *bkt_alloc;
     serf_bucket_t *body_bkt;
@@ -400,7 +400,7 @@ static apr_status_t setup_request(serf_request_t *request,
 }
 
 /* TODO: rewrite drive_serf to make it async */
-static int drive_serf(request_rec *r, serf_config_t *conf)
+static int drive_serf(request_rec *r, modserf_dir_config_t *conf)
 {
     apr_status_t rv = 0;
     apr_pool_t *pool;
@@ -409,8 +409,8 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
     /* XXXXX: make persistent/per-process or something.*/
     serf_context_t *serfme;
     serf_connection_t *conn;
-    serf_server_config_t *ctx =
-        (serf_server_config_t *)ap_get_module_config(r->server->module_config,
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *)ap_get_module_config(r->server->module_config,
                                                      &serf_module);
 
     /* Allocate everything out of a subpool, with a shorter lifetime than
@@ -422,7 +422,7 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
     if (strcmp(conf->url.scheme, "cluster") == 0) {
         int rc;
         ap_serf_cluster_provider_t *cp;
-        serf_cluster_t *cluster;
+        modserf_cluster_t *cluster;
         apr_array_header_t *servers = NULL;
         apr_uint32_t pick = 0;
         ap_serf_server_t *choice;
@@ -594,7 +594,7 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
 
 static int serf_handler(request_rec *r)
 {
-    serf_config_t *conf = ap_get_module_config(r->per_dir_config,
+    modserf_dir_config_t *conf = ap_get_module_config(r->per_dir_config,
                                                &serf_module);
 
     if (conf->on == 0) {
@@ -619,7 +619,7 @@ static const char *add_pass(cmd_parms *cmd, void *vconf,
 {
     int i;
     apr_status_t rv;
-    serf_config_t *conf = (serf_config_t *) vconf;
+    modserf_dir_config_t *conf = (modserf_dir_config_t *) vconf;
 
     if (argc < 1) {
         return "SerfPass must have at least a URI.";
@@ -668,9 +668,9 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
     const char *rv;
     ap_serf_cluster_provider_t *backend;
     int i;
-    serf_cluster_t *cluster = NULL;
-    serf_server_config_t *ctx =
-        (serf_server_config_t *)ap_get_module_config(cmd->server->module_config,
+    modserf_cluster_t *cluster = NULL;
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *)ap_get_module_config(cmd->server->module_config,
                                                      &serf_module);
 
     const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
@@ -683,7 +683,7 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
         return "SerfCluster must have at least a name and provider.";
     }
 
-    cluster = apr_palloc(cmd->pool, sizeof(serf_cluster_t));
+    cluster = apr_palloc(cmd->pool, sizeof(modserf_cluster_t));
     cluster->name = apr_pstrdup(cmd->pool, argv[0]);
     cluster->provider = apr_pstrdup(cmd->pool, argv[1]);
     cluster->params = apr_table_make(cmd->pool, 6);
@@ -730,7 +730,7 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
 
 static void *create_dir_config(apr_pool_t *p, char *dummy)
 {
-    serf_config_t *new = (serf_config_t *) apr_pcalloc(p, sizeof(serf_config_t));
+    modserf_dir_config_t *new = (modserf_dir_config_t *) apr_pcalloc(p, sizeof(modserf_dir_config_t));
     new->on = 0;
     new->preservehost = 1;
     return new;
@@ -738,8 +738,8 @@ static void *create_dir_config(apr_pool_t *p, char *dummy)
 
 static void *create_server_config(apr_pool_t *p, server_rec *s)
 {
-    serf_server_config_t *ctx =
-        (serf_server_config_t *) apr_pcalloc(p, sizeof(serf_server_config_t));
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *) apr_pcalloc(p, sizeof(modserf_server_config_t));
 
     ctx->clusters = apr_hash_make(p);
 
@@ -748,9 +748,9 @@ static void *create_server_config(apr_pool_t *p, server_rec *s)
 
 static void * merge_server_config(apr_pool_t *p, void *basev, void *overridesv)
 {
-    serf_server_config_t *ctx = apr_pcalloc(p, sizeof(serf_server_config_t));
-    serf_server_config_t *base = (serf_server_config_t *) basev;
-    serf_server_config_t *overrides = (serf_server_config_t *) overridesv;
+    modserf_server_config_t *ctx = apr_pcalloc(p, sizeof(modserf_server_config_t));
+    modserf_server_config_t *base = (modserf_server_config_t *) basev;
+    modserf_server_config_t *overrides = (modserf_server_config_t *) overridesv;
 
     ctx->clusters = apr_hash_overlay(p, base->clusters, overrides->clusters);
     return ctx;
