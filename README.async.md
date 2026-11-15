@@ -136,10 +136,8 @@ request wait is still on the stack.
   thread that will notify.
 - **The worker running the request** (an MPM worker; for an HTTP/2 stream, one of mod_http2's) runs
   it alone: consecutive runs through the core's waits never overlap, since the MPM arms a wait only
-  once the run has ended. It also holds the request's invoke mutex (`r->invoke_mtx`) for the length
-  of the run, which holds back a timed callback (`ap_mpm_register_timed_callback()`) that locks it
-  until the run that registered it has ended. Code outside a run, such as a module's own thread,
-  doesn't touch the request; it only notifies.
+  once the run has ended, and debug builds assert it. Code outside a run, such as a module's own
+  thread, doesn't touch the request; it only notifies.
 
 ### 2.3 Completion and resumption
 
@@ -263,6 +261,8 @@ Use this layer for connection-level code, or when the core's request layer doesn
   `ap_mpm_notifier_rearm()`, `ap_mpm_notifier_attach()` / `ap_mpm_notifier_detach()` (parents), and
   `ap_mpm_notifier_notified()` to see which attached ones fired.
 - **Timeouts:** `ap_mpm_register_timeouts()` at post-config, with the configured values only.
+- **A delay alone:** the MPM has no timed callbacks. A request waits on a timer wait context
+  ([4.2](#42-wait-contexts)), connection-level code registers a wait with only a timeout.
 
 Rules:
 
