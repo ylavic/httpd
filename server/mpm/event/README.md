@@ -60,9 +60,9 @@ Queues:
   per state: I/O wait, write completion, keep-alive, shutdown, lingering close, and the backlog.
 - **timer**: an entry of the timers' skiplist, sorted by expiry, for timeouts that no queue holds (a
   value that varies per connection, a wait's undeclared timeout).
-- **workers' queue** (`worker_queue`): what waits for a worker: connections and timers, in **lanes**
-  by class (new connections, keep-alive, I/O wait, write completion, lingering close, continuations,
-  timers), popped by weighted round-robin.
+- **workers' queue** (`worker_queue`): what waits for a worker: connections and continuations, in
+  **lanes** by class (new connections, keep-alive, I/O wait, write completion, lingering close,
+  continuations), popped by weighted round-robin.
 - **backlog**: everything in the workers' queue. Its connections are also in a timeout queue of
   their own (`backlog_q`), so that they are counted and the lingering ones time out.
 
@@ -537,7 +537,7 @@ second is only a backstop against a lost wakeup.
 ### 6.3 The workers' queue
 
 The workers' queue has a lane per class of work, popped by weighted round-robin: the work in
-progress first (timers, continuations, write completion, lingering close: weight 4), then the
+progress first (continuations, write completion, lingering close: weight 4), then the
 connections that were waiting for the client (I/O wait, keep-alive: 2), then the new connections
 (1). Every lane keeps a share, so nothing starves, and under load the new connections are the ones
 that wait, which is what the admission measures.
@@ -641,7 +641,7 @@ spreads the connections only roughly evenly. The fair share ([section
 
 At trace2, the listener logs two lines every second while the child has connections:
 
-- the child's line: idlers, connections by state, timers, suspended connections, workers live out of
+- the child's line: idlers, connections by state, suspended connections, workers live out of
   the most, grown and retired in the period;
 - the backlog's line: for each class of the workers' queue, how many waited and for how long
   (average, p50 and p99 bounds, maximum), the connections dropped from the backlog and closed by the
@@ -668,8 +668,9 @@ or too many idle threads), after `MaxConnectionsPerChild`, or on a failure it ca
   keep-alive connections stay until their `KeepAliveTimeout`, so that their clients don't have to
   reconnect for a request already on its way; lingering closes last 2 seconds at most;
 - while there are more live workers than connections, the workers exit one by one;
-- the listener exits once there are no connections and no timers left, then the queue is terminated,
-  the last workers exit, the main thread joins them and the child exits.
+- the listener exits once there are no connections left (a wait's timer belongs to a connection),
+  then the queue is terminated, the last workers exit, the main thread joins them and the child
+  exits.
 
 The parent bounds a graceful stop of the server with `GracefulShutdownTimeout`, after which it stops
 the children immediately.
