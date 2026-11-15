@@ -40,7 +40,7 @@ Threads and their roles:
 - **listener**: the child's thread that polls the listening sockets and the wakeups of its pollset
   (`event_pollset`), and runs the timers and timeout queues. Without worker polling it polls the
   connections too.
-- **worker**: a thread that runs connections, timer callbacks and continuations. A worker is either
+- **worker**: a thread that runs connections and continuations. A worker is either
   busy or **idle** (waiting for work); the count of idle workers is the **idlers**.
 - **poller**: an idle worker that polls the connections' pollset (`conn_pollset`) itself. At most
   `AsyncWorkerPollers` of them poll at once; the other idle workers <a id="park"></a>**park** on the
@@ -59,7 +59,7 @@ Queues:
   tail, so it stays sorted by expiry and only its head needs looking at. The connections' queues are
   per state: I/O wait, write completion, keep-alive, shutdown, lingering close, and the backlog.
 - **timer**: an entry of the timers' skiplist, sorted by expiry, for timeouts that no queue holds (a
-  value that varies per connection, a wait's undeclared timeout, a module's timed callback).
+  value that varies per connection, a wait's undeclared timeout).
 - **workers' queue** (`worker_queue`): what waits for a worker: connections and timers, in **lanes**
   by class (new connections, keep-alive, I/O wait, write completion, lingering close, continuations,
   timers), popped by weighted round-robin.
@@ -337,9 +337,9 @@ lowers.
 
 A timeout that no queue holds uses a timer in the skiplist instead: a connection whose `Timeout` was
 changed for this connection (mod_reqtimeout), a wait whose timeout wasn't declared ([section
-5.4](#54-timeouts-of-the-waits)), a module's timed callback (`ap_mpm_register_timed_callback()`). A
-timer is recorded by its owner before it's inserted, since the listener may pop it at once if the
-owner is preempted. A timer that isn't needed anymore is removed and recycled at once.
+5.4](#54-timeouts-of-the-waits)). A timer is recorded by its owner before it's inserted, since the
+listener may pop it at once if the owner is preempted. A timer that isn't needed anymore is removed
+and recycled at once.
 
 ## 5. Waits
 
@@ -403,8 +403,8 @@ worker busy writing meanwhile. When the continuation returns:
   straight back to a worker since a socket is writable most of the time;
 - it did neither: the connection is abandoned, logged as an error, and closed.
 
-`ap_mpm_resume_suspended()` called outside a continuation (e.g. by a module that gives the
-connection back from a timed callback) queues the connection for write completion at once.
+`ap_mpm_resume_suspended()` called outside a continuation queues the connection for write
+completion at once.
 
 Leaving the SUSPENDED state releases the connection's kept descriptors: the request is done, and the
 connection's own socket is the MPM's again.
