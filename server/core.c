@@ -5037,7 +5037,7 @@ AP_INIT_TAKE1("ProtocolsHonorOrder", set_protocols_honor_order, NULL, RSRC_CONF,
               "'off' (default) or 'on' to respect given order of protocols, "
               "by default the client specified order determines selection"),
 AP_INIT_TAKE1("AsyncFilter", set_async_filter, NULL, RSRC_CONF,
-              "'network', 'connection' (default) or 'request' to limit the "
+              "'network', 'connection' or 'request' (default) to limit the "
               "types of filters that support asynchronous handling"),
 AP_INIT_FLAG("MergeSlashes", set_core_server_flag, 
              (void *)APR_OFFSETOF(core_server_config, merge_slashes),  
