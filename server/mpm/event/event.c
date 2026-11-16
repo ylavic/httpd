@@ -290,13 +290,13 @@ static int auto_settings = 0;               /* MaxRequestWorkers auto: settings
                                                derived from max_client_conns and
                                                num_cpus */
 static int max_client_conns = 0;            /* The client connections to hold
-                                               (auto), derived if 0 */
+                                               (MaxClientConnections), derived
+                                               if 0 */
 static int clients_per_child = 0;           /* The client connections a
-                                               child's descriptors can hold
-                                               (auto) */
+                                               child's descriptors can hold */
 static apr_uint32_t clients_share = 0;      /* The client connections a
-                                               child accepts at most (auto),
-                                               0 for no limit */
+                                               child accepts at most, 0 for
+                                               no limit */
 /* The settings set explicitly, that auto doesn't derive */
 #define AUTO_SET_SERVER_LIMIT   (1u << 0)
 #define AUTO_SET_THREAD_LIMIT   (1u << 1)
@@ -1794,8 +1794,8 @@ static int fair_share_above(int stopped)
     return conns > ((stopped) ? avg : avg + fair_share_slack);
 }
 
-/* The connections a child holds at most: its share of MaxClientConnections
- * (auto), 0 for no limit.
+/* The connections a child holds at most: its share of MaxClientConnections,
+ * 0 for no limit.
  */
 static apr_uint32_t connections_limit;
 
@@ -9035,6 +9035,44 @@ static int event_listen_buckets(server_rec *s, int prev)
     return n;
 }
 
+/* The client connections a child's descriptors can hold: the soft limit of
+ * open files less a reserve for logs, modules and listeners, at
+ * AUTO_FDS_PER_CLIENT descriptors per client, at least 1. The soft and hard
+ * limits are returned too (AUTO_FDS_MAX if unlimited or unknown), if wanted.
+ * Called with the listeners set up (num_listensocks).
+ */
+static apr_int64_t descriptors_per_child(apr_int64_t *soft_limit,
+                                         apr_int64_t *hard_limit)
+{
+    apr_int64_t fds = AUTO_FDS_MAX, hard = AUTO_FDS_MAX, per_child;
+
+#if APR_HAVE_STRUCT_RLIMIT && defined(RLIMIT_NOFILE)
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < AUTO_FDS_MAX) {
+                fds = (apr_int64_t)rl.rlim_cur;
+            }
+            if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < AUTO_FDS_MAX) {
+                hard = (apr_int64_t)rl.rlim_max;
+            }
+        }
+    }
+#endif
+    per_child = (fds - (AUTO_FDS_RESERVE + (apr_int64_t)num_listensocks))
+                / AUTO_FDS_PER_CLIENT;
+    if (per_child < 1) {
+        per_child = 1;
+    }
+    if (soft_limit) {
+        *soft_limit = fds;
+    }
+    if (hard_limit) {
+        *hard_limit = hard;
+    }
+    return per_child;
+}
+
 /* MaxRequestWorkers auto: derive the settings not set explicitly from the
  * client connections to hold (max_client_conns, or what the descriptors limit
  * allows) and the CPUs: ThreadsPerChild (AUTO_THREADS_PER_CHILD), the
@@ -9050,7 +9088,7 @@ static void auto_settings_derive(server_rec *s, int startup)
     server_rec *ls = (startup) ? NULL : s;
     int ratio = ap_get_listen_buckets_ratio();
     int tpc, children, min_children, cpu_buckets = 1;
-    apr_int64_t fds = AUTO_FDS_MAX, hard = AUTO_FDS_MAX, reserve, per_child, n;
+    apr_int64_t fds, hard, per_child, n;
     int clients_set = (max_client_conns > 0);
 
     tpc = threads_per_child;
@@ -9079,24 +9117,7 @@ static void auto_settings_derive(server_rec *s, int startup)
         }
     }
 
-#if APR_HAVE_STRUCT_RLIMIT && defined(RLIMIT_NOFILE)
-    {
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-            if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < AUTO_FDS_MAX) {
-                fds = (apr_int64_t)rl.rlim_cur;
-            }
-            if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < AUTO_FDS_MAX) {
-                hard = (apr_int64_t)rl.rlim_max;
-            }
-        }
-    }
-#endif
-    reserve = AUTO_FDS_RESERVE + (apr_int64_t)num_listensocks;
-    per_child = (fds - reserve) / AUTO_FDS_PER_CLIENT;
-    if (per_child < 1) {
-        per_child = 1;
-    }
+    per_child = descriptors_per_child(&fds, &hard);
 
     /* The fewest children: enough for their threads to cover the CPUs */
     min_children = (num_cpus + tpc - 1) / tpc;
@@ -9349,12 +9370,36 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
         active_daemons_limit = retained->first_server_sb_limit;
     }
 
+    /* What a child queues for its workers at most (AP_MPMQ_MAX_CONNECTIONS
+     * adds it to the threads)
+     */
+    workers_backlog_limit = threads_per_child * admission_backlog;
+
     /* A child's share of MaxClientConnections, with a 10% slack since the
      * kernel spreads the new connections only roughly evenly (when a child
      * stops accepting, the others take them).
      */
     clients_share = 0;
-    if (auto_settings && max_client_conns > 0) {
+    if (!auto_settings) {
+        clients_per_child = (int)descriptors_per_child(NULL, NULL);
+    }
+    if (!auto_settings && max_client_conns <= 0) {
+        /* Not set with a fixed MaxRequestWorkers: the child's threads and
+         * their backlog, which is AP_MPMQ_MAX_CONNECTIONS (the threads are
+         * fixed), so a connections pool sized by it (mod_proxy's) holds
+         * a connection per request in flight; no slack needed. The
+         * descriptors' limit bounds it.
+         */
+        int limit = threads_max + workers_backlog_limit;
+
+        if (limit > clients_per_child) {
+            limit = clients_per_child;
+        }
+        clients_share = (apr_uint32_t)limit;
+        max_client_conns = (limit < INT_MAX / 2 / active_daemons_limit)
+                           ? limit * active_daemons_limit : INT_MAX / 2;
+    }
+    else if (max_client_conns > 0) {
         clients_share = ((apr_uint32_t)max_client_conns + active_daemons_limit - 1)
                         / active_daemons_limit;
         clients_share += (clients_share + 9) / 10;
@@ -9423,8 +9468,6 @@ static int event_open_logs(apr_pool_t * p, apr_pool_t * plog,
             max_spare_threads = max_workers;
         }
     }
-
-    workers_backlog_limit = threads_per_child * admission_backlog;
 
     /* For the PODs of the next restart (see above) */
     retained->gen_daemons_limit = active_daemons_limit;
@@ -9743,19 +9786,6 @@ static int event_check_config(apr_pool_t *p, apr_pool_t *plog,
             }
         }
         return OK; /* => event_open_logs() */
-    }
-
-    if (max_client_conns > 0) {
-        if (startup) {
-            ap_log_error(APLOG_MARK, APLOG_WARNING | APLOG_STARTUP, 0, NULL, APLOGNO()
-                         "WARNING: MaxClientConnections has no effect without "
-                         "MaxRequestWorkers auto, ignored.");
-        } else {
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s, APLOGNO()
-                         "MaxClientConnections has no effect without "
-                         "MaxRequestWorkers auto, ignored");
-        }
-        max_client_conns = 0;
     }
 
     /* No auto settings; use the default for anything not set (or set to
