@@ -278,7 +278,7 @@ static apr_status_t handle_response(serf_request_t *request,
     rv = serf_bucket_response_status(response, &sl);
     if (rv) {
         if (APR_STATUS_IS_EAGAIN(rv)) {
-            return APR_SUCCESS;
+            return rv;
         }
 
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, ctx->r, APLOGNO(01121) "serf_bucket_response_status...");
@@ -342,7 +342,7 @@ static apr_status_t handle_response(serf_request_t *request,
 
         /* XXXX: Should we send a flush now? */
         if (APR_STATUS_IS_EAGAIN(rv)) {
-            return APR_SUCCESS;
+            return rv;
         }
 
     } while (1);
