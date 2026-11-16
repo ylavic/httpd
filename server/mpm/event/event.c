@@ -560,10 +560,10 @@ struct event_conn_state_t {
     struct user_wait *user_wait;
     /** a wait (ap_mpm_register_wait()) to arm once no thread runs the
      *  connection anymore */
-    struct user_wait *pending_wait;
+    struct user_wait *registered_wait;
     /** the connection's wait (cs->p), reused by all its waits so that a
      *  fired event's pfd/pt/wait stay valid as long as the connection;
-     *  user_wait/pending_wait point to it */
+     *  user_wait/registered_wait point to it */
     struct user_wait *wait;
     /** the continuation to run (continuation.fn set), once its wait fired */
     struct user_continuation continuation;
@@ -2214,7 +2214,7 @@ static apr_status_t decrement_connection_count(void *cs_)
     return APR_SUCCESS;
 }
 
-static void arm_pending_wait(event_conn_state_t *cs);
+static void arm_registered_wait(event_conn_state_t *cs);
 static void notifier_wait_done(ap_mpm_notifier_t *notifier);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 
@@ -2233,8 +2233,8 @@ static void enter_suspended(event_conn_state_t *cs)
     /* A wait registered by the handler (ap_mpm_register_wait()) is armed
      * now that the MPM has the connection.
      */
-    if (cs->pending_wait) {
-        arm_pending_wait(cs);
+    if (cs->registered_wait) {
+        arm_registered_wait(cs);
     }
 }
 
@@ -2909,7 +2909,7 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
         processed = 1;
         cs->pub.state = CONN_STATE_PROCESSING;
         rc = ap_run_process_connection(c);
-        if (cs->pending_wait && cs->pub.state != CONN_STATE_SUSPENDED) {
+        if (cs->registered_wait && cs->pub.state != CONN_STATE_SUSPENDED) {
             /* The handler registered a wait but didn't suspend in the end */
             {
                 static log_ratelimit_t rl;
@@ -2919,12 +2919,12 @@ static void process_socket(apr_thread_t *thd, apr_pool_t *p,
                                   "suspended");
                 }
             }
-            if (cs->pending_wait->notifier) {
+            if (cs->registered_wait->notifier) {
                 /* Its notifier can be re-armed */
-                notifier_wait_done(cs->pending_wait->notifier);
-                cs->pending_wait->notifier = NULL;
+                notifier_wait_done(cs->registered_wait->notifier);
+                cs->registered_wait->notifier = NULL;
             }
-            cs->pending_wait = NULL;
+            cs->registered_wait = NULL;
         }
         /*
          * The process_connection hooks should set the appropriate connection
@@ -3105,7 +3105,7 @@ static struct user_wait *make_user_wait(event_conn_state_t *cs,
                                         ap_mpm_notifier_t *notifier);
 static apr_status_t arm_user_wait(event_conn_state_t *cs,
                                   struct user_wait *user_wait);
-static void arm_pending_wait(event_conn_state_t *cs);
+static void arm_registered_wait(event_conn_state_t *cs);
 static int run_user_continuation(event_conn_state_t *cs, int in_place);
 static int claim_user_wait(struct user_wait *user_wait);
 static void claimed_user_wait_timer(struct user_wait *user_wait);
@@ -4181,7 +4181,7 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     if (!cs) {
         return APR_ENOTIMPL; /* not a connection of this MPM */
     }
-    if (cs->pending_wait || (cs->suspended && !cs->in_continuation)) {
+    if (cs->registered_wait || (cs->suspended && !cs->in_continuation)) {
         /* One wait at a time, and not from another thread */
         return APR_EBUSY;
     }
@@ -4207,13 +4207,13 @@ static apr_status_t event_register_wait(conn_rec *c, apr_pool_t *p,
     }
     user_wait->continuation.fn = fn;
     user_wait->continuation.baton = baton;
-    cs->pending_wait = user_wait;
+    cs->registered_wait = user_wait;
     return APR_SUCCESS;
 }
 
 /* Release a descriptor kept for whichever connection
  * (ap_mpm_release_pfd(), ap_mpm_release_pfds()), from the thread running
- * it, no wait pending nor armed.
+ * it, no wait registered nor armed.
  */
 static apr_status_t event_release_pfd(const apr_pollfd_t *pfd)
 {
@@ -4226,7 +4226,7 @@ static apr_status_t event_release_pfd(const apr_pollfd_t *pfd)
         return APR_SUCCESS; /* not kept */
     }
     cs = kept->cs;
-    if (cs->pending_wait || cs->user_wait) {
+    if (cs->registered_wait || cs->user_wait) {
         return APR_EBUSY;
     }
     i = kept_index(cs, kept);
@@ -4234,15 +4234,15 @@ static apr_status_t event_release_pfd(const apr_pollfd_t *pfd)
     return (i >= 0) ? release_kept_pfd(cs, i) : APR_SUCCESS;
 }
 
-/* Arm the pending wait of a connection, or run its continuation with
+/* Arm the registered wait of a connection, or run its continuation with
  * AP_MPM_WAIT_ERROR if that fails.
  */
-static void arm_pending_wait(event_conn_state_t *cs)
+static void arm_registered_wait(event_conn_state_t *cs)
 {
-    struct user_wait *user_wait = cs->pending_wait;
+    struct user_wait *user_wait = cs->registered_wait;
     apr_status_t rc;
 
-    cs->pending_wait = NULL;
+    cs->registered_wait = NULL;
     rc = arm_user_wait(cs, user_wait);
     if (rc == APR_SUCCESS) {
         return;
@@ -4341,9 +4341,9 @@ static int run_user_continuation(event_conn_state_t *cs, int in_place)
     continuation.fn(cs->c, cs->r, continuation.why, continuation.pfds, continuation.baton);
     cs->in_continuation = 0;
 
-    if (cs->pending_wait) {
+    if (cs->registered_wait) {
         cs->continuation_pending = 0;
-        arm_pending_wait(cs);
+        arm_registered_wait(cs);
     }
     else {
         if (!cs->continuation_pending) {
