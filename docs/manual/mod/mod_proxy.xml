@@ -1115,7 +1115,17 @@ ProxyPass "/example" "http://backend.example.com" max=20 ttl=120 retry=300
     backend server. The default for this limit is the number of threads
     per process in the active MPM. In the Prefork MPM, this is always 1;
     while with other MPMs, it is controlled by the
-    <directive>ThreadsPerChild</directive> directive.</td></tr>
+    <directive>ThreadsPerChild</directive> directive. With an MPM that can
+    wait for its connections (<module>event</module>), the default is
+    instead the connections a process runs or queues at once, when larger
+    than its threads: with <module>event</module> the threads plus
+    <directive module="mpm_common">ThreadsPerChild</directive> x
+    <directive module="event">AsyncAdmissionBacklogPerThread</directive>
+    (425 with 25 threads and the default backlog). A backend connection is
+    then kept for each request in flight, which the threads no longer
+    bound, but <directive module="event">MaxClientConnections</directive>
+    does. A backend that limits its connections needs an explicit
+    <code>max</code>.</td></tr>
     <tr><td>smax</td>
         <td>max</td>
         <td>Retained connection pool entries above this limit are freed
