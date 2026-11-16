@@ -2331,8 +2331,8 @@ static void flush_limbo(void);
 /* Take a connection's socket back from the slot where the worker processing
  * it published it, before the socket is closed and its pool (holding it)
  * recycled: zero if close_worker_sockets() took it, on an ungraceful stop,
- * the socket and its pool then to be left alone (the child is exiting, pchild
- * frees the pool). A socket not published (e.g. a connection closed by the
+ * the socket and its pool then to be left alone (the child is exiting: the
+ * pool goes with the process). A socket not published (e.g. a connection closed by the
  * listener) is taken back unless the child stops ungracefully.
  */
 static int take_back_worker_socket(apr_socket_t *csd)
