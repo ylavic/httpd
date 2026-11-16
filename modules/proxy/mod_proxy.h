@@ -178,11 +178,6 @@ typedef struct {
     long maxfwd;
     apr_interval_time_t timeout;
     enum {
-      bad_error,
-      bad_ignore,
-      bad_body
-    } badopt;                   /* how to deal with bad headers */
-    enum {
         status_off,
         status_on,
         status_full
@@ -198,7 +193,6 @@ typedef struct {
     unsigned int io_buffer_size_set:1;
     unsigned int maxfwd_set:1;
     unsigned int timeout_set:1;
-    unsigned int badopt_set:1;
     unsigned int proxy_status_set:1;
     unsigned int source_address_set:1;
     unsigned int bgrowth_set:1;
@@ -258,18 +252,35 @@ typedef struct {
     apr_interval_time_t async_idle_timeout;
     unsigned int async_delay_set:1;
     unsigned int async_idle_timeout_set:1;
+
+    /* The backends' HTTP/1 heads (ProxyHttpProtocolOptions,
+     * ProxyLimitResponse*), see ap_proxy_h1_head_opts()
+     */
+    apr_size_t limit_response_line;
+    apr_size_t limit_response_fieldsize;
+    unsigned int limit_response_fields;
+    unsigned int http_unsafe:1;
+    unsigned int http_unsafe_set:1;
+    unsigned int limit_response_line_set:1;
+    unsigned int limit_response_fieldsize_set:1;
+    unsigned int limit_response_fields_set:1;
 } proxy_dir_conf;
 
 /* if we interpolate env vars per-request, we'll need a per-request
  * copy of the reverse proxy config
  */
+struct proxy_req_async; /* opaque, mod_proxy's own */
+
 typedef struct {
     apr_array_header_t *raliases;
     apr_array_header_t* cookie_paths;
     apr_array_header_t* cookie_domains;
+    /* The states of the request's asynchronous processing */
+    struct proxy_req_async *async;
 } proxy_req_conf;
 
 struct proxy_address; /* opaque TTL'ed and refcount'ed address */
+struct proxy_backend_wait; /* opaque, a request's wait context (proxy_util) */
 
 typedef struct {
     conn_rec     *connection;
@@ -299,12 +310,29 @@ typedef struct {
     apr_pool_t   *uds_pool;     /* Subpool for reusing UDS paths */
     apr_pool_t   *fwd_pool;     /* Subpool for reusing ProxyRemote infos */
     struct proxy_address *address; /* Current remote address */
+    /* The wait context of the request that waited for the connection
+     * (ap_proxy_wait()), released with the connection */
+    struct proxy_backend_wait *backend_wait;
+    /* The asynchronous state of the request holding the connection, from
+     * ap_proxy_hold_connection() to the release */
+    struct proxy_req_async *holder;
 } proxy_conn_rec;
 
 typedef struct {
         float cache_completion; /* completion percentage */
         int content_length; /* length of the content */
 } proxy_completion;
+
+/* A waiter for a connection of an exhausted pool (opaque), see
+ * ap_proxy_conn_pool_waiter_make() and ap_proxy_acquire_connection_ex()
+ */
+typedef struct ap_proxy_conn_pool_waiter ap_proxy_conn_pool_waiter;
+
+/* Called once a connection is released for a waiter, from the releasing
+ * thread and with the pool's lock held: it must not block nor use the pool,
+ * it only tells the waiter to acquire again (e.g. with ap_mpm_notify()).
+ */
+typedef void ap_proxy_conn_pool_waiter_fn(void *baton);
 
 /* Connection pool */
 struct proxy_conn_pool {
@@ -313,6 +341,8 @@ struct proxy_conn_pool {
     apr_reslist_t  *res;      /* Connection resource list */
     proxy_conn_rec *conn;     /* Single connection for prefork mpm */
     apr_pool_t     *dns_pool; /* The pool used for worker scoped DNS resolutions */
+    struct proxy_conn_pool_waiters *pool_waiters; /* (opaque) waiting for a
+                                                   * connection */
 };
 
 #define AP_VOLATILIZE_T(T, x) (*(T volatile *)&(x))
@@ -475,7 +505,8 @@ typedef struct {
     apr_size_t      io_buffer_size;
     apr_size_t      elected;    /* Number of times the worker was elected */
     apr_size_t      busy;       /* busyness factor */
-    apr_size_t      response_field_size; /* Size of proxy response buffer in bytes. */
+    apr_size_t      response_field_size; /* limitresponsefieldsize= (or
+                                          * responsefieldsize=) */
     apr_port_t      port;
     apr_off_t       transferred;/* Number of bytes transferred to remote */
     apr_off_t       read;       /* Number of bytes read from remote */
@@ -500,6 +531,12 @@ typedef struct {
     apr_int32_t      address_ttl;    /* backend address' TTL (seconds) */
     apr_uint32_t     address_expiry; /* backend address' next expiry time */
     int              sock_proto;     /* The protocol to use to create the socket */
+    apr_size_t       limit_response_line;   /* limitresponseline= */
+    unsigned int     limit_response_fields; /* limitresponsefields= */
+    unsigned int     http_unsafe:1;         /* httpprotocoloptions=unsafe */
+    unsigned int     http_unsafe_set:1;
+    unsigned int     limit_response_line_set:1;
+    unsigned int     limit_response_fields_set:1;
 } proxy_worker_shared;
 
 #define ALIGNED_PROXY_WORKER_SHARED_SIZE (APR_ALIGN_DEFAULT(sizeof(proxy_worker_shared)))
@@ -684,7 +721,8 @@ PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, detach_backend,
  * and corresponding balancer.
  * The url is rewritten from balancer://cluster/uri to scheme://host:port/uri
  * and then the scheme_handler is called.
- *
+ * It may return SUSPENDED (e.g. waiting for a usable worker), see
+ * ap_proxy_handler_resume().
  */
 APR_DECLARE_EXTERNAL_HOOK(proxy, PROXY, int, pre_request,
                           (proxy_worker **worker, proxy_balancer **balancer,
@@ -732,6 +770,30 @@ PROXY_DECLARE(int) ap_proxy_checkproxyblock(request_rec *r, proxy_server_conf *c
 
 
 PROXY_DECLARE(int) ap_proxy_pre_http_request(conn_rec *c, request_rec *r);
+
+/**
+ * Initialize the options of an HTTP/1 head parser for a backend's response
+ * head or trailers (ap_h1_head_parse()): ProxyHttpProtocolOptions and
+ * ProxyLimitResponse* of r's directory, each overridden by the worker's key
+ * if set, else the client side's defaults (Strict, 8190, 8190, 100); errors
+ * logged under module_index.
+ * @param opts         the options to initialize
+ * @param r            the client's request
+ * @param worker       the worker of the backend
+ * @param kind         AP_H1_HEAD_RESPONSE or AP_H1_HEAD_TRAILERS
+ * @param module_index the module logging the errors: the module calling the
+ *                     ap_proxy_h1_head_opts() macro (APLOG_MODULE_INDEX), or
+ *                     the index given by code acting for another module
+ */
+PROXY_DECLARE(void) ap_proxy_h1_head_opts_(ap_h1_head_opts_t *opts,
+                                           request_rec *r,
+                                           proxy_worker *worker,
+                                           ap_h1_head_kind_e kind,
+                                           int module_index);
+
+/** ap_proxy_h1_head_opts_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_proxy_h1_head_opts(opts, r, worker, kind) \
+    ap_proxy_h1_head_opts_(opts, r, worker, kind, APLOG_MODULE_INDEX)
 /* DEPRECATED (will be replaced with ap_proxy_connect_backend */
 PROXY_DECLARE(int) ap_proxy_connect_to_backend(apr_socket_t **, const char *, apr_sockaddr_t *, const char *, proxy_server_conf *, request_rec *);
 /* DEPRECATED (will be replaced with ap_proxy_check_connection */
@@ -1049,7 +1111,8 @@ PROXY_DECLARE(int) ap_proxy_fixup_uds_filename(request_rec *r);
  * @param r        current request
  * @param conf     current proxy server configuration
  * @param url      request url that balancer can rewrite.
- * @return         OK or  HTTP_XXX error
+ * @return         OK, SUSPENDED (a hook waits asynchronously), or HTTP_XXX
+ *                 error
  * @note It calls balancer pre_request hook if the url starts with balancer://
  * The balancer then rewrites the url to particular worker, like http://host:port
  */
@@ -1072,6 +1135,52 @@ PROXY_DECLARE(int) ap_proxy_post_request(proxy_worker *worker,
                                          proxy_balancer *balancer,
                                          request_rec *r,
                                          proxy_server_conf *conf);
+
+/**
+ * Resume mod_proxy's handler after a scheme handler suspended the request
+ * @param r        current request
+ * @param status   the status the scheme handler would have returned
+ * @return         the status to finish the request with, or SUSPENDED if the
+ *                 request was suspended again (e.g. failing over to another
+ *                 balancer member whose scheme handler suspended it too)
+ * @note A scheme handler that returned SUSPENDED calls this once done, as
+ * proxy_handler() would have continued: marking the worker in error and
+ * failing over to another balancer member on recoverable errors, then
+ * running the post_request hooks. It returns the status as is when the
+ * request was not suspended by proxy_handler().
+ * @note A pre_request hook that returned SUSPENDED calls it (or rather
+ * ap_proxy_handler_done()) once done waiting: with OK proxy_handler() runs
+ * the pre_request hooks again, otherwise status is taken as theirs.
+ */
+PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status);
+
+/**
+ * Whether a request can be suspended to wait asynchronously
+ * (ap_proxy_wait()): unless ProxyAsyncDelay is -1, when the core can suspend
+ * it (ap_request_can_suspend(): the MPM can wait, AsyncRequests is not Off,
+ * and it's neither a subrequest run by ap_run_sub_req() nor an internally
+ * redirected request, whose caller goes on once the handler returns, nor an
+ * HTTP/2 stream's; a subrequest run by ap_run_sub_req_async() can be).
+ * @param r  the request
+ * @return   non-zero if it can
+ */
+PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r);
+
+/**
+ * Finish a request that a scheme handler suspended (returned SUSPENDED for),
+ * once done with it: let mod_proxy's handler continue as if the handler had
+ * returned status (ap_proxy_handler_resume()), then unless suspended again
+ * resume the handler chain as if proxy_handler() had returned that status
+ * (ap_request_resume_suspended(): with DECLINED the next handlers run,
+ * otherwise the request ends and its connection goes back to the MPM, or
+ * for a subrequest run by ap_run_sub_req_async() its caller's done function
+ * goes on with its main request).
+ * @param r       the request
+ * @param status  the scheme handler's status
+ * @remark Call it once per suspension, from the continuation of the
+ * request's last wait. Don't dereference r afterwards.
+ */
+PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status);
 
 /* Bitmask for ap_proxy_determine_address() */
 #define PROXY_DETERMINE_ADDRESS_CHECK   (1u << 0)
@@ -1151,6 +1260,98 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
                                                proxy_worker *worker,
                                                server_rec *s);
 /**
+ * Create a waiter for a connection of an exhausted pool, to be given to
+ * ap_proxy_acquire_connection_ex() (and reused for the next acquires).
+ * @param p       pool to allocate the waiter from
+ * @param fn      called once a connection is released for the waiter
+ * @param baton   the baton passed to fn
+ * @return        the waiter
+ */
+PROXY_DECLARE(ap_proxy_conn_pool_waiter *) ap_proxy_conn_pool_waiter_make(apr_pool_t *p,
+                                                                          ap_proxy_conn_pool_waiter_fn *fn,
+                                                                          void *baton);
+/**
+ * Acquire a connection from the worker's connection pool. When a waiter is
+ * given, don't block if the connection limit has been reached.
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn    acquired connection
+ * @param worker  worker used for obtaining connection
+ * @param s       current server record
+ * @param waiter  NULL to block as ap_proxy_acquire_connection() does,
+ *                otherwise queued if the connection limit has been reached
+ * @return        OK, SUSPENDED if the waiter is queued (its fn is called
+ *                once a connection is released, and the caller then
+ *                retries), or HTTP_XXX error
+ */
+PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
+                                                  proxy_conn_rec **conn,
+                                                  proxy_worker *worker,
+                                                  server_rec *s,
+                                                  ap_proxy_conn_pool_waiter *waiter);
+/**
+ * Remove a waiter from the queue of a worker connection pool, if queued, or
+ * pass the released connection on to the next waiter if it was notified
+ * already (giving up instead of acquiring it).
+ * @param worker  worker used for obtaining connection
+ * @param waiter  the waiter given to ap_proxy_acquire_connection_ex()
+ */
+PROXY_DECLARE(void) ap_proxy_cancel_conn_pool_waiter(proxy_worker *worker,
+                                                     ap_proxy_conn_pool_waiter *waiter);
+
+/* A scheme handler (the scheme_handler hook's signature) */
+typedef int ap_proxy_scheme_handler_fn(request_rec *r, proxy_worker *worker,
+                                       proxy_server_conf *conf, char *url,
+                                       const char *proxyname,
+                                       apr_port_t proxyport);
+
+/**
+ * Acquire a connection from the worker's connection pool for a scheme
+ * handler, without blocking on an exhausted pool when possible: the request
+ * then waits in the MPM for a connection to be released (or the worker's
+ * acquire= timeout, else the server's Timeout), and the scheme handler runs
+ * again with the same arguments, to acquire from the start.
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn      acquired connection
+ * @param r         the request
+ * @param handler   the scheme handler to run again (called with r and the
+ *                  next arguments), whose status finishes the request
+ *                  (ap_proxy_handler_done()) unless SUSPENDED
+ * @param worker    worker used for obtaining connection
+ * @param conf      the handler's conf
+ * @param url       the handler's url (unchanged by the handler before)
+ * @param proxyname the handler's proxyname
+ * @param proxyport the handler's proxyport
+ * @return          OK, SUSPENDED if waiting asynchronously (the scheme
+ *                  handler returns SUSPENDED), or HTTP_XXX error; it blocks
+ *                  as ap_proxy_acquire_connection() does when the request
+ *                  can't be suspended (ProxyAsyncDelay -1, the MPM can't
+ *                  wait, a subrequest or an HTTP/2 stream)
+ * @remark A timeout finishes the request with HTTP_SERVICE_UNAVAILABLE.
+ */
+PROXY_DECLARE(int) ap_proxy_acquire_connection_async(const char *proxy_function,
+                                                     proxy_conn_rec **conn,
+                                                     request_rec *r,
+                                                     ap_proxy_scheme_handler_fn *handler,
+                                                     proxy_worker *worker,
+                                                     proxy_server_conf *conf,
+                                                     char *url,
+                                                     const char *proxyname,
+                                                     apr_port_t proxyport);
+/**
+ * Make the request the holder of a connection it acquired, whose end is the
+ * release of the connection (ap_proxy_release_connection()). Done by
+ * ap_proxy_acquire_connection_async() already, for the users of the blocking
+ * ap_proxy_acquire_connection() running (or suspended) in a request.
+ * @param r       the request using the connection
+ * @param conn    acquired connection
+ * @note If the pool of the request goes while it still holds the connection
+ *       (e.g. the request is suspended when its connection is killed, or the
+ *       child exits), the connection is closed and released to the worker.
+ */
+PROXY_DECLARE(void) ap_proxy_hold_connection(request_rec *r,
+                                             proxy_conn_rec *conn);
+
+/**
  * Release a connection back to worker connection pool
  * @param proxy_function calling proxy scheme (http, ajp, ...)
  * @param conn    acquired connection
@@ -1197,6 +1398,51 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                                             proxy_conn_rec *conn,
                                             proxy_worker *worker,
                                             server_rec *s);
+
+/* The state of a connection to the backend in progress, see
+ * ap_proxy_connect_backend_ex()
+ */
+typedef struct {
+    apr_socket_t *sock;          /* The connecting socket, to poll for events */
+    apr_int16_t events;          /* What to poll sock for: APR_POLLOUT while
+                                  * connecting, either direction during a
+                                  * CONNECT exchange with a forward proxy */
+    apr_interval_time_t timeout; /* The timeout for the poll */
+    apr_status_t status;         /* Set by the caller to fail the attempt
+                                  * (e.g. APR_TIMEUP), else APR_SUCCESS */
+    apr_sockaddr_t *addr;        /* (opaque) the address being connected */
+    int did_dns_lookup;          /* (opaque) */
+    void *exchange;              /* (opaque) the CONNECT exchange with a
+                                  * forward proxy, in progress */
+} ap_proxy_connect_state;
+
+/**
+ * Make a connection to the backend, possibly without blocking
+ * @param proxy_function calling proxy scheme (http, ajp, ...)
+ * @param conn    acquired connection
+ * @param worker  connection worker
+ * @param s       current server record
+ * @param state   NULL to block as ap_proxy_connect_backend() does; otherwise
+ *                zeroed for a new connection, or as left by a call that
+ *                returned SUSPENDED, to continue the connect once
+ *                state->sock is ready for state->events (or, after
+ *                state->timeout, with state->status set to APR_TIMEUP)
+ * @return        OK, SUSPENDED if the connect is in progress, or DECLINED
+ * @note Through a forward proxy (HTTP CONNECT), the connect is in progress
+ * until the proxy's reply to the CONNECT is read. The connect still blocks
+ * for Unix Domain Sockets. A caller giving up on a SUSPENDED connect must
+ * call ap_proxy_connect_backend_cancel().
+ */
+PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
+                                               proxy_conn_rec *conn,
+                                               proxy_worker *worker,
+                                               server_rec *s,
+                                               ap_proxy_connect_state *state);
+/**
+ * Abort a connect to the backend in progress (after SUSPENDED)
+ * @param state   as returned by ap_proxy_connect_backend_ex()
+ */
+PROXY_DECLARE(void) ap_proxy_connect_backend_cancel(ap_proxy_connect_state *state);
 
 /**
  * Make a connection to a Unix Domain Socket (UDS) path
@@ -1389,6 +1635,37 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
                                         apr_off_t *bytes_spooled,
                                         apr_off_t max_mem_spool);
 
+/* The state of a request body being spooled, see ap_proxy_spool_input_ex() */
+typedef struct {
+    apr_bucket_brigade *body_brigade;   /* (opaque) spooled in memory */
+    apr_file_t *tmpfile;                /* (opaque) spooled on disk */
+    apr_off_t fsize;                    /* (opaque) size on disk */
+    apr_off_t bytes_spooled;            /* (opaque) size overall */
+} ap_proxy_spool_state;
+
+/**
+ * Spool the client request body to memory, or to disk above the given limit,
+ * possibly without blocking.
+ * @param r             client request
+ * @param backend       backend connection
+ * @param input_brigade input brigade to use/fill
+ * @param bytes_spooled number of bytes spooled
+ * @param max_mem_spool maximum number of in-memory bytes
+ * @param block         APR_BLOCK_READ or APR_NONBLOCK_READ
+ * @param state         zeroed to start spooling, or as left by a previous
+ *                      call that returned SUSPENDED
+ * @return              OK, SUSPENDED for APR_NONBLOCK_READ when the client
+ *                      has nothing to read yet (the caller calls again once
+ *                      it's readable), or HTTP_* error code
+ */
+PROXY_DECLARE(int) ap_proxy_spool_input_ex(request_rec *r,
+                                           proxy_conn_rec *backend,
+                                           apr_bucket_brigade *input_brigade,
+                                           apr_off_t *bytes_spooled,
+                                           apr_off_t max_mem_spool,
+                                           apr_read_type_e block,
+                                           ap_proxy_spool_state *state);
+
 /**
  * Read what's in the client pipe. If the read would block (EAGAIN),
  * pass a FLUSH bucket to the backend and read again in blocking mode.
@@ -1417,6 +1694,74 @@ PROXY_DECLARE(int) ap_proxy_pass_brigade(apr_bucket_alloc_t *bucket_alloc,
                                          conn_rec *origin, apr_bucket_brigade *bb,
                                          int flush);
 
+/** The direction of a wait or transfer (client or backend, in or out) */
+typedef enum {
+    AP_PROXY_CLIENT_IN,   /**< from the client (e.g. the request body) */
+    AP_PROXY_CLIENT_OUT,  /**< to the client (e.g. the response) */
+    AP_PROXY_BACKEND_IN,  /**< from the backend (e.g. the response) */
+    AP_PROXY_BACKEND_OUT  /**< to the backend (e.g. the request) */
+} ap_proxy_direction_e;
+
+/**
+ * The continuation of a wait of ap_proxy_wait(), called from a thread
+ * processing the request: the core's (ap_request_continuation_fn), with
+ * status APR_SUCCESS if the socket is ready, APR_TIMEUP if the wait timed
+ * out, or APR_EGENERAL if the MPM failed to wait, and the baton given to
+ * ap_proxy_wait().
+ */
+typedef ap_request_continuation_fn ap_proxy_wait_continuation_fn;
+
+/**
+ * Flag for ap_proxy_wait(): the caller's last read or write in the direction
+ * of the wait failed with EAGAIN since its last wait in this direction
+ * (AP_REQUEST_WAIT_DRAINED), which spares the MPM a check of a socket kept
+ * registered across the waits.
+ */
+#define AP_PROXY_WAIT_DRAINED (1u << 0)
+
+/**
+ * Wait for the client or a backend connection to be ready in a direction
+ * (e.g. the backend readable for its response once the request is sent)
+ * without holding the thread when possible, with the core's request waits
+ * (ap_request_wait()): unless the connection's filters are ready already
+ * (for the client, or the backend of the schemes reading and writing
+ * through filters: input pending, ap_check_input_pending(); no output
+ * pending, ap_check_output_pending()), poll the socket synchronously for up
+ * to ProxyAsyncDelay if not 0, then let the MPM wait.
+ * @param r          the request
+ * @param conn       the backend connection (for AP_PROXY_BACKEND_*)
+ * @param direction  what to wait for: AP_PROXY_CLIENT_IN (the client's
+ *                   socket readable), AP_PROXY_CLIENT_OUT (writable),
+ *                   AP_PROXY_BACKEND_IN or AP_PROXY_BACKEND_OUT (the
+ *                   backend's)
+ * @param flags      AP_PROXY_WAIT_DRAINED, or 0
+ * @param timeout    how long to wait (e.g. the connection's socket timeout)
+ * @param fn         called once the asynchronous wait is over
+ * @param baton      for fn
+ * @return           SUSPENDED if waiting asynchronously (the caller returns
+ *                   SUSPENDED, fn is called later and eventually
+ *                   ap_proxy_handler_done()), OK if ready now (or with an
+ *                   error the next I/O will report): the caller goes on, or
+ *                   DECLINED if the request can't wait asynchronously
+ *                   (ap_proxy_request_can_suspend(), or the MPM refusing
+ *                   the wait): the caller goes on blocking.
+ *                   fn is called only after SUSPENDED.
+ * @remark The backend connection's pfd stays registered in the MPM between
+ * the waits of a request: the first wait adds it, the next ones keep it
+ * (AP_MPM_WAIT_KEEP_PFDS), and mod_proxy releases it with the connection.
+ * The client connection's likewise, until the request is done.
+ * @remark Input that the filters keep after the caller's last read
+ * returned EAGAIN (e.g. mod_ssl's part of a line) is pending for
+ * ap_check_input_pending() but not readable: such a wait answers OK once,
+ * then polls the socket.
+ */
+PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
+                                 ap_proxy_direction_e direction,
+                                 unsigned int flags,
+                                 apr_interval_time_t timeout,
+                                 ap_proxy_wait_continuation_fn *fn,
+                                 void *baton);
+
 struct proxy_tunnel_conn; /* opaque */
 typedef struct proxy_tunnel_conn proxy_tunnel_conn_t;
 typedef struct {
@@ -1433,7 +1778,8 @@ typedef struct {
 } proxy_tunnel_rec;
 
 /**
- * Create a tunnel, to be activated by ap_proxy_tunnel_run().
+ * Create a tunnel, to be activated by ap_proxy_tunnel_run() (or driven by
+ * ap_proxy_tunnel_step()).
  * @param tunnel   tunnel created
  * @param r        client request
  * @param c_o      connection to origin
@@ -1452,6 +1798,58 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **tunnel,
  *                or another HTTP_ error otherwise.
  */
 PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel);
+
+/**
+ * Forward what can be forwarded from either side of the tunnel to the other
+ * without blocking nor polling, for tunneling driven by the caller's polling
+ * (e.g. the MPM's, ap_mpm_register_wait()): the tunnel's pfds (tunnel->pfds)
+ * then have the events to wait for in their reqevents.
+ * @param tunnel  tunnel to step
+ * @param ready   the tunnel's pfds as polled, with their rtnevents set, or
+ *                NULL to try what each side waits for (e.g. the first step)
+ * @return        SUSPENDED to wait for the pfds' reqevents, OK if completion
+ *                is full, or an HTTP_ error otherwise.
+ * @remark Input already held by the connections' input filters is forwarded
+ *         before returning SUSPENDED (no polling would report it).
+ */
+PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
+                                        const apr_array_header_t *ready);
+
+/**
+ * The callback of ap_proxy_tunnel_run_ex() once the asynchronous tunnel
+ * is over, called by the MPM's thread waking it up.
+ * @param tunnel  the tunnel
+ * @param status  OK if completion is full, HTTP_GATEWAY_TIME_OUT if idle for
+ *                longer than the timeout, HTTP_INTERNAL_SERVER_ERROR if the
+ *                MPM failed to wait, or another HTTP_ error
+ * @param baton   the baton given to ap_proxy_tunnel_run_ex()
+ */
+typedef void (ap_proxy_tunnel_done_fn)(proxy_tunnel_rec *tunnel, int status,
+                                       void *baton);
+
+/**
+ * Run the tunnel, asynchronously if possible: forward what's ready
+ * (ap_proxy_tunnel_step()), then let the MPM wait for either side
+ * (ap_mpm_register_wait()), and so on until it's over, without holding a
+ * thread meanwhile. Otherwise (no done callback, the MPM can't wait, the
+ * request is a subrequest, or the tunnel is for an HTTP/2 stream's
+ * connection) the whole tunneling happens now, as with ap_proxy_tunnel_run().
+ * @param tunnel   tunnel to run
+ * @param timeout  the time the tunnel can stay idle, i.e. both of its
+ *                 directions, each on its own clock (negative for none)
+ * @param done     called once an asynchronous tunnel is over, or NULL to
+ *                 run the tunnel synchronously
+ * @param baton    for done
+ * @return         SUSPENDED if the tunnel continues asynchronously (the
+ *                 request handler returns SUSPENDED, done is called later),
+ *                 or the tunnel's status as ap_proxy_tunnel_run()'s (done is
+ *                 not called).
+ * @remark The status of a timeout (HTTP_GATEWAY_TIME_OUT) is not logged.
+ */
+PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
+                                          apr_interval_time_t timeout,
+                                          ap_proxy_tunnel_done_fn *done,
+                                          void *baton);
 
 /*
  * Number of incoming bytes on the tunnel connection.
@@ -1474,17 +1872,129 @@ PROXY_DECLARE(apr_off_t) ap_proxy_tunnel_conn_bytes_out(
  * the origin. Each hook receives incoming buckets in bb and produces outgoing
  * buckets in the same bb, much like an output filter.
  * @param tunnel   the tunnel
- * @param c        the connection the data are going to
+ * @param c_i      the connection the data come from
+ * @param c_o      the connection the data are going to
  * @param bb       the incoming data
  * @return         OK/DECLINED to pass to the next hooks, DONE to not pass to
- *                 the next hooks, an HTTP_ error on failure.
- * @note A hook must not return DONE unless it consumes/sets-aside *all* the
- *       incoming buckets, and it must produce (non-meta-)data buckets only.
+ *                 the next hooks, SUSPENDED once the hook holds the
+ *                 direction (ap_proxy_tunnel_hold()), an HTTP_ error on
+ *                 failure.
+ * @note A hook must not return DONE nor SUSPENDED unless it
+ *       consumes/sets-aside *all* the incoming buckets, and it must produce
+ *       (non-meta-)data buckets only.
+ * @note When a hold is over the hooks are called again for its direction
+ *       with an empty bb (the holder producing what it held, if anything):
+ *       a hook not holding passes an empty bb through.
+ * @note Data a hook sends on its own (e.g. a protocol's closing frames
+ *       passed to c_i's or c_o's output filters) end with a WC bucket, not
+ *       a FLUSH one: a FLUSH blocks the thread until written.
  */
 PROXY_DECLARE_OPTIONAL_HOOK(proxy, PROXY, int, tunnel_forward,
                             (proxy_tunnel_rec *tunnel,
                              conn_rec *c_i, conn_rec *c_o,
                              apr_bucket_brigade *bb))
+
+/** Flag for ap_proxy_tunnel_hold(): pause the other direction too */
+#define AP_PROXY_TUNNEL_HOLD_BOTH (1u << 0)
+/** Flag for ap_proxy_tunnel_hold(): the hold is delegated to the
+ *  asynchronous work the hook starts next (ap_request_hold_delegate()),
+ *  released when that work ends */
+#define AP_PROXY_TUNNEL_HOLD_DELEGATED (1u << 1)
+
+/**
+ * Hold a direction of an asynchronous tunnel (ap_proxy_tunnel_run_ex())
+ * from a tunnel_forward hook, until the wait of a context completes (e.g.
+ * a service checking what the hook was passed, a notifier of another
+ * thread), without holding a thread meanwhile: the hook keeps what it holds
+ * (set aside in its own pool), returns SUSPENDED with bb empty, and is
+ * called again for that direction when the wait completes, with an empty
+ * bb, producing what it held (or holding again). The tunnel reads no more
+ * from c_i meanwhile, but keeps writing what was forwarded already, and
+ * the other direction keeps flowing unless AP_PROXY_TUNNEL_HOLD_BOTH.
+ * @param tunnel     the tunnel
+ * @param c_i        the connection the direction's data come from (the
+ *                   hook's c_i)
+ * @param ctx        the context whose wait releases the hold, of the
+ *                   tunnel's request (ap_request_waitctx_*()), not the
+ *                   client's (the tunnel's own); NULL with
+ *                   AP_PROXY_TUNNEL_HOLD_DELEGATED
+ * @param direction  AP_WAIT_IN or AP_WAIT_OUT for a connection or a
+ *                   descriptor, ignored by a timer or a notifier
+ * @param flags      AP_PROXY_TUNNEL_HOLD_BOTH and/or
+ *                   AP_PROXY_TUNNEL_HOLD_DELEGATED, or 0
+ * @return APR_SUCCESS: held, the hook returns SUSPENDED (a delegated hold:
+ *         once its work suspended); APR_EAGAIN: ctx is ready already (not
+ *         held, go on); APR_ENOTIMPL: the tunnel runs synchronously (no
+ *         done callback, the request can't suspend, or the tunnel fell back
+ *         to synchronous) or the wait is refused: the hook does its work
+ *         blocking; APR_EBUSY: the direction is held already (or another
+ *         delegated hold awaits its work); APR_EINVAL: not from a
+ *         tunnel_forward hook of c_i's direction, a context of another
+ *         request, no context without AP_PROXY_TUNNEL_HOLD_DELEGATED or one
+ *         with it.
+ * @remark The hold's outcome, when the hook is called again:
+ *         ap_proxy_tunnel_hold_status().
+ * @remark Every hold is bounded: a context giving no timeout (e.g. a
+ *         notifier's) gets the tunnel's idle timeout (the server's Timeout
+ *         if the tunnel has none) for the hold's wait, the hook called
+ *         again with APR_TIMEUP when it's reached.
+ * @remark Each direction has its own idle clock: a held direction's (and
+ *         the other one's with AP_PROXY_TUNNEL_HOLD_BOTH) is stopped while
+ *         held, and restarts at the hold's end; the other direction's
+ *         restarts at the hold's start and runs as usual, so the tunnel
+ *         ends idle once the directions not held are idle for the idle
+ *         timeout (e.g. the other direction staying quiet for that long
+ *         during a long hold), never while both are held. A direction over
+ *         (its input's EOF read) doesn't end the tunnel idle while the
+ *         other one is held: the hold's bound applies then.
+ * @remark The tunnel ending meanwhile (an error, a side closing with
+ *         nohalfclose, its done callback called) cancels the hold's wait:
+ *         the hook isn't called again, its context and what it holds are
+ *         its own to release (e.g. with its pool).
+ * @remark If the asynchronous tunnel falls back to synchronous meanwhile,
+ *         the hook is called again with APR_ENOTIMPL (its hold's wait
+ *         canceled): it finishes its work blocking.
+ * @remark A delegated hold (AP_PROXY_TUNNEL_HOLD_DELEGATED) has no wait of
+ *         its own: the hook starts the asynchronous work right after, in
+ *         the same call (e.g. ap_run_sub_req_async() for a service checking
+ *         what it holds); if that work suspends the hook returns SUSPENDED,
+ *         the work's own completion function records its outcome (it starts
+ *         no other work), then the hook is called again as above; if the
+ *         work ends at once the hold is undone and the hook goes on in its
+ *         call (e.g. with the subrequest's status). A hook returning
+ *         SUSPENDED without starting the work ends the tunnel (logged). The
+ *         other direction keeps flowing meanwhile, unless
+ *         AP_PROXY_TUNNEL_HOLD_BOTH.
+ * @remark A delegated hold is bounded by its work's own timeout (e.g.
+ *         ap_run_sub_req_async()'s), or if it has none by the tunnel's idle
+ *         timeout (the server's Timeout if the tunnel has none), which the
+ *         tunnel gives its holder (ap_request_holder_t's timeout): past it
+ *         the work ends as its timeout says (e.g. a subrequest's done
+ *         function gets HTTP_GATEWAY_TIME_OUT), then the hook is called
+ *         again as above, the tunnel going on.
+ * @remark Synchronous tunnels refuse delegated holds (APR_ENOTIMPL), and an
+ *         asynchronous tunnel can't fall back to synchronous while a
+ *         delegated hold's work runs: it ends then (logged).
+ */
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
+                                                 conn_rec *c_i,
+                                                 ap_request_waitctx_t *ctx,
+                                                 unsigned int direction,
+                                                 unsigned int flags);
+
+/**
+ * The outcome of a tunnel direction's last hold (ap_proxy_tunnel_hold()),
+ * for its tunnel_forward hook called again.
+ * @param tunnel  the tunnel
+ * @param c_i     the connection the direction's data come from
+ * @return APR_SUCCESS: the hold's wait completed (ready) or none was held;
+ *         APR_TIMEUP: its timeout was reached; APR_ENOTIMPL: the tunnel
+ *         runs synchronously from now on (finish blocking); APR_EGENERAL:
+ *         the MPM failed to wait (the tunnel ends); APR_EINVAL: c_i is
+ *         neither side of the tunnel.
+ */
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold_status(const proxy_tunnel_rec *tunnel,
+                                                        const conn_rec *c_i);
 
 /**
  * Clear the headers referenced by the Connection header from the given

@@ -166,8 +166,8 @@ AP_IMPLEMENT_HOOK_VOID(child_init,
                        (apr_pool_t *pchild, server_rec *s),
                        (pchild, s))
 
-AP_IMPLEMENT_HOOK_RUN_FIRST(int, handler, (request_rec *r),
-                            (r), DECLINED)
+AP_IMPLEMENT_HOOK_RUN_FIRST_FROM(int, handler, (request_rec *r), (r),
+                                 (request_rec *r, int *pos), pos, DECLINED)
 
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, quick_handler, (request_rec *r, int lookup),
                             (r, lookup), DECLINED)
@@ -386,13 +386,49 @@ static int invoke_filter_init(request_rec *r, ap_filter_t *filters)
     return OK;
 }
 
+/* The end of the handler chain run by ap_invoke_handler(), or continued by
+ * ap_invoke_handler_resume(): restore r->handler, check the result
+ */
+static int invoke_handler_epilogue(request_rec *r, const char *old_handler,
+                                   int result)
+{
+    const char *ignore;
+
+    r->handler = old_handler;
+
+    if (result == DECLINED && r->handler && r->filename) {
+        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(00523)
+            "handler \"%s\" not found for: %s", r->handler, r->filename);
+    }
+    if ((result != OK) && (result != DONE) && (result != DECLINED) && (result != SUSPENDED)
+        && (result != AP_FILTER_ERROR) /* ap_die() knows about this specifically */
+        && !ap_is_HTTP_VALID_RESPONSE(result)) {
+        /* If a module is deliberately returning something else
+         * (request_rec in non-HTTP or proprietary extension?)
+         * let it set a note to allow it explicitly.
+         * Otherwise, a return code that is neither reserved nor HTTP
+         * is a bug, as in PR#31759.
+         */
+        ignore = apr_table_get(r->notes, "HTTP_IGNORE_RANGE");
+        if (!ignore) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(00524)
+                          "Handler for %s returned invalid result code %d",
+                          r->handler, result);
+            result = HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+
+    return result == DECLINED ? HTTP_INTERNAL_SERVER_ERROR : result;
+}
+
 AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
 {
     const char *handler;
     const char *p;
-    int result;
+    int result, pos;
     const char *old_handler = r->handler;
-    const char *ignore;
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = (req_cfg) ? req_cfg->async : NULL;
 
     /*
      * The new insert_filter stage makes the most sense here.  We only use
@@ -440,33 +476,62 @@ AP_CORE_DECLARE(int) ap_invoke_handler(request_rec *r)
         r->handler = handler;
     }
 
-    result = ap_run_handler(r);
-
-    r->handler = old_handler;
-
-    if (result == DECLINED && r->handler && r->filename) {
-        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(00523)
-            "handler \"%s\" not found for: %s", r->handler, r->filename);
+    /* The handlers of a top-level request can suspend it, until they return
+     * anything but SUSPENDED (ap_request_can_suspend())
+     */
+    if (async) {
+        async->phase = AP_REQUEST_PHASE_HANDLER;
     }
-    if ((result != OK) && (result != DONE) && (result != DECLINED) && (result != SUSPENDED)
-        && (result != AP_FILTER_ERROR) /* ap_die() knows about this specifically */
-        && !ap_is_HTTP_VALID_RESPONSE(result)) {
-        /* If a module is deliberately returning something else
-         * (request_rec in non-HTTP or proprietary extension?)
-         * let it set a note to allow it explicitly.
-         * Otherwise, a return code that is neither reserved nor HTTP
-         * is a bug, as in PR#31759.
-         */
-        ignore = apr_table_get(r->notes, "HTTP_IGNORE_RANGE");
-        if (!ignore) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(00524)
-                          "Handler for %s returned invalid result code %d",
-                          r->handler, result);
-            result = HTTP_INTERNAL_SERVER_ERROR;
+
+    pos = 0;
+    result = ap_run_handler_from(r, &pos);
+
+    if (async) {
+        if (result == SUSPENDED) {
+            /* Where the chain suspended, to continue it later */
+            async->handler_pos = pos;
+            async->handler = r->handler;
+            async->old_handler = old_handler;
+        }
+        else {
+            async->phase = AP_REQUEST_PHASE_NONE;
         }
     }
 
-    return result == DECLINED ? HTTP_INTERNAL_SERVER_ERROR : result;
+    return invoke_handler_epilogue(r, old_handler, result);
+}
+
+AP_CORE_DECLARE(int) ap_invoke_handler_resume(request_rec *r, int status)
+{
+    core_request_config *req_cfg = ap_get_core_module_config(r->request_config);
+    ap_request_async_t *async = (req_cfg) ? req_cfg->async : NULL;
+    const char *old_handler;
+    int pos;
+
+    if (!async || !async->handler) {
+        /* No handler chain suspended to continue: the handlers are done */
+        return invoke_handler_epilogue(r, r->handler, status);
+    }
+    old_handler = async->old_handler;
+
+    if (status == DECLINED) {
+        /* The next handlers, after the one that suspended the chain, with
+         * the handler chosen for it
+         */
+        r->handler = async->handler;
+        async->phase = AP_REQUEST_PHASE_HANDLER;
+        pos = async->handler_pos + 1;
+        status = ap_run_handler_from(r, &pos);
+        if (status == SUSPENDED) {
+            async->handler_pos = pos;
+        }
+    }
+    if (status != SUSPENDED) {
+        async->phase = AP_REQUEST_PHASE_NONE;
+        async->handler = NULL;
+    }
+
+    return invoke_handler_epilogue(r, old_handler, status);
 }
 
 AP_DECLARE(int) ap_method_is_limited(cmd_parms *cmd, const char *method)

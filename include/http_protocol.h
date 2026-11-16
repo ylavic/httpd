@@ -54,18 +54,29 @@ AP_DECLARE_DATA extern ap_filter_rec_t *ap_old_write_func;
  */
 
 /**
- * Read an empty request and set reasonable defaults.
+ * Create an empty request and set reasonable defaults.
  * @param c The current connection
  * @return The new request_rec
  */
 AP_DECLARE(request_rec *) ap_create_request(conn_rec *c);
 
 /**
- * Read a request and fill in the fields.
+ * Read the request line and header fields.
  * @param c The current connection
  * @return The new request_rec
  */
 AP_DECLARE(request_rec *) ap_read_request(conn_rec *c);
+
+/**
+ * Read the request line and header fields, possibly non-blocking.
+ * @param r      The request read
+ * @param c      The connection to read from
+ * @param block  How the read should be performed
+ *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
+ * @return APR_SUCCESS, APR_EAGAIN or APR_EGENERAL
+ */
+AP_DECLARE(apr_status_t) ap_read_request_ex(request_rec **r, conn_rec *c,
+                                            apr_read_type_e block);
 
 /**
  * Assign the method, uri and protocol (in HTTP/1.x the
@@ -107,6 +118,153 @@ AP_DECLARE(int) ap_parse_request_line(request_rec *r);
  */
 AP_DECLARE(int) ap_check_request_header(request_rec *r);
 
+/** What an HTTP/1 head parser parses */
+typedef enum {
+    AP_H1_HEAD_REQUEST = 0, /**< A request-line, then a header section */
+    AP_H1_HEAD_RESPONSE,    /**< A status-line, then a header section */
+    AP_H1_HEAD_HEADERS,     /**< A header section without start line */
+    AP_H1_HEAD_TRAILERS     /**< A trailer section (chunked trailers) */
+} ap_h1_head_kind_e;
+
+/** RFC 9112's rules: CRLF line ends, token field names, field-content
+ * values, and the request-line's whitespace rules of HttpProtocolOptions
+ * Strict; otherwise (Unsafe) bare LF line ends, field names without
+ * whitespace and field values without LF, VT, FF nor CR are accepted
+ */
+#define AP_H1_HEAD_OPT_STRICT  (1u << 0)
+/** The head comes from a backend: errors are HTTP_BAD_GATEWAY or
+ * HTTP_GATEWAY_TIME_OUT, their causes logged at APLOG_WARNING (APLOG_DEBUG
+ * otherwise)
+ */
+#define AP_H1_HEAD_OPT_BACKEND (1u << 1)
+/** Merge the headers of the same name (RFC 9110 5.3) once the head is read,
+ * and check the merged values against limit_field
+ */
+#define AP_H1_HEAD_OPT_MERGE   (1u << 2)
+
+/**
+ * The options of an HTTP/1 head parser. As with ap_fgetline(), a line may
+ * be longer than its limit by one byte, or by two if it ends with a bare LF.
+ */
+typedef struct {
+    ap_h1_head_kind_e kind;         /**< what the parser parses */
+    unsigned int flags;             /**< AP_H1_HEAD_OPT_* */
+    apr_size_t limit_start_line;    /**< request-line or status-line length,
+                                     *   its line end excluded */
+    apr_size_t limit_field;         /**< field line length, obs-folds joined,
+                                     *   its line end excluded */
+    unsigned int limit_fields;      /**< number of headers, 0 for no limit */
+    unsigned int max_blank_lines;   /**< empty lines skipped before the
+                                     *   start line */
+    int module_index;               /**< the module logging the errors */
+    const char *echo_protocol;      /**< NULL, or the protocol (e.g.
+                                     *   "HTTP/2.0") a status-line may have
+                                     *   besides HTTP/1.x, also as "HTTP/x"
+                                     *   for an "HTTP/x.0" (a gateway echoing
+                                     *   the request's protocol), only from
+                                     *   HTTP/2 on; the head is then read as
+                                     *   HTTP/1.1 */
+} ap_h1_head_opts_t;
+
+/** A parsed HTTP/1 head, its strings NUL-terminated in the parser's pool */
+typedef struct {
+    const char *start_line;         /**< as received, line end excluded
+                                     *   (NULL for HEADERS and TRAILERS) */
+    const char *protocol;           /**< "HTTP/x.y" (or "HTTP/x"), "" for
+                                     *   HTTP/0.9 */
+    int proto_num;                  /**< HTTP_VERSION(x, y) */
+    apr_table_t *headers;           /**< in the order received, not merged
+                                     *   unless AP_H1_HEAD_OPT_MERGE */
+    apr_off_t length;               /**< bytes of the head, line ends
+                                     *   included */
+    ap_h1_head_kind_e kind;         /**< what this head is (the parser's
+                                     *   options' kind): u.req for REQUEST,
+                                     *   u.rsp for RESPONSE */
+    union {
+        struct {
+            const char *method;
+            const char *uri;
+        } req;                      /**< REQUEST */
+        struct {
+            int status;
+            const char *reason;     /**< the reason phrase, or "" */
+        } rsp;                      /**< RESPONSE */
+    } u;
+} ap_h1_head_t;
+
+/** An HTTP/1 head parser (opaque) */
+typedef struct ap_h1_head_parser ap_h1_head_parser_t;
+
+/**
+ * Initialize the options of an HTTP/1 head parser with a side's defaults:
+ * for the client side, HttpProtocolOptions (Strict or Unsafe) and the
+ * LimitRequest* of r's server, merging the headers; for a backend
+ * (AP_H1_HEAD_OPT_BACKEND in flags), Strict and the client side's default
+ * limits.
+ * @param opts The options to initialize
+ * @param r The request whose server's configuration applies
+ * @param kind What is parsed
+ * @param flags AP_H1_HEAD_OPT_BACKEND or 0
+ * @param module_index The module logging the errors: the module calling
+ *        the ap_h1_head_opts_init() macro (APLOG_MODULE_INDEX, which is
+ *        APLOG_NO_MODULE outside a module, as for logging), or the index
+ *        given by code acting for another module
+ */
+AP_DECLARE(void) ap_h1_head_opts_init_(ap_h1_head_opts_t *opts,
+                                       request_rec *r,
+                                       ap_h1_head_kind_e kind,
+                                       unsigned int flags,
+                                       int module_index);
+
+/** ap_h1_head_opts_init_() for the calling module (APLOG_MODULE_INDEX) */
+#define ap_h1_head_opts_init(opts, r, kind, flags) \
+    ap_h1_head_opts_init_(opts, r, kind, flags, APLOG_MODULE_INDEX)
+
+/**
+ * Create a parser for an HTTP/1 head.
+ * @param p The pool of the parser and of the head it parses
+ * @param r The request the logs are about: for a backend's response head, the
+ *          client's request; for its trailers, the proxied response's
+ * @param opts The options, copied
+ * @return The parser
+ */
+AP_DECLARE(ap_h1_head_parser_t *) ap_h1_head_parser_create(apr_pool_t *p,
+                                                           request_rec *r,
+                                                           const ap_h1_head_opts_t *opts);
+
+/**
+ * Prepare a parser for the next head (e.g. the final response after an
+ * interim one), also after DONE or an error: its state is reset and a new
+ * head allocated in its pool. The heads returned before stay valid.
+ * @param parser The parser
+ */
+AP_DECLARE(void) ap_h1_head_parser_reset(ap_h1_head_parser_t *parser);
+
+/**
+ * The apr_status_t behind the last DONE or error of ap_h1_head_parse():
+ * a read error, APR_EOF, APR_ENOSPC for a limit, or APR_EINVAL.
+ * @param parser The parser
+ */
+AP_DECLARE(apr_status_t) ap_h1_head_parser_status(const ap_h1_head_parser_t *parser);
+
+/**
+ * Set the options of the parser reading r's chunked trailers (HTTP1_BODY_IN),
+ * on the client side or for a proxied response (r->proxyreq ==
+ * PROXYREQ_RESPONSE); without them, the side's defaults
+ * (ap_h1_head_opts_init()) apply.
+ * @param r The request (the backend's for a proxied response)
+ * @param opts The options, copied (kind AP_H1_HEAD_TRAILERS)
+ */
+AP_DECLARE(void) ap_h1_set_trailers_opts(request_rec *r,
+                                         const ap_h1_head_opts_t *opts);
+
+/**
+ * Get the options set by ap_h1_set_trailers_opts(), if any.
+ * @param r The request
+ * @return The options, or NULL
+ */
+AP_DECLARE(const ap_h1_head_opts_t *) ap_h1_get_trailers_opts(request_rec *r);
+
 /**
  * Read the mime-encoded headers.
  * @param r The current request
@@ -121,6 +279,35 @@ AP_DECLARE(void) ap_get_mime_headers(request_rec *r);
  */
 AP_DECLARE(void) ap_get_mime_headers_core(request_rec *r,
                                           apr_bucket_brigade *bb);
+
+/**
+ * Read and parse an HTTP/1 head from an input filter, as far as the input
+ * goes, in blocking or non-blocking mode: in blocks peeked at
+ * (AP_MODE_SPECULATIVE) then consumed (AP_MODE_READBYTES) up to the head's
+ * end, so nothing after the head is read.
+ * @param parser The parser (ap_h1_head_parser_create())
+ * @param f Input filter to read from, supporting both modes
+ * @param block  How the operations should be performed
+ *               ::APR_BLOCK_READ, ::APR_NONBLOCK_READ
+ * @param head Set to the head on OK; on an error, to the head as parsed so
+ *        far once its start line is complete (u.req.method or
+ *        u.rsp.status unset if the start line is invalid), otherwise to NULL
+ * @return OK: the head is complete (and its input consumed);
+ *         AGAIN: non-blocking and more input is needed: call again once f's
+ *         connection is readable, the state is kept;
+ *         DONE: the input ended or failed (but timeouts) before the start
+ *         line was complete (a closed connection, not a malformed head);
+ *         or an HTTP status, its cause logged: for the client side
+ *         HTTP_BAD_REQUEST, HTTP_REQUEST_URI_TOO_LARGE (request-line) or
+ *         HTTP_REQUEST_TIME_OUT, for a backend HTTP_BAD_GATEWAY or
+ *         HTTP_GATEWAY_TIME_OUT. ap_h1_head_parser_status() gives the
+ *         underlying apr_status_t of DONE and errors.
+ * @remark DONE and errors are final (until ap_h1_head_parser_reset()).
+ */
+AP_DECLARE(int) ap_h1_head_parse(ap_h1_head_parser_t *parser,
+                                 ap_filter_t *f,
+                                 apr_read_type_e block,
+                                 ap_h1_head_t **head);
 
 /**
  * Run post_read_request hook and validate.
@@ -744,11 +931,11 @@ AP_DECLARE(apr_status_t) ap_get_basic_auth_components(const request_rec *r,
  */
 AP_CORE_DECLARE(void) ap_parse_uri(request_rec *r, const char *uri);
 
-#define AP_GETLINE_FOLD      (1 << 0) /* Whether to merge continuation lines */
-#define AP_GETLINE_CRLF      (1 << 1) /* Whether line ends must be CRLF */
-#define AP_GETLINE_NOSPC_EOL (1 << 2) /* Whether to consume up to and including
-                                         the end of line on APR_ENOSPC */
-#define AP_GETLINE_NONBLOCK  (1 << 3) /* Whether to read non-blocking */
+#define AP_GETLINE_FOLD         (1 << 0) /* Whether to merge continuation lines */
+#define AP_GETLINE_CRLF         (1 << 1) /* Whether line ends must be CRLF */
+#define AP_GETLINE_NOSPC_EOL    (1 << 2) /* Whether to consume up to and including
+                                            the end of line on APR_ENOSPC */
+#define AP_GETLINE_NONBLOCK     (1 << 3) /* Whether to read non-blocking */
 
 /**
  * Get the next line of input for the request
@@ -1363,6 +1550,28 @@ AP_DECLARE(void) ap_set_std_response_headers(request_rec *r);
  * @param send_headers Whether to send&clear headers in r->headers_out
  */
 AP_DECLARE(void) ap_send_interim_response(request_rec *r, int send_headers);
+
+/** ap_send_interim_response_ex() flag: don't block writing the response */
+#define AP_SEND_INTERIM_NONBLOCK (1u << 0)
+
+/**
+ * Send an interim (HTTP 1xx) response, with flags.
+ * @param r The request
+ * @param send_headers Whether to send&clear headers in r->headers_out
+ * @param flags AP_SEND_INTERIM_* flags (0 for ap_send_interim_response())
+ * @return APR_SUCCESS if sent (or nothing to send), APR_EAGAIN with
+ * AP_SEND_INTERIM_NONBLOCK if (some of) the response is pending in the
+ * connection's output filters, or an error.
+ * @remark With AP_SEND_INTERIM_NONBLOCK, the response is passed with a WC
+ * (write completion) bucket instead of a FLUSH: the core writes what it can
+ * without blocking and sets aside the rest. On APR_EAGAIN, the caller must
+ * get it written (ap_check_output_pending() when the connection is writable)
+ * before waiting for the client, which may wait for this response (e.g. a 100
+ * Continue).
+ */
+AP_DECLARE(apr_status_t) ap_send_interim_response_ex(request_rec *r,
+                                                     int send_headers,
+                                                     unsigned int flags);
 
 /**
  * Append a header in HTTP/1.1 format to the brigade.

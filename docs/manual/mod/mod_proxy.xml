@@ -576,37 +576,6 @@ ProxyPass "/apps"     "http://127"
 <seealso><directive type="section" module="mod_proxy">ProxyMatch</directive></seealso>
 </directivesynopsis>
 
-<directivesynopsis>
-<name>ProxyBadHeader</name>
-<description>Determines how to handle bad header lines in a
-response</description>
-<syntax>ProxyBadHeader IsError|Ignore|StartBody</syntax>
-<default>ProxyBadHeader IsError</default>
-<contextlist><context>server config</context><context>virtual host</context>
-</contextlist>
-
-<usage>
-    <p>The <directive>ProxyBadHeader</directive> directive determines the
-    behavior of <module>mod_proxy</module> if it receives syntactically invalid
-    response header lines (<em>i.e.</em> containing no colon) from the origin
-    server. The following arguments are possible:</p>
-
-    <dl>
-    <dt><code>IsError</code></dt>
-    <dd>Abort the request and end up with a 502 (Bad Gateway) response. This is
-    the default behavior.</dd>
-
-    <dt><code>Ignore</code></dt>
-    <dd>Treat bad header lines as if they weren't sent.</dd>
-
-    <dt><code>StartBody</code></dt>
-    <dd>When receiving the first bad header line, finish reading the headers and
-    treat the remainder as body. This helps to work around buggy backend servers
-    which forget to insert an empty line between the headers and the body.</dd>
-    </dl>
-</usage>
-</directivesynopsis>
-
 <directivesynopsis type="section">
 <name>ProxyMatch</name>
 <description>Container for directives applied to regular-expression-matched
@@ -1146,7 +1115,17 @@ ProxyPass "/example" "http://backend.example.com" max=20 ttl=120 retry=300
     backend server. The default for this limit is the number of threads
     per process in the active MPM. In the Prefork MPM, this is always 1;
     while with other MPMs, it is controlled by the
-    <directive>ThreadsPerChild</directive> directive.</td></tr>
+    <directive>ThreadsPerChild</directive> directive. With an MPM that can
+    wait for its connections (<module>event</module>), the default is
+    instead the connections a process runs or queues at once, when larger
+    than its threads: with <module>event</module> the threads plus
+    <directive module="mpm_common">ThreadsPerChild</directive> x
+    <directive module="event">AsyncAdmissionBacklogPerThread</directive>
+    (425 with 25 threads and the default backlog). A backend connection is
+    then kept for each request in flight, which the threads no longer
+    bound, but <directive module="event">MaxClientConnections</directive>
+    does. A backend that limits its connections needs an explicit
+    <code>max</code>.</td></tr>
     <tr><td>smax</td>
         <td>max</td>
         <td>Retained connection pool entries above this limit are freed
@@ -1214,12 +1193,29 @@ ProxyPass "/example" "http://backend.example.com" max=20 ttl=120 retry=300
         This must be at least 512 or set to 0 for the system default of 8192.
     </td></tr>
     <tr><td>responsefieldsize</td>
-        <td>8192</td>
-        <td>Adjust the size of the proxy response field buffer. The buffer size
-            should be at least the size of the largest expected header size from
-            a proxied response. Setting the value to 0 will use the system
-            default of 8192 bytes.<br />
+        <td>-</td>
+        <td>An alias of <code>limitresponsefieldsize</code>.<br />
         Available in Apache HTTP Server 2.4.34 and later.
+    </td></tr>
+    <tr><td>limitresponsefieldsize</td>
+        <td>-</td>
+        <td>Overrides <directive>ProxyLimitResponseFieldSize</directive> for
+        this worker, 0 for the directive's value.
+    </td></tr>
+    <tr><td>limitresponseline</td>
+        <td>-</td>
+        <td>Overrides <directive>ProxyLimitResponseLine</directive> for
+        this worker, 0 for the directive's value.
+    </td></tr>
+    <tr><td>limitresponsefields</td>
+        <td>-</td>
+        <td>Overrides <directive>ProxyLimitResponseFields</directive> for
+        this worker, 0 for no limit.
+    </td></tr>
+    <tr><td>httpprotocoloptions</td>
+        <td>-</td>
+        <td>Overrides <directive>ProxyHttpProtocolOptions</directive> for
+        this worker: <code>Strict</code> or <code>Unsafe</code>.
     </td></tr>
     <tr><td>keepalive</td>
         <td>Off</td>
@@ -2358,6 +2354,7 @@ header for proxied requests</description>
 <description>Time to poll synchronously before handing a connection to the
 MPM for asynchronous processing</description>
 <syntax>ProxyAsyncDelay <var>time</var>[s]</syntax>
+<default>ProxyAsyncDelay 0</default>
 <contextlist><context>server config</context>
 <context>virtual host</context>
 <context>directory</context>
@@ -2374,25 +2371,39 @@ MPM for asynchronous processing</description>
     responded, the connection is handed off to the MPM's asynchronous
     event loop, freeing the worker thread to serve other requests.</p>
 
-    <p>Setting this directive to <code>0</code> causes the connection
-    to be handed to the event loop immediately. Setting it to
-    <code>-1</code> disables asynchronous handling entirely (all proxy
-    connections remain synchronous).</p>
+    <p>With <code>0</code>, the default, the connection is handed to the
+    event loop as soon as it would wait, without polling first. Setting
+    this directive to <code>-1</code> disables asynchronous handling
+    entirely (all proxy connections remain synchronous), as
+    <directive module="core">AsyncRequests</directive> <code>Off</code>
+    does for every module processing the requests it applies to.</p>
 
-    <p>This directive has no effect unless the MPM supports polling
-    (e.g., <module>event</module>).</p>
+    <p>Tunnels (protocols upgraded with a <code>101 Switching
+    Protocols</code> response, e.g. WebSocket, see the
+    <code>upgrade</code> parameter of
+    <directive module="mod_proxy">ProxyPass</directive>) are handled
+    asynchronously too unless this directive is <code>-1</code>, whatever
+    its value: the worker thread forwards what is available on either
+    side, then the MPM waits for more.</p>
+
+    <p>This directive has no effect unless the MPM supports it (e.g.,
+    <module>event</module>), and the proxy connections of HTTP/2 streams
+    and subrequests remain synchronous.</p>
 
     <note><title>When to use this</title>
-    <p>Async proxy handling is most useful for slow backends or
-    long-lived streaming responses, where tying up a worker thread
-    waiting for data would limit concurrency. For fast backends that
-    respond within milliseconds, the synchronous path is more
-    efficient.</p>
+    <p>Async proxy handling frees the worker threads while waiting for
+    slow backends, long-lived streaming responses or tunnels, where tying
+    up a worker thread waiting for data would limit concurrency. For fast
+    backends that respond within a millisecond, the synchronous path
+    (<code>-1</code>) costs a bit less CPU per request, and a delay
+    greater than <code>0</code> helps only for the requests answered
+    within that delay.</p>
     </note>
 </usage>
 
 <seealso><directive module="mod_proxy">ProxyAsyncIdleTimeout</directive></seealso>
 <seealso><directive module="mod_proxy">ProxyTimeout</directive></seealso>
+<seealso><directive module="core">AsyncRequests</directive></seealso>
 </directivesynopsis>
 
 <directivesynopsis>
@@ -2421,13 +2432,98 @@ MPM for asynchronous processing</description>
     finally to the server's
     <directive module="core">Timeout</directive>.</p>
 
-    <p>This directive has no effect unless
-    <directive module="mod_proxy">ProxyAsyncDelay</directive> is also
-    set to enable asynchronous handling.</p>
+    <p>This directive has no effect when
+    <directive module="mod_proxy">ProxyAsyncDelay</directive> is
+    <code>-1</code> (asynchronous handling disabled). For asynchronous
+    tunnels it is the time without data on either side.</p>
 </usage>
 
 <seealso><directive module="mod_proxy">ProxyAsyncDelay</directive></seealso>
 <seealso><directive module="mod_proxy">ProxyTimeout</directive></seealso>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>ProxyHttpProtocolOptions</name>
+<description>The rules of the backends' HTTP/1 response heads</description>
+<syntax>ProxyHttpProtocolOptions Strict|Unsafe</syntax>
+<default>ProxyHttpProtocolOptions Strict</default>
+<contextlist><context>server config</context>
+<context>virtual host</context>
+<context>directory</context>
+</contextlist>
+<compatibility>Available in Apache HTTP Server 2.5 and later</compatibility>
+
+<usage>
+    <p>The rules applied to the response heads (and chunked trailers) of
+    HTTP/1 backends, as <directive module="core">HttpProtocolOptions</directive>
+    does for the requests: with <code>Strict</code>, lines must end with
+    CRLF, field names must be tokens and field values must not contain
+    control characters but HTAB (RFC 9112); <code>Unsafe</code> also accepts
+    bare LF line ends, field names without whitespace and field values
+    without LF, VT, FF nor CR. In both cases a line without a colon, an
+    obs-fold after the status line or a blank one, and a malformed status
+    line are errors (502). The worker's <code>httpprotocoloptions</code>
+    parameter overrides it.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>ProxyLimitResponseLine</name>
+<description>Limit on the backends' HTTP/1 status line length</description>
+<syntax>ProxyLimitResponseLine <var>bytes</var></syntax>
+<default>ProxyLimitResponseLine 8190</default>
+<contextlist><context>server config</context>
+<context>virtual host</context>
+<context>directory</context>
+</contextlist>
+<compatibility>Available in Apache HTTP Server 2.5 and later</compatibility>
+
+<usage>
+    <p>The length of a backend's status line, as
+    <directive module="core">LimitRequestLine</directive> for the request
+    line; a longer one is an error (502). The worker's
+    <code>limitresponseline</code> parameter overrides it.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>ProxyLimitResponseFieldSize</name>
+<description>Limit on the backends' HTTP/1 response header field length</description>
+<syntax>ProxyLimitResponseFieldSize <var>bytes</var></syntax>
+<default>ProxyLimitResponseFieldSize 8190</default>
+<contextlist><context>server config</context>
+<context>virtual host</context>
+<context>directory</context>
+</contextlist>
+<compatibility>Available in Apache HTTP Server 2.5 and later</compatibility>
+
+<usage>
+    <p>The length of a backend's response header (or trailer) field line,
+    its obs-folds joined, as
+    <directive module="core">LimitRequestFieldSize</directive> for the
+    requests; a longer one is an error (502). The worker's
+    <code>limitresponsefieldsize</code> (or <code>responsefieldsize</code>)
+    parameter overrides it.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>ProxyLimitResponseFields</name>
+<description>Limit on the number of the backends' HTTP/1 response headers</description>
+<syntax>ProxyLimitResponseFields <var>number</var></syntax>
+<default>ProxyLimitResponseFields 100</default>
+<contextlist><context>server config</context>
+<context>virtual host</context>
+<context>directory</context>
+</contextlist>
+<compatibility>Available in Apache HTTP Server 2.5 and later</compatibility>
+
+<usage>
+    <p>The number of headers in a backend's response head (or of trailers), as
+    <directive module="core">LimitRequestFields</directive> for the
+    requests, 0 for no limit; more is an error (502). The worker's
+    <code>limitresponsefields</code> parameter overrides it.</p>
+</usage>
 </directivesynopsis>
 
 </modulesynopsis>

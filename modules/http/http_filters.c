@@ -83,6 +83,7 @@ typedef struct http_filter_ctx
         BODY_CHUNK_END_LF, /* got CR after data, expect LF */
         BODY_CHUNK_TRAILER /* trailers */
     } state;
+    ap_h1_head_parser_t *trailer_parser;
     unsigned int at_eos:1,
                  seen_data:1;
 } http_ctx_t;
@@ -263,45 +264,68 @@ static apr_status_t parse_chunk_size(http_ctx_t *ctx, const char *buffer,
     return APR_SUCCESS;
 }
 
-static apr_status_t read_chunked_trailers(http_ctx_t *ctx, ap_filter_t *f,
-                                          apr_bucket_brigade *b)
+AP_DECLARE(void) ap_h1_set_trailers_opts(request_rec *r,
+                                         const ap_h1_head_opts_t *opts)
 {
-    int rv;
-    apr_bucket *e;
+    ap_h1_head_opts_t *copy = apr_pmemdup(r->pool, opts, sizeof(*opts));
+
+    copy->kind = AP_H1_HEAD_TRAILERS;
+    ap_set_module_config(r->request_config, &http_module, copy);
+}
+
+AP_DECLARE(const ap_h1_head_opts_t *) ap_h1_get_trailers_opts(request_rec *r)
+{
+    return ap_get_module_config(r->request_config, &http_module);
+}
+
+/* Read the trailer section following the last chunk, with the
+ * options set by ap_h1_set_trailers_opts() if any, else the side's defaults:
+ * a backend's for a proxied response, the client side's otherwise. Resumes
+ * after APR_EAGAIN.
+ */
+static apr_status_t read_chunked_trailers(http_ctx_t *ctx, ap_filter_t *f,
+                                          apr_bucket_brigade *b,
+                                          apr_read_type_e block)
+{
     request_rec *r = f->r;
-    apr_table_t *trailers;
-    apr_table_t *saved_headers_in = r->headers_in;
-    int saved_status = r->status;
+    ap_h1_head_t *head;
+    apr_bucket *e;
+    int rc;
 
-    trailers = apr_table_make(r->pool, 5);
-    r->status = HTTP_OK;
-    r->headers_in = trailers;
-    ap_get_mime_headers(r);
-    r->headers_in = saved_headers_in;
+    if (!ctx->trailer_parser) {
+        const ap_h1_head_opts_t *opts = ap_h1_get_trailers_opts(r);
+        ap_h1_head_opts_t defaults;
 
-    if (r->status == HTTP_OK) {
-        r->status = saved_status;
-
-        if (!apr_is_empty_table(trailers)) {
-            e = ap_bucket_headers_create(trailers, r->pool, b->bucket_alloc);
-            APR_BRIGADE_INSERT_TAIL(b, e);
+        if (!opts) {
+            ap_h1_head_opts_init(&defaults, r, AP_H1_HEAD_TRAILERS,
+                                 (r->proxyreq == PROXYREQ_RESPONSE)
+                                 ? AP_H1_HEAD_OPT_BACKEND : 0);
+            opts = &defaults;
         }
-        e = apr_bucket_eos_create(f->c->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(b, e);
-        ctx->at_eos = 1;
-        rv = APR_SUCCESS;
+        ctx->trailer_parser = ap_h1_head_parser_create(r->pool, r, opts);
     }
-    else {
-        const char *error_notes = apr_table_get(r->notes,
-                                                "error-notes");
+
+    rc = ap_h1_head_parse(ctx->trailer_parser, f->next, block, &head);
+    if (rc == AGAIN) {
+        return APR_EAGAIN;
+    }
+    if (rc != OK) {
+        const char *error_notes = apr_table_get(r->notes, "error-notes");
         ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r, APLOGNO(02656)
                       "Error while reading HTTP trailer: %i%s%s",
-                      r->status, error_notes ? ": " : "",
+                      rc, error_notes ? ": " : "",
                       error_notes ? error_notes : "");
-        rv = APR_EINVAL;
+        return APR_EINVAL;
     }
 
-    return rv;
+    if (!apr_is_empty_table(head->headers)) {
+        e = ap_bucket_headers_create(head->headers, r->pool, b->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(b, e);
+    }
+    e = apr_bucket_eos_create(f->c->bucket_alloc);
+    APR_BRIGADE_INSERT_TAIL(b, e);
+    ctx->at_eos = 1;
+    return APR_SUCCESS;
 }
 
 typedef struct h1_in_ctx_t
@@ -335,15 +359,17 @@ apr_status_t ap_http_filter(ap_filter_t *f, apr_bucket_brigade *b,
      * If the read is to be nonblocking though, the caller may not want to
      * handle this just now (e.g. mod_proxy_http), and is prepared to read
      * nothing if the client really waits for 100 continue, so we don't
-     * send it now and wait for later blocking read.
+     * send it now and wait for later blocking read. Unless the caller says
+     * so with AP_EXPECT_100_NONBLOCK, then we send it without blocking.
      *
      * In any case, even if r->expecting remains set at the end of the
      * request handling, ap_set_keepalive() will finally do the right
      * thing (i.e. "Connection: close" the connection).
      */
-    if (block == APR_BLOCK_READ
-            && r->expecting_100 && r->proto_num >= HTTP_VERSION(1,1)
-            && !(ctx->at_eos || r->eos_sent || r->bytes_sent)) {
+    if ((block == APR_BLOCK_READ
+         || (r->expecting_100 & AP_EXPECT_100_NONBLOCK))
+        && r->expecting_100 && r->proto_num >= HTTP_VERSION(1,1)
+        && !(ctx->at_eos || r->eos_sent || r->bytes_sent)) {
         if (!ap_is_HTTP_SUCCESS(r->status)) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                           "ap_http_in_filter: status != OK, not sending 100-continue");
@@ -356,10 +382,18 @@ apr_status_t ap_http_filter(ap_filter_t *f, apr_bucket_brigade *b,
                           "ap_http_in_filter: sending 100-continue");
             r->status = HTTP_CONTINUE;
             r->status_line = NULL;
-            ap_send_interim_response(r, 0);
+            rv = ap_send_interim_response_ex(r, 0,
+                                             (block == APR_BLOCK_READ)
+                                             ? 0 : AP_SEND_INTERIM_NONBLOCK);
             AP_DEBUG_ASSERT(!r->expecting_100);
             r->status_line = saved_status_line;
             r->status = saved_status;
+            if (APR_STATUS_IS_EAGAIN(rv)) {
+                /* Nonblocking: the 100 is pending, nothing to read before
+                 * the client gets it (see AP_EXPECT_100_NONBLOCK).
+                 */
+                return APR_EAGAIN;
+            }
         }
         else {
             /* https://tools.ietf.org/html/rfc7231#section-5.1.1
@@ -607,7 +641,7 @@ apr_status_t ap_h1_body_in_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
             if (ctx->state == BODY_CHUNK_TRAILER) {
                 /* Treat UNSET as DISABLE - trailers aren't merged by default */
-                return read_chunked_trailers(ctx, f, b);
+                return read_chunked_trailers(ctx, f, b, block);
             }
 
             break;
@@ -697,23 +731,10 @@ apr_status_t ap_h1_body_in_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
             break;
         }
-        case BODY_CHUNK_TRAILER: {
+        case BODY_CHUNK_TRAILER:
+            /* Resume after APR_EAGAIN */
+            return read_chunked_trailers(ctx, f, b, block);
 
-            rv = ap_get_brigade(f->next, b, mode, block, readbytes);
-
-            /* for timeout */
-            if (block == APR_NONBLOCK_READ
-                    && ((rv == APR_SUCCESS && APR_BRIGADE_EMPTY(b))
-                            || (APR_STATUS_IS_EAGAIN(rv)))) {
-                return APR_EAGAIN;
-            }
-
-            if (rv != APR_SUCCESS) {
-                return rv;
-            }
-
-            break;
-        }
         default: {
             /* Should not happen */
             ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, f->r, APLOGNO(02901)
@@ -1512,6 +1533,507 @@ cleanup:
     return rc;
 }
 
+/*
+ * The request body reader (ap_request_read_body(), ap_request_wait_body()):
+ * nonblocking reads when the request can suspend, the waits for the client
+ * through the core's request waits, their outcome answered by the next read.
+ * Nothing is allocated per read or wait: the state and its brigade are made
+ * once per request.
+ */
+
+/* The state of a request's body reads (core_request_config->body) */
+struct ap_request_body {
+    request_rec *r;
+    apr_bucket_brigade *tmp_bb;      /* what a read gets, before the caller's
+                                      * brigade */
+    ap_request_continuation_fn *fn;  /* the caller's, for the wait in flight */
+    void *baton;
+    apr_status_t interrupted;        /* the last wait was (the MPM failed to
+                                      * wait: APR_EGENERAL), else
+                                      * APR_SUCCESS */
+    /* ap_request_body_run()'s */
+    apr_bucket_brigade *run_bb;      /* each read, given to the sink */
+    apr_off_t run_readbytes;
+    unsigned int run_flags;
+    int run_module_index;
+    ap_request_body_sink_fn *sink;
+    ap_request_body_done_fn *done;
+    void *run_baton;
+    /* ap_request_discard_body()'s */
+    apr_bucket_brigade *discard_bb;  /* each read, dropped */
+    apr_off_t discarded;             /* bytes dropped so far */
+    unsigned int timed_out :1,       /* the last wait timed out */
+                 drained   :1,       /* the last read said EAGAIN */
+                 block     :1,       /* a wait declined: read blocking */
+                 running   :1;       /* a run is in progress */
+};
+
+static struct ap_request_body *request_body_get(request_rec *r)
+{
+    core_request_config *req_cfg;
+    struct ap_request_body *body;
+
+    req_cfg = ap_get_core_module_config(r->request_config);
+    body = (req_cfg) ? req_cfg->body : NULL;
+    if (!body) {
+        body = apr_pcalloc(r->pool, sizeof(*body));
+        body->r = r;
+        body->tmp_bb = apr_brigade_create(r->pool,
+                                          r->connection->bucket_alloc);
+        if (req_cfg) {
+            req_cfg->body = body;
+        }
+    }
+    return body;
+}
+
+AP_DECLARE(int) ap_request_read_body_(request_rec *r, apr_bucket_brigade *bb,
+                                      apr_off_t readbytes, unsigned int flags,
+                                      int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    apr_bucket_brigade *tmp_bb = body->tmp_bb;
+    int block, status;
+    apr_status_t rv;
+
+    if (readbytes <= 0) {
+        readbytes = AP_IOBUFSIZE;
+    }
+    block = ((flags & AP_REQUEST_BODY_BLOCK)
+             || body->block
+             || !ap_request_can_suspend(r));
+
+    /* A nonblocking read sends the 100 Continue without blocking too, else
+     * the client and we would wait for each other.
+     */
+    if (!block && r->expecting_100) {
+        r->expecting_100 |= AP_EXPECT_100_NONBLOCK;
+    }
+    rv = ap_get_brigade(r->input_filters, tmp_bb, AP_MODE_READBYTES,
+                        (block) ? APR_BLOCK_READ : APR_NONBLOCK_READ,
+                        readbytes);
+    if (r->expecting_100) {
+        r->expecting_100 &= ~AP_EXPECT_100_NONBLOCK;
+    }
+
+    if (!block && (APR_STATUS_IS_EAGAIN(rv)
+                   || (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(tmp_bb)))) {
+        apr_brigade_cleanup(tmp_bb);
+        if (body->timed_out) {
+            /* The wait for the client timed out and there is still nothing
+             * to read (the time left to read, a deadline of mod_reqtimeout's
+             * would have failed the read)
+             */
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_INFO, 0, r,
+                          APLOGNO() "timeout reading the request body "
+                          "(async)");
+            status = HTTP_REQUEST_TIME_OUT;
+            goto failed;
+        }
+        if (body->interrupted != APR_SUCCESS) {
+            /* The wait was interrupted: the MPM failed to wait */
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR,
+                          body->interrupted, r, APLOGNO()
+                          "reading the request body interrupted: "
+                          "the wait failed (async)");
+            status = HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+        body->drained = APR_STATUS_IS_EAGAIN(rv);
+        return AGAIN;
+    }
+    if (rv != APR_SUCCESS) {
+        apr_brigade_cleanup(tmp_bb);
+        status = ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, rv, r,
+                      APLOGNO() "reading the request body failed (%d)",
+                      status);
+        goto failed;
+    }
+
+    /* A blocking read always returns something, a filter not doing so is
+     * a bug
+     */
+    if (APR_BRIGADE_EMPTY(tmp_bb)) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "a blocking read of the request body "
+                      "returned nothing (an input filter's bug)");
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        goto failed;
+    }
+    AP_DEBUG_ASSERT(!APR_BRIGADE_EMPTY(tmp_bb));
+
+    body->timed_out = 0;
+    body->interrupted = APR_SUCCESS;
+    body->drained = 0;
+    if (flags & AP_REQUEST_BODY_SETASIDE) {
+        rv = ap_save_brigade(NULL, &bb, &tmp_bb, r->pool);
+        if (rv != APR_SUCCESS) {
+            apr_brigade_cleanup(tmp_bb);
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, rv, r,
+                          APLOGNO() "setting the request body aside failed");
+            status = HTTP_INTERNAL_SERVER_ERROR;
+            goto failed;
+        }
+    }
+    else {
+        APR_BRIGADE_CONCAT(bb, tmp_bb);
+    }
+    return OK;
+
+failed:
+    r->connection->keepalive = AP_CONN_CLOSE;
+    return status;
+}
+
+/* The continuation of ap_request_wait_body(): its outcome is answered by the
+ * next read, then the caller's continuation runs.
+ */
+static void request_body_wait_continuation(request_rec *r,
+                                           apr_status_t status,
+                                           void *baton)
+{
+    struct ap_request_body *body = baton;
+    ap_request_continuation_fn *fn = body->fn;
+    void *fn_baton = body->baton;
+
+    body->fn = NULL;
+    body->baton = NULL;
+    if (APR_STATUS_IS_TIMEUP(status)) {
+        body->timed_out = 1;
+    }
+    else if (status != APR_SUCCESS) {
+        body->interrupted = status;
+    }
+    fn(r, status, fn_baton);
+}
+
+AP_DECLARE(int) ap_request_wait_body_(request_rec *r,
+                                      ap_request_continuation_fn *fn,
+                                      void *baton, int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    conn_rec *c = r->connection;
+    ap_request_waitctx_t *ctx;
+    unsigned int flags;
+    int pending, rc;
+
+    if (body->fn != NULL) {
+        /* A second wait while one is pending: refuse it before touching
+         * the pending one's continuation
+         */
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "waiting for the request body while a wait "
+                      "for it is pending: declined");
+        AP_DEBUG_ASSERT(body->fn == NULL);
+        return DECLINED;
+    }
+    if (body->block || !ap_request_can_suspend(r)) {
+        body->block = 1;
+        return DECLINED;
+    }
+
+    /* The client's context is shared by the request's waits for the client:
+     * the defaults of the body's wait (the time left to read, no poll)
+     */
+    ctx = ap_request_waitctx_client_(r, module_index);
+    ctx->timeout = AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
+    ctx->delay = 0;
+
+    /* With output pending (e.g. the 100 Continue), the client may wait for
+     * it before sending more: wait for either direction, the wait's check
+     * writing what it can.
+     */
+    flags = (body->drained) ? AP_REQUEST_WAIT_DRAINED : 0;
+    pending = (ap_check_output_pending(c) == AGAIN);
+    body->fn = fn;
+    body->baton = baton;
+    if (pending) {
+        unsigned int directions = AP_WAIT_IN | AP_WAIT_OUT;
+        rc = ap_request_wait_any(&ctx, 1, &directions, flags,
+                                 request_body_wait_continuation, body);
+    }
+    else {
+        rc = ap_request_wait(ctx, AP_WAIT_IN, flags,
+                             request_body_wait_continuation, body);
+    }
+    if (rc == SUSPENDED) {
+        return SUSPENDED;
+    }
+    body->fn = NULL;
+    body->baton = NULL;
+
+    if (rc == DECLINED) {
+        body->block = 1;
+        if (pending) {
+            /* The blocking reads don't write what's pending for the client,
+             * which may wait for it: flush it now (an error is the next
+             * read's)
+             */
+            apr_bucket_brigade *tmp_bb = body->tmp_bb;
+            APR_BRIGADE_INSERT_TAIL(tmp_bb,
+                                    apr_bucket_flush_create(c->bucket_alloc));
+            (void)ap_pass_brigade(c->output_filters, tmp_bb);
+            apr_brigade_cleanup(tmp_bb);
+        }
+        return DECLINED;
+    }
+    return OK;
+}
+
+/* The loop of ap_request_body_run(): OK or an HTTP error once done, or
+ * SUSPENDED (request_body_run_continuation() goes on)
+ */
+static void request_body_run_continuation(request_rec *r,
+                                          apr_status_t status,
+                                          void *baton);
+
+static int request_body_run(struct ap_request_body *body)
+{
+    request_rec *r = body->r;
+    apr_bucket_brigade *bb = body->run_bb;
+    int rc;
+
+    for (;;) {
+        apr_bucket *e;
+        int eos = 0;
+
+        rc = ap_request_read_body_(r, bb, body->run_readbytes,
+                                   body->run_flags, body->run_module_index);
+        if (rc == AGAIN) {
+            rc = ap_request_wait_body_(r, request_body_run_continuation, body,
+                                       body->run_module_index);
+            if (rc == SUSPENDED) {
+                return SUSPENDED;
+            }
+            continue; /* ready, or blocking from now on */
+        }
+        if (rc != OK) {
+            apr_brigade_cleanup(bb);
+            return rc;
+        }
+
+        if (!APR_BRIGADE_EMPTY(bb)) {
+            e = APR_BRIGADE_LAST(bb);
+            if (APR_BUCKET_IS_EOS(e)) {
+                apr_bucket_delete(e);
+                eos = 1;
+            }
+        }
+        if (eos || !APR_BRIGADE_EMPTY(bb)) {
+            rc = body->sink(r, bb, eos, body->run_baton);
+            apr_brigade_cleanup(bb);
+            if (rc == DONE) {
+                return OK; /* the rest is discarded */
+            }
+            if (rc != OK) {
+                AP_DEBUG_ASSERT(rc != SUSPENDED);
+                if (rc == SUSPENDED) {
+                    ap_log_rerror(__FILE__, __LINE__, body->run_module_index,
+                                  APLOG_ERR, 0, r, APLOGNO()
+                                  "request body sink returned SUSPENDED");
+                    return HTTP_INTERNAL_SERVER_ERROR;
+                }
+                return rc;
+            }
+        }
+        if (eos) {
+            return OK;
+        }
+    }
+}
+
+static void request_body_run_continuation(request_rec *r,
+                                          apr_status_t status,
+                                          void *baton)
+{
+    struct ap_request_body *body = baton;
+    int rc;
+
+    /* The next read answers the wait's status */
+    rc = request_body_run(body);
+    if (rc != SUSPENDED) {
+        body->running = 0;
+        body->done(r, rc, body->run_baton);
+    }
+}
+
+AP_DECLARE(int) ap_request_body_run_(request_rec *r, apr_off_t readbytes,
+                                     unsigned int flags,
+                                     ap_request_body_sink_fn *sink,
+                                     ap_request_body_done_fn *done,
+                                     void *baton, int module_index)
+{
+    struct ap_request_body *body = request_body_get(r);
+    int rc;
+
+    AP_DEBUG_ASSERT(!body->running);
+    if (body->running) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_ERR, 0, r,
+                      APLOGNO() "request body run while another one is in "
+                      "progress");
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    if (!body->run_bb) {
+        body->run_bb = apr_brigade_create(r->pool,
+                                          r->connection->bucket_alloc);
+    }
+    body->run_readbytes = readbytes;
+    body->run_flags = flags;
+    body->run_module_index = module_index;
+    body->sink = sink;
+    body->done = done;
+    body->run_baton = baton;
+    body->running = 1;
+
+    rc = request_body_run(body);
+    if (rc != SUSPENDED) {
+        body->running = 0;
+    }
+    return rc;
+}
+
+/* The length left to read of a Content-Length body, from HTTP1_BODY_IN's
+ * state (or the request's headers before its first read), or -1 when not
+ * known (chunked, an invalid length that the read will fail on, or no
+ * HTTP1_BODY_IN, e.g. HTTP/2)
+ */
+static apr_off_t request_body_length_left(request_rec *r)
+{
+    const char *lenp;
+    apr_off_t len;
+    ap_filter_t *f;
+
+    for (f = r->input_filters; f; f = f->next) {
+        if (f->frec == ap_h1_body_in_filter_handle) {
+            break;
+        }
+    }
+    if (!f) {
+        return -1;
+    }
+    if (f->ctx) {
+        const http_ctx_t *ctx = f->ctx;
+        if (ctx->at_eos) {
+            return 0;
+        }
+        return (ctx->state == BODY_LENGTH) ? ctx->remaining : -1;
+    }
+    if (apr_table_get(r->headers_in, "Transfer-Encoding")) {
+        return -1;
+    }
+    lenp = apr_table_get(r->headers_in, "Content-Length");
+    if (!lenp) {
+        return 0;
+    }
+    if (!ap_parse_strict_length(&len, lenp)) {
+        return -1;
+    }
+    return len;
+}
+
+AP_DECLARE(int) ap_request_discard_body_(request_rec *r, apr_off_t limit,
+                                         int module_index)
+{
+    conn_rec *c = r->connection;
+    struct ap_request_body *body;
+    apr_bucket_brigade *bb;
+    apr_off_t left;
+    int rc;
+
+    /* As ap_discard_request_body() */
+    if (r->main || c->keepalive == AP_CONN_CLOSE) {
+        return OK;
+    }
+    if (ap_status_drops_connection(r->status)) {
+        c->keepalive = AP_CONN_CLOSE;
+        return OK;
+    }
+
+    /* The client waits for a 100 Continue that wasn't sent (the response
+     * is final): it may never send the body, close (as ap_set_keepalive()
+     * does then)
+     */
+    if (r->expecting_100) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_TRACE3, 0, r,
+                      "discarding the request body: 100 Continue not sent, "
+                      "closing");
+        c->keepalive = AP_CONN_CLOSE;
+        return DONE;
+    }
+
+    body = request_body_get(r);
+    if (!body->discard_bb) {
+        body->discard_bb = apr_brigade_create(r->pool, c->bucket_alloc);
+    }
+    bb = body->discard_bb;
+
+    /* A Content-Length over the limit closes without reading */
+    left = request_body_length_left(r);
+    if (limit >= 0 && left > limit - body->discarded) {
+        ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, 0, r,
+                      APLOGNO() "discarding the request body: %"
+                      APR_OFF_T_FMT " bytes left over the limit of %"
+                      APR_OFF_T_FMT ", closing", left, limit);
+        c->keepalive = AP_CONN_CLOSE;
+        return DONE;
+    }
+
+    for (;;) {
+        apr_off_t readbytes = AP_IOBUFSIZE;
+
+        /* Up to the limit, and one byte more tells it's over */
+        if (limit >= 0 && readbytes > limit - body->discarded + 1) {
+            readbytes = limit - body->discarded + 1;
+        }
+        rc = ap_request_read_body_(r, bb, readbytes, 0, module_index);
+        if (rc == AGAIN) {
+            return AGAIN;
+        }
+        if (rc != OK) {
+            apr_brigade_cleanup(bb);
+            c->keepalive = AP_CONN_CLOSE; /* set already */
+            return DONE;
+        }
+
+        while (!APR_BRIGADE_EMPTY(bb)) {
+            apr_bucket *e = APR_BRIGADE_FIRST(bb);
+
+            if (APR_BUCKET_IS_EOS(e)) {
+                apr_brigade_cleanup(bb);
+                return OK;
+            }
+
+            /* There is no need to read empty or metadata buckets or buckets
+             * of known length, but buckets of unknown length must be read
+             * to be exhausted.
+             */
+            if (e->length == (apr_size_t)-1) {
+                const char *data;
+                apr_size_t len;
+                apr_status_t rv;
+
+                rv = apr_bucket_read(e, &data, &len, APR_BLOCK_READ);
+                if (rv != APR_SUCCESS) {
+                    apr_brigade_cleanup(bb);
+                    c->keepalive = AP_CONN_CLOSE;
+                    return DONE;
+                }
+            }
+            body->discarded += e->length;
+            apr_bucket_delete(e);
+        }
+
+        if (limit >= 0 && body->discarded > limit) {
+            ap_log_rerror(__FILE__, __LINE__, module_index, APLOG_DEBUG, 0, r,
+                          APLOGNO() "discarding the request body: over the "
+                          "limit of %" APR_OFF_T_FMT ", closing", limit);
+            c->keepalive = AP_CONN_CLOSE;
+            return DONE;
+        }
+    }
+}
+
 /* Here we deal with getting the request message body from the client.
  * Whether or not the request contains a body is signaled by the presence
  * of a non-zero Content-Length or by a Transfer-Encoding: chunked.
@@ -2174,88 +2696,28 @@ static apr_bucket *create_trailers_bucket(request_rec *r, apr_bucket_alloc_t *bu
 typedef struct h1_request_ctx {
     enum
     {
-        REQ_LINE, /* reading 1st request line */
-        REQ_HEADERS, /* reading header lines */
+        REQ_HEAD, /* reading the request head */
         REQ_BODY, /* reading body follows, terminal */
         REQ_ERROR, /* failed, terminal */
     } state;
 
     request_rec *r;
-    char *request_line;
-    const char *method;
-    const char *uri;
-    const char *protocol;
+    ap_h1_head_parser_t *parser;
 } h1_request_ctx;
 
-static apr_status_t read_request_line(h1_request_ctx *ctx, apr_bucket_brigade *bb)
-{
-    apr_size_t len;
-    int num_blank_lines = DEFAULT_LIMIT_BLANK_LINES;
-    core_server_config *conf = ap_get_core_module_config(ctx->r->server->module_config);
-    int strict = (conf->http_conformance != AP_HTTP_CONFORMANCE_UNSAFE);
-    apr_status_t rv;
-
-    /* Read past empty lines until we get a real request line,
-     * a read error, the connection closes (EOF), or we timeout.
-     *
-     * We skip empty lines because browsers have to tack a CRLF on to the end
-     * of POSTs to support old CERN webservers.  But note that we may not
-     * have flushed any previous response completely to the client yet.
-     * We delay the flush as long as possible so that we can improve
-     * performance for clients that are pipelining requests.  If a request
-     * is pipelined then we won't block during the (implicit) read() below.
-     * If the requests aren't pipelined, then the client is still waiting
-     * for the final buffer flush from us, and we will block in the implicit
-     * read().  B_SAFEREAD ensures that the BUFF layer flushes if it will
-     * have to block during a read.
-     */
-    do {
-        /* ensure ap_rgetline allocates memory each time thru the loop
-         * if there are empty lines
-         */
-        ctx->request_line = NULL;
-        len = 0;
-        rv = ap_rgetline(&ctx->request_line, (apr_size_t)(ctx->r->server->limit_req_line + 2),
-                         &len, ctx->r, strict ? AP_GETLINE_CRLF : 0, bb);
-
-        if (rv != APR_SUCCESS) {
-            return rv;
-        }
-        else if (len > 0) {
-            /* got the line in ctx->r->the_request */
-            return APR_SUCCESS;
-        }
-    } while (--num_blank_lines >= 0);
-    /* too many blank lines */
-    return APR_EINVAL;
-}
-
-static void sanitize_brigade(apr_bucket_brigade *bb)
-{
-    apr_bucket *e, *next;
-
-    for (e = APR_BRIGADE_FIRST(bb);
-         e != APR_BRIGADE_SENTINEL(bb);
-         e = next)
-    {
-        next = APR_BUCKET_NEXT(e);
-        if (!APR_BUCKET_IS_METADATA(e) && e->length == 0) {
-            apr_bucket_delete(e);
-        }
-    }
-}
-
-apr_status_t ap_h1_request_in_filter(ap_filter_t *f,
-                                     apr_bucket_brigade *bb,
-                                     ap_input_mode_t mode,
-                                     apr_read_type_e block,
-                                     apr_off_t readbytes)
+apr_status_t ap_h1_header_in_filter(ap_filter_t *f,
+                                    apr_bucket_brigade *bb,
+                                    ap_input_mode_t mode,
+                                    apr_read_type_e block,
+                                    apr_off_t readbytes)
 {
     request_rec *r = f->r;
-    apr_bucket *e;
     h1_request_ctx *ctx = f->ctx;
     apr_status_t rv = APR_SUCCESS;
     int http_status = HTTP_OK;
+    ap_h1_head_t *head;
+    apr_bucket *e;
+    int rc;
 
     /* just get out of the way for things we don't want to handle. */
     if (mode != AP_MODE_READBYTES && mode != AP_MODE_GETLINE) {
@@ -2263,88 +2725,79 @@ apr_status_t ap_h1_request_in_filter(ap_filter_t *f,
     }
 
     if (!ctx) {
+        ap_h1_head_opts_t opts;
+
         f->ctx = ctx = apr_pcalloc(r->pool, sizeof(*ctx));
         ctx->r = r;
-        ctx->state = REQ_LINE;
+        ctx->state = REQ_HEAD;
+        ap_h1_head_opts_init(&opts, r, AP_H1_HEAD_REQUEST, 0);
+        ctx->parser = ap_h1_head_parser_create(r->pool, r, &opts);
     }
 
-    /* This filter needs to get out of the way of read_request_line() */
-    ap_remove_input_filter(f);
-
-    while (APR_SUCCESS == rv) {
-        switch (ctx->state) {
-        case REQ_LINE:
-            if ((rv = read_request_line(ctx, bb)) != APR_SUCCESS) {
-                /* certain failures are answered with a HTTP error bucket
-                 * and are terminal for parsing a request */
-                ctx->method = ctx->uri = "-";
-                ctx->protocol = "HTTP/1.0";
-                if (APR_STATUS_IS_ENOSPC(rv)) {
-                    http_status = HTTP_REQUEST_URI_TOO_LARGE;
-                }
-                else if (APR_STATUS_IS_TIMEUP(rv)) {
-                    http_status = HTTP_REQUEST_TIME_OUT;
-                }
-                else if (APR_STATUS_IS_BADARG(rv)) {
-                    http_status = HTTP_BAD_REQUEST;
-                }
-                else if (APR_STATUS_IS_EINVAL(rv)) {
-                    http_status = HTTP_BAD_REQUEST;
-                }
-                goto cleanup;
-            }
-
-            if (!ap_h1_tokenize_request_line(r, ctx->request_line,
-                                             &ctx->method, &ctx->uri, &ctx->protocol)) {
-                http_status = HTTP_BAD_REQUEST;
-                goto cleanup;
-            }
-            /* got the request line and it looked to contain what we need */
-            ctx->state = REQ_HEADERS;
+    switch (ctx->state) {
+    case REQ_HEAD:
+        /* Empty lines before the request line are skipped (up to
+         * DEFAULT_LIMIT_BLANK_LINES) because browsers have to tack a CRLF
+         * on to the end of POSTs to support old CERN webservers.
+         */
+        rc = ap_h1_head_parse(ctx->parser, f->next, block, &head);
+        if (rc == AGAIN) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE6, 0, r,
+                          "reading request head");
+            rv = APR_EAGAIN;
             break;
-
-        case REQ_HEADERS:
-            ap_get_mime_headers_core(r, bb);
-            if (r->status != HTTP_OK) {
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00567)
-                              "request failed: error reading the headers");
-                http_status = r->status;
-                goto cleanup;
-            }
-            /* clear the brigade, as ap_get_mime_headers_core() leaves the last
-             * empty line in there, insert the REQUEST bucket and return */
-            apr_brigade_cleanup(bb);
-            e = ap_bucket_request_createn(ctx->method, ctx->uri,
-                                          ctx->protocol, r->headers_in,
-                                          r->pool, r->connection->bucket_alloc);
-            /* reading may leave 0 length data buckets in the brigade,
-             * get rid of those. */
-            sanitize_brigade(bb);
-            APR_BRIGADE_INSERT_HEAD(bb, e);
-            ctx->state = REQ_BODY;
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
-                          "http1 request and headers parsed: %s %s %s",
-                          ctx->method, ctx->uri, ctx->protocol);
-            goto cleanup;
-
-        case REQ_BODY:
-            /* we should not come here */
-            AP_DEBUG_ASSERT(0);
-            rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
-            goto cleanup;
-
-        case REQ_ERROR:
-        default:
-            rv = APR_EINVAL;
-            goto cleanup;
         }
-    } /* while(APR_SUCCESS == rv) */
+        if (rc == DONE) {
+            /* No request line: closed, not worth an error response */
+            rv = ap_h1_head_parser_status(ctx->parser);
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
+                          "failed reading request line");
+            break;
+        }
+        if (rc != OK) {
+            /* Answered with an HTTP error bucket, terminal for parsing a
+             * request
+             */
+            http_status = rc;
+            if (head && head->u.req.method) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(00567)
+                              "request failed: error reading the headers (%i)",
+                              http_status);
+            }
+            else {
+                ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                              "failed reading request line (status %d)",
+                              http_status);
+            }
+            break;
+        }
 
-cleanup:
+        e = ap_bucket_request_createn(head->u.req.method, head->u.req.uri,
+                                      head->protocol, head->headers,
+                                      r->pool, r->connection->bucket_alloc);
+        APR_BRIGADE_INSERT_TAIL(bb, e);
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                      "http1 request and headers parsed: %s %s %s",
+                      head->u.req.method, head->u.req.uri, head->protocol);
+        /* Got the header, done with this filter */
+        ap_remove_input_filter(f);
+        ctx->state = REQ_BODY;
+        break;
+
+    case REQ_ERROR:
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                      "invalid request read while in error");
+        rv = APR_EINVAL;
+        break;
+
+    default:
+        /* we should never come here */
+        ap_assert(0);
+        break;
+    }
+
     if (http_status != HTTP_OK) {
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
-                      "failed reading request line, returning error bucket %d", http_status);
-        apr_brigade_cleanup(bb);
         e = ap_bucket_error_create(http_status, NULL, r->pool,
                                    f->c->bucket_alloc);
         APR_BRIGADE_INSERT_TAIL(bb, e);

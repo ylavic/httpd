@@ -530,6 +530,65 @@ static int scgi_request_status(int *status, request_rec *r)
 }
 
 
+/* Once the wait for the response failed: let reading it fail at once, as it
+ * would have failed after waiting in the blocking path, with APR_TIMEUP (a
+ * timeout of 1us, since 0 would give EAGAIN), hence the same status and log.
+ * Data arriving between the end of the wait and here is read as usual
+ * though, the response then succeeds. Returns whether it changed the
+ * timeout, the one to restore then in *timeout.
+ */
+static int scgi_fail_at_once(request_rec *r,
+                             proxy_conn_rec *backend,
+                             apr_interval_time_t *timeout)
+{
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = backend->sock;
+    pfd.reqevents = APR_POLLIN;
+    if (apr_poll(&pfd, 1, &nready, 0) == APR_SUCCESS) {
+        return 0;
+    }
+    apr_socket_timeout_get(backend->sock, timeout);
+    apr_socket_timeout_set(backend->sock, 1);
+    return 1;
+}
+
+/*
+ * The continuation of scgi_handler() once the backend's response is readable
+ * (or the wait for it failed): pass the response, release the backend and
+ * finish the request.
+ */
+static void scgi_response_continuation(request_rec *r, apr_status_t rv, void *baton)
+{
+    proxy_conn_rec *backend = baton;
+    apr_interval_time_t timeout = 0;
+    int status, restore = 0;
+
+    if (rv != APR_SUCCESS) {
+        /* A timeout is logged by the response's read ("Script timed out
+         * before returning headers"), not an interruption.
+         */
+        if (!APR_STATUS_IS_TIMEUP(rv)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "waiting for the response of %s:%u interrupted",
+                          backend->hostname, backend->port);
+        }
+        restore = scgi_fail_at_once(r, backend, &timeout);
+    }
+    status = pass_response(r, backend);
+    if (restore) {
+        apr_socket_timeout_set(backend->sock, timeout);
+    }
+
+    backend->close = 1; /* always close the socket */
+    ap_proxy_release_connection(PROXY_FUNCTION, backend, r->server);
+    ap_proxy_handler_done(r, status);
+}
+
 /*
  * This handles scgi:(dest) URLs
  */
@@ -541,6 +600,7 @@ static int scgi_handler(request_rec *r, proxy_worker *worker,
     proxy_conn_rec *backend = NULL;
     apr_pool_t *p = r->pool;
     apr_uri_t *uri;
+    apr_interval_time_t timeout;
     char dummy;
 
     if (ap_cstr_casecmpn(url, SCHEME "://", sizeof(SCHEME) + 2)) {
@@ -549,9 +609,12 @@ static int scgi_handler(request_rec *r, proxy_worker *worker,
         return DECLINED;
     }
 
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(PROXY_FUNCTION, &backend, worker,
-                                         r->server);
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released.
+     */
+    status = ap_proxy_acquire_connection_async(PROXY_FUNCTION, &backend, r,
+                                               scgi_handler, worker, conf,
+                                               url, proxyname, proxyport);
     if (status != OK) {
         goto cleanup;
     }
@@ -578,10 +641,19 @@ static int scgi_handler(request_rec *r, proxy_worker *worker,
     /* Step Three: Process the Request */
     if (   ((status = ap_setup_client_block(r, REQUEST_CHUNKED_ERROR)) != OK)
         || ((status = send_headers(r, backend)) != OK)
-        || ((status = send_request_body(r, backend)) != OK)
-        || ((status = pass_response(r, backend)) != OK)) {
+        || ((status = send_request_body(r, backend)) != OK)) {
         goto cleanup;
     }
+
+    /* Wait for the response without holding the thread if possible, then
+     * scgi_response_continuation() continues.
+     */
+    apr_socket_timeout_get(backend->sock, &timeout);
+    if (ap_proxy_wait(r, backend, AP_PROXY_BACKEND_IN, 0, timeout,
+                      scgi_response_continuation, backend) == SUSPENDED) {
+        return SUSPENDED;
+    }
+    status = pass_response(r, backend);
 
 cleanup:
     if (backend) {

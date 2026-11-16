@@ -16,6 +16,7 @@
 
 #include "mod_proxy.h"
 #include "mod_core.h"
+#include "ap_mpm.h"
 #include "apr_optional.h"
 #include "apr_strings.h"
 #include "scoreboard.h"
@@ -349,13 +350,45 @@ static const char *set_worker_param(apr_pool_t *p,
                                 (int)sizeof(worker->s->upgrade));
         }
     }
-    else if (!strcasecmp(key, "responsefieldsize")) {
+    else if (!strcasecmp(key, "limitresponsefieldsize")
+             || !strcasecmp(key, "responsefieldsize")) {
         long s = atol(val);
         if (s < 0) {
-            return "ResponseFieldSize must be greater than 0 bytes, or 0 for system default.";
+            return apr_psprintf(p, "%s must be a non-negative number of "
+                                "bytes (0 for the directory's limit)", key);
         }
-        worker->s->response_field_size = (s ? s : HUGE_STRING_LEN);
-        worker->s->response_field_size_set = 1;
+        worker->s->response_field_size = s;
+        worker->s->response_field_size_set = (s != 0);
+    }
+    else if (!strcasecmp(key, "limitresponseline")) {
+        long s = atol(val);
+        if (s < 0) {
+            return "limitresponseline must be a non-negative number of bytes "
+                   "(0 for the directory's limit)";
+        }
+        worker->s->limit_response_line = s;
+        worker->s->limit_response_line_set = (s != 0);
+    }
+    else if (!strcasecmp(key, "limitresponsefields")) {
+        long s = atol(val);
+        if (s < 0) {
+            return "limitresponsefields must be a non-negative number "
+                   "(0 for no limit)";
+        }
+        worker->s->limit_response_fields = s;
+        worker->s->limit_response_fields_set = 1;
+    }
+    else if (!strcasecmp(key, "httpprotocoloptions")) {
+        if (!strcasecmp(val, "Strict")) {
+            worker->s->http_unsafe = 0;
+        }
+        else if (!strcasecmp(val, "Unsafe")) {
+            worker->s->http_unsafe = 1;
+        }
+        else {
+            return "httpprotocoloptions must be Strict or Unsafe";
+        }
+        worker->s->http_unsafe_set = 1;
     }
     else if (!strcasecmp(key, "multipathtcp")) {
 #ifdef IPPROTO_MPTCP
@@ -1229,24 +1262,37 @@ static int proxy_needsdomain(request_rec *r, const char *url, const char *domain
 /* -------------------------------------------------------------- */
 /* Invoke handler */
 
+/* The state of proxy_handler()'s worker loop, kept when a scheme handler or
+ * a pre_request hook suspends the request (SUSPENDED) until it calls
+ * ap_proxy_handler_resume().
+ */
+typedef struct proxy_handler_ctx {
+    char *uri;
+    char *scheme;
+    proxy_server_conf *conf;
+    proxy_balancer *balancer;
+    proxy_worker *worker;
+    int attempts, max_attempts;
+    int direct_connect;
+    int via_proxy; /* suspended while trying a ProxyRemote */
+    int pre_request; /* suspended by a pre_request hook */
+} proxy_handler_ctx;
+
+static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
+                             int resumed, int access_status);
+
 static int proxy_handler(request_rec *r)
 {
     char *uri, *scheme, *p;
-    const char *p2;
     void *sconf = r->server->module_config;
     proxy_server_conf *conf = (proxy_server_conf *)
         ap_get_module_config(sconf, &proxy_module);
-    apr_array_header_t *proxies = conf->proxies;
-    struct proxy_remote *ents = (struct proxy_remote *) proxies->elts;
-    int rc = DECLINED, access_status, i;
+    int rc = DECLINED, i;
     int direct_connect = 0;
     const char *str;
     apr_int64_t maxfwd;
-    proxy_balancer *balancer = NULL;
-    proxy_worker *worker = NULL;
-    int attempts = 0, max_attempts = 0;
     struct dirconn_entry *list = (struct dirconn_entry *)conf->dirconn->elts;
-    int saved_status;
+    proxy_handler_ctx *x;
 
     /* is this for us? */
     if (!r->filename) {
@@ -1383,10 +1429,65 @@ static int proxy_handler(request_rec *r)
                 r->uri);
 #endif
 
+    x = apr_pcalloc(r->pool, sizeof(*x));
+    x->uri = uri;
+    x->scheme = scheme;
+    x->conf = conf;
+    x->direct_connect = direct_connect;
+    return proxy_handler_run(r, x, 0, DECLINED);
+}
+
+/* The worker loop of proxy_handler(): elect a worker, run the scheme handler
+ * on it, fail over to another one (balancer) if needed, and run the
+ * post_request hooks once done. If the scheme handler suspends the request,
+ * the loop is resumed by ap_proxy_handler_resume() with the status of the
+ * attempt (resumed != 0), as if the scheme handler had returned it. If a
+ * pre_request hook suspends it, the loop is resumed there: with OK the hooks
+ * run again, otherwise the status is taken as theirs.
+ */
+static int proxy_handler_run(request_rec *r, proxy_handler_ctx *x,
+                             int resumed, int access_status)
+{
+    char *uri = x->uri;
+    char *scheme = x->scheme;
+    proxy_server_conf *conf = x->conf;
+    apr_array_header_t *proxies = conf->proxies;
+    struct proxy_remote *ents = (struct proxy_remote *) proxies->elts;
+    proxy_balancer *balancer = x->balancer;
+    proxy_worker *worker = x->worker;
+    int attempts = x->attempts, max_attempts = x->max_attempts;
+    int direct_connect = x->direct_connect;
+    char *url = uri;
+    const char *p2;
+    int i, saved_status;
+
+    if (resumed) {
+        if (x->pre_request) {
+            x->pre_request = 0;
+            if (access_status == OK) {
+                goto pre_request;
+            }
+            goto pre_request_done;
+        }
+        if (x->via_proxy) {
+            /* No fallback to a direct connection after an async attempt
+             * through a ProxyRemote (yet).
+             */
+            goto cleanup;
+        }
+        goto resumed;
+    }
+
     do {
-        char *url = uri;
+pre_request:
+        url = uri;
         /* Try to obtain the most suitable worker */
         access_status = ap_proxy_pre_request(&worker, &balancer, r, conf, &url);
+pre_request_done:
+        if (access_status == SUSPENDED) {
+            x->pre_request = 1;
+            goto suspended;
+        }
         if (access_status != OK) {
             /*
              * Only return if access_status is not HTTP_SERVICE_UNAVAILABLE
@@ -1440,6 +1541,11 @@ static int proxy_handler(request_rec *r)
 
                     if (ents[i].creds) apr_table_unset(r->notes, "proxy-basic-creds");
 
+                    if (access_status == SUSPENDED) {
+                        x->via_proxy = 1;
+                        goto suspended;
+                    }
+
                     /* Did the scheme handler process the request? */
                     if (access_status != DECLINED) {
                         const char *cl_a;
@@ -1489,6 +1595,10 @@ static int proxy_handler(request_rec *r)
         AP_PROXY_RUN(r, worker, conf, url, attempts);
         access_status = proxy_run_scheme_handler(r, worker, conf,
                                                  url, NULL, 0);
+        if (access_status == SUSPENDED) {
+            goto suspended;
+        }
+resumed:
         if (access_status == OK
                 || apr_table_get(r->notes, "proxy-error-override"))
             break;
@@ -1568,6 +1678,31 @@ cleanup:
     AP_PROXY_RUN_FINISHED(r, attempts, access_status);
 
     return access_status;
+
+suspended:
+    /* The scheme handler (or pre_request hook) continues asynchronously, and
+     * calls ap_proxy_handler_resume() with its status once done.
+     */
+    x->balancer = balancer;
+    x->worker = worker;
+    x->attempts = attempts;
+    x->max_attempts = max_attempts;
+    ap_proxy_req_async(r)->handler = x;
+    return SUSPENDED;
+}
+
+PROXY_DECLARE(int) ap_proxy_handler_resume(request_rec *r, int status)
+{
+    proxy_req_conf *rconf = ap_get_module_config(r->request_config,
+                                                 &proxy_module);
+    proxy_handler_ctx *x = (rconf && rconf->async) ? rconf->async->handler
+                                                   : NULL;
+
+    if (!x) {
+        return status; /* not suspended by proxy_handler()'s loop */
+    }
+    rconf->async->handler = NULL;
+    return proxy_handler_run(r, x, 1, status);
 }
 
 /* -------------------------------------------------------------- */
@@ -1610,8 +1745,6 @@ static void * create_proxy_config(apr_pool_t *p, server_rec *s)
     ps->maxfwd_set = 0;
     ps->timeout = 0;
     ps->timeout_set = 0;
-    ps->badopt = bad_error;
-    ps->badopt_set = 0;
     ps->source_address = NULL;
     ps->source_address_set = 0;
     apr_pool_create_ex(&ps->pool, p, NULL, NULL);
@@ -1767,8 +1900,6 @@ static void * merge_proxy_config(apr_pool_t *p, void *basev, void *overridesv)
     ps->maxfwd_set = overrides->maxfwd_set || base->maxfwd_set;
     ps->timeout = (overrides->timeout_set == 0) ? base->timeout : overrides->timeout;
     ps->timeout_set = overrides->timeout_set || base->timeout_set;
-    ps->badopt = (overrides->badopt_set == 0) ? base->badopt : overrides->badopt;
-    ps->badopt_set = overrides->badopt_set || base->badopt_set;
     ps->proxy_status = (overrides->proxy_status_set == 0) ? base->proxy_status : overrides->proxy_status;
     ps->proxy_status_set = overrides->proxy_status_set || base->proxy_status_set;
     ps->source_address = (overrides->source_address_set == 0) ? base->source_address : overrides->source_address;
@@ -1816,7 +1947,7 @@ static void *create_proxy_dir_config(apr_pool_t *p, char *dummy)
     new->add_forwarded_headers_set = 0;
     new->forward_100_continue = 1;
     new->forward_100_continue_set = 0;
-    new->async_delay = -1;
+    new->async_delay = 0; /* asynchronous when the MPM can wait */
 
     return (void *) new;
 }
@@ -1887,6 +2018,25 @@ static void *merge_proxy_dir_config(apr_pool_t *p, void *basev, void *addv)
                                            : add->async_idle_timeout;
     new->async_idle_timeout_set = add->async_idle_timeout_set
                                   || base->async_idle_timeout_set;
+
+    new->http_unsafe = (add->http_unsafe_set) ? add->http_unsafe
+                                              : base->http_unsafe;
+    new->http_unsafe_set = add->http_unsafe_set || base->http_unsafe_set;
+    new->limit_response_line = (add->limit_response_line_set)
+                               ? add->limit_response_line
+                               : base->limit_response_line;
+    new->limit_response_line_set = add->limit_response_line_set
+                                   || base->limit_response_line_set;
+    new->limit_response_fieldsize = (add->limit_response_fieldsize_set)
+                                    ? add->limit_response_fieldsize
+                                    : base->limit_response_fieldsize;
+    new->limit_response_fieldsize_set = add->limit_response_fieldsize_set
+                                        || base->limit_response_fieldsize_set;
+    new->limit_response_fields = (add->limit_response_fields_set)
+                                 ? add->limit_response_fields
+                                 : base->limit_response_fields;
+    new->limit_response_fields_set = add->limit_response_fields_set
+                                     || base->limit_response_fields_set;
 
     return new;
 }
@@ -2487,6 +2637,56 @@ static const char *
 }
 
 static const char *
+    set_proxy_http_protocol_options(cmd_parms *parms, void *dconf,
+                                    const char *arg)
+{
+    proxy_dir_conf *conf = dconf;
+    if (!strcasecmp(arg, "Strict")) {
+        conf->http_unsafe = 0;
+    }
+    else if (!strcasecmp(arg, "Unsafe")) {
+        conf->http_unsafe = 1;
+    }
+    else {
+        return "ProxyHttpProtocolOptions must be Strict or Unsafe";
+    }
+    conf->http_unsafe_set = 1;
+    return NULL;
+}
+
+/* ProxyLimitResponseLine, ProxyLimitResponseFieldSize and
+ * ProxyLimitResponseFields (cmd->info: which), non-negative integers as
+ * their LimitRequest* counterparts
+ */
+static const char *
+    set_proxy_limit_response(cmd_parms *parms, void *dconf, const char *arg)
+{
+    proxy_dir_conf *conf = dconf;
+    const char *which = parms->info;
+    char *end;
+    apr_int64_t lim;
+
+    lim = apr_strtoi64(arg, &end, 10);
+    if (*end || end == arg || lim < 0 || lim > APR_INT32_MAX) {
+        return apr_pstrcat(parms->temp_pool, parms->cmd->name, " \"", arg,
+                           "\" must be a non-negative integer", NULL);
+    }
+    if (!strcmp(which, "line")) {
+        conf->limit_response_line = (apr_size_t)lim;
+        conf->limit_response_line_set = 1;
+    }
+    else if (!strcmp(which, "fieldsize")) {
+        conf->limit_response_fieldsize = (apr_size_t)lim;
+        conf->limit_response_fieldsize_set = 1;
+    }
+    else {
+        conf->limit_response_fields = (unsigned int)lim;
+        conf->limit_response_fields_set = 1;
+    }
+    return NULL;
+}
+
+static const char *
     set_proxy_async_idle(cmd_parms *parms, void *dconf, const char *arg)
 {
     proxy_dir_conf *conf = dconf;
@@ -2575,27 +2775,6 @@ static const char*
     }
 
     psf->viaopt_set = 1;
-    return NULL;
-}
-
-static const char*
-    set_bad_opt(cmd_parms *parms, void *dummy, const char *arg)
-{
-    proxy_server_conf *psf =
-    ap_get_module_config(parms->server->module_config, &proxy_module);
-
-    if (strcasecmp(arg, "IsError") == 0)
-        psf->badopt = bad_error;
-    else if (strcasecmp(arg, "Ignore") == 0)
-        psf->badopt = bad_ignore;
-    else if (strcasecmp(arg, "StartBody") == 0)
-        psf->badopt = bad_body;
-    else {
-        return "ProxyBadHeader must be one of: "
-            "IsError | Ignore | StartBody";
-    }
-
-    psf->badopt_set = 1;
     return NULL;
 }
 
@@ -3076,8 +3255,6 @@ static const command_rec proxy_cmds[] =
     AP_INIT_TAKE1("ProxyTimeout", set_proxy_timeout, NULL, RSRC_CONF,
      "Set the timeout (in seconds) for a proxied connection. "
      "This overrides the server timeout"),
-    AP_INIT_TAKE1("ProxyBadHeader", set_bad_opt, NULL, RSRC_CONF,
-     "How to handle bad header line in response: IsError | Ignore | StartBody"),
     AP_INIT_RAW_ARGS("BalancerMember", add_member, NULL, RSRC_CONF|ACCESS_CONF,
      "A balancer name and scheme with list of params"),
     AP_INIT_TAKE1("BalancerGrowth", set_bgrowth, NULL, RSRC_CONF,
@@ -3105,6 +3282,21 @@ static const command_rec proxy_cmds[] =
      "Amount of time to poll before going asynchronous"),
     AP_INIT_TAKE1("ProxyAsyncIdleTimeout", set_proxy_async_idle, NULL, RSRC_CONF|ACCESS_CONF,
      "Timeout for asynchronous inactivity, ProxyTimeout by default"),
+    AP_INIT_TAKE1("ProxyHttpProtocolOptions", set_proxy_http_protocol_options,
+     NULL, RSRC_CONF|ACCESS_CONF,
+     "'Strict' (default) or 'Unsafe': the rules of the backends' HTTP/1 "
+     "response heads, as HttpProtocolOptions' for the requests"),
+    AP_INIT_TAKE1("ProxyLimitResponseLine", set_proxy_limit_response,
+     "line", RSRC_CONF|ACCESS_CONF,
+     "Limit on the backends' HTTP/1 status line length (8190 by default)"),
+    AP_INIT_TAKE1("ProxyLimitResponseFieldSize", set_proxy_limit_response,
+     "fieldsize", RSRC_CONF|ACCESS_CONF,
+     "Limit on the backends' HTTP/1 response header field length (8190 by "
+     "default)"),
+    AP_INIT_TAKE1("ProxyLimitResponseFields", set_proxy_limit_response,
+     "fields", RSRC_CONF|ACCESS_CONF,
+     "Limit on the number of the backends' HTTP/1 response headers "
+     "(100 by default, 0 for no limit)"),
     {NULL}
 };
 
@@ -3155,6 +3347,133 @@ PROXY_DECLARE(const char *) ap_proxy_ssl_val(apr_pool_t *p, server_rec *s,
     return ap_ssl_var_lookup(p, s, c, r, var);
 }
 
+/* The timeouts of the waits in the MPM (ap_mpm_register_wait()), collected
+ * for ap_mpm_register_timeouts(): the connect's, less ProxyAsyncDelay after
+ * the first poll (proxy_http_connect()), separately.
+ */
+typedef struct {
+    apr_array_header_t *timeouts;
+    apr_array_header_t *connects;
+    apr_array_header_t *delays;
+} proxy_wait_timeouts;
+
+static void proxy_wait_timeout_add(apr_array_header_t *a,
+                                   apr_interval_time_t t)
+{
+    if (t >= 0) {
+        APR_ARRAY_PUSH(a, apr_interval_time_t) = t;
+    }
+}
+
+static void proxy_wait_timeouts_dir(proxy_wait_timeouts *wt,
+                                    ap_conf_vector_t *section)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(section, &proxy_module);
+
+    if (!dconf) {
+        return;
+    }
+    if (dconf->async_idle_timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, dconf->async_idle_timeout);
+    }
+    if (dconf->async_delay > 0) {
+        proxy_wait_timeout_add(wt->delays, dconf->async_delay);
+    }
+}
+
+static void proxy_wait_timeouts_dirs(proxy_wait_timeouts *wt,
+                                     apr_array_header_t *sections)
+{
+    ap_conf_vector_t **elts = (ap_conf_vector_t **)sections->elts;
+    int i;
+
+    for (i = 0; i < sections->nelts; i++) {
+        proxy_wait_timeouts_dir(wt, elts[i]);
+    }
+}
+
+static void proxy_wait_timeouts_worker(proxy_wait_timeouts *wt,
+                                       proxy_worker *worker)
+{
+    if (worker->s->timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->timeout);
+        proxy_wait_timeout_add(wt->connects, worker->s->timeout);
+    }
+    if (worker->s->conn_timeout_set) {
+        proxy_wait_timeout_add(wt->connects, worker->s->conn_timeout);
+    }
+    if (worker->s->ping_timeout_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->ping_timeout);
+    }
+    if (worker->s->acquire_set) {
+        proxy_wait_timeout_add(wt->timeouts, worker->s->acquire);
+    }
+}
+
+/* Declare the timeouts of the waits to the MPM (a hint): the vhosts' Timeout,
+ * ProxyTimeout, the workers' timeout, connectiontimeout, ping and acquire, and
+ * ProxyAsyncIdleTimeout, i.e. the fixed ones (not what's left of the request
+ * read timeouts of mod_reqtimeout); the connect timeouts with and without
+ * each ProxyAsyncDelay.
+ */
+static void proxy_declare_wait_timeouts(apr_pool_t *p, server_rec *main_s)
+{
+    proxy_wait_timeouts wt;
+    apr_interval_time_t *c, *d;
+    server_rec *s;
+    int i, j;
+
+    wt.timeouts = apr_array_make(p, 16, sizeof(apr_interval_time_t));
+    wt.connects = apr_array_make(p, 8, sizeof(apr_interval_time_t));
+    wt.delays = apr_array_make(p, 4, sizeof(apr_interval_time_t));
+
+    for (s = main_s; s; s = s->next) {
+        proxy_server_conf *sconf = ap_get_module_config(s->module_config,
+                                                        &proxy_module);
+        core_server_config *core = ap_get_core_module_config(s->module_config);
+        proxy_balancer *balancer;
+        proxy_worker *worker;
+
+        proxy_wait_timeout_add(wt.timeouts, s->timeout);
+        proxy_wait_timeout_add(wt.connects, s->timeout);
+        if (sconf->timeout_set) {
+            proxy_wait_timeout_add(wt.timeouts, sconf->timeout);
+            proxy_wait_timeout_add(wt.connects, sconf->timeout);
+        }
+
+        worker = (proxy_worker *)sconf->workers->elts;
+        for (i = 0; i < sconf->workers->nelts; i++) {
+            proxy_wait_timeouts_worker(&wt, &worker[i]);
+        }
+        balancer = (proxy_balancer *)sconf->balancers->elts;
+        for (i = 0; i < sconf->balancers->nelts; i++) {
+            proxy_worker **workers = (proxy_worker **)
+                                     balancer[i].workers->elts;
+            for (j = 0; j < balancer[i].workers->nelts; j++) {
+                proxy_wait_timeouts_worker(&wt, workers[j]);
+            }
+        }
+
+        proxy_wait_timeouts_dir(&wt, s->lookup_defaults);
+        proxy_wait_timeouts_dirs(&wt, sconf->sec_proxy);
+        proxy_wait_timeouts_dirs(&wt, core->sec_dir);
+        proxy_wait_timeouts_dirs(&wt, core->sec_url);
+    }
+
+    c = (apr_interval_time_t *)wt.connects->elts;
+    d = (apr_interval_time_t *)wt.delays->elts;
+    for (i = 0; i < wt.connects->nelts; i++) {
+        proxy_wait_timeout_add(wt.timeouts, c[i]);
+        for (j = 0; j < wt.delays->nelts; j++) {
+            if (c[i] > d[j]) {
+                proxy_wait_timeout_add(wt.timeouts, c[i] - d[j]);
+            }
+        }
+    }
+
+    (void)ap_mpm_register_timeouts(wt.timeouts);
+}
+
 static int proxy_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                              apr_pool_t *ptemp, server_rec *main_s)
 {
@@ -3172,6 +3491,8 @@ static int proxy_post_config(apr_pool_t *pconf, apr_pool_t *plog,
     proxy_ssl_engine = APR_RETRIEVE_OPTIONAL_FN(ssl_engine_set);
     ap_proxy_strmatch_path = apr_strmatch_precompile(pconf, "path=", 0);
     ap_proxy_strmatch_domain = apr_strmatch_precompile(pconf, "domain=", 0);
+
+    proxy_declare_wait_timeouts(ptemp, main_s);
 
     for (; s; s = s->next) {
         int rc, i;

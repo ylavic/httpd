@@ -45,9 +45,16 @@ AP_DECLARE_DATA ap_listen_rec *ap_listeners = NULL;
  * be printed by ap_log_mpm_common(), but keep the listeners
  * buckets static since it is used only here to close them
  * all (including duplicated) with ap_close_listeners().
+ *
+ * The duplicated listeners (buckets 1..N-1) live in the process pool, like
+ * ap_listeners (bucket 0), and are kept across restarts in ap_listen_buckets
+ * so that the next ap_duplicate_listeners() can reuse them (num_dup_buckets
+ * of them, in an array of listen_buckets_size).
  */
 AP_DECLARE_DATA int ap_num_listen_buckets;
 static ap_listen_rec **ap_listen_buckets;
+static int num_dup_buckets;
+static int listen_buckets_size;
 
 /* Determine once, at runtime, whether or not SO_REUSEPORT
  * is usable on this platform, and hence whether or not
@@ -461,8 +468,8 @@ static const char *alloc_listener(process_rec *process, const char *addr,
                                   apr_pool_t *temp_pool, apr_uint32_t flags)
 {
     ap_listen_rec *last;
+    apr_sockaddr_t *sa, *next_sa;
     apr_status_t status;
-    apr_sockaddr_t *sa;
 
     /* see if we've got a listener for this address:port, which is an error */
     if (find_listeners(&ap_listeners, NULL, addr, port, scope_id, temp_pool)) {
@@ -493,7 +500,7 @@ static const char *alloc_listener(process_rec *process, const char *addr,
         last = last->next;
     }
 
-    while (sa) {
+    for (; sa; sa = next_sa) {
         ap_listen_rec *new;
         int sock_proto = 0;
 
@@ -502,16 +509,17 @@ static const char *alloc_listener(process_rec *process, const char *addr,
             sock_proto = IPPROTO_MPTCP;
 #endif
 
+        /* Each listener has its own (unlinked) address */
+        next_sa = sa->next;
+        sa->next = NULL;
+
         /* this has to survive restarts */
         new = apr_palloc(process->pool, sizeof(ap_listen_rec));
         new->active = 0;
-        new->next = 0;
+        new->next = NULL;
         new->bind_addr = sa;
         new->protocol = apr_pstrdup(process->pool, proto);
         new->flags = flags;
-
-        /* Go to the next sockaddr. */
-        sa = sa->next;
 
         status = apr_socket_create(&new->sd, new->bind_addr->family,
                                     SOCK_STREAM, sock_proto, process->pool);
@@ -820,6 +828,32 @@ AP_DECLARE(int) ap_setup_listeners(server_rec *s)
     return num_listeners;
 }
 
+/* Unlink and return the listener of the list *from which duplicates lr (same
+ * address, port, scope, protocol and flags), or NULL if none.
+ */
+static ap_listen_rec *take_dup_listener(ap_listen_rec **from,
+                                        const ap_listen_rec *lr)
+{
+    const apr_sockaddr_t *sa = lr->bind_addr;
+
+    for (; *from; from = &(*from)->next) {
+        ap_listen_rec *dup = *from;
+        const apr_sockaddr_t *dsa = dup->bind_addr;
+
+        if (dsa && dup->flags == lr->flags
+            && dsa->salen == sa->salen
+            && memcmp(&dsa->sa, &sa->sa, sa->salen) == 0
+            && ((!dup->protocol && !lr->protocol)
+                || (dup->protocol && lr->protocol
+                    && strcmp(dup->protocol, lr->protocol) == 0))) {
+            *from = dup->next;
+            dup->next = NULL;
+            return dup;
+        }
+    }
+    return NULL;
+}
+
 AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
                                                 ap_listen_rec ***buckets,
                                                 int *num_buckets)
@@ -828,7 +862,9 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
     int i;
     apr_status_t stat;
     int use_nonblock = 0;
+    int reuse = 1;
     ap_listen_rec *lr;
+    apr_pool_t *pproc = s->process->pool;
 
     if (*num_buckets < 1) {
         *num_buckets = 1;
@@ -858,51 +894,71 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
         }
     }
 
+#ifdef HAVE_SYSTEMD
+    /* The duplicates of systemd's listeners share their sockets, which are
+     * never closed here: don't reuse nor close them.
+     */
+    if (use_systemd) {
+        reuse = 0;
+    }
+#endif
+
     *buckets = apr_pcalloc(p, *num_buckets * sizeof(ap_listen_rec *));
     (*buckets)[0] = ap_listeners;
 
+    /* Like ap_listeners across restarts, reuse the previous generation's
+     * listeners of each bucket that match the new ones, so that the sockets
+     * (and the connections queued on them) live on in the SO_REUSEPORT group;
+     * the ones not reused are closed below.  New listeners are allocated in
+     * the process pool, for the same lifetime.
+     */
     for (i = 1; i < *num_buckets; i++) {
         ap_listen_rec *last = NULL;
         lr = ap_listeners;
         while (lr) {
-            ap_listen_rec *duplr;
-            char *hostname;
-            apr_port_t port;
-            apr_sockaddr_t *sa;
+            ap_listen_rec *duplr = NULL;
             int sock_proto = 0;
+            if (reuse && i < num_dup_buckets) {
+                duplr = take_dup_listener(&ap_listen_buckets[i], lr);
+            }
+            if (duplr) {
+                /* reused, already bound and listening */
+            }
 #ifdef HAVE_SYSTEMD
-            if (use_systemd) {
+            else if (use_systemd) {
                 int thesock;
                 apr_os_sock_get(&thesock, lr->sd);
                 if ((stat = alloc_systemd_listener(s->process, thesock,
-                    lr->protocol, &duplr)) != APR_SUCCESS) {
+                                                   lr->protocol, &duplr))) {
                     return stat;
                 }
             }
-            else
 #endif
-            {
-                duplr = apr_palloc(p, sizeof(ap_listen_rec));
-                duplr->slave = NULL;
-                duplr->protocol = apr_pstrdup(p, lr->protocol);
-                hostname = apr_pstrdup(p, lr->bind_addr->hostname);
-                port = lr->bind_addr->port;
-                stat = apr_sockaddr_info_get(&sa, hostname, APR_UNSPEC, port, 0, p);
+            else {
+                duplr = apr_pcalloc(pproc, sizeof(ap_listen_rec));
+                duplr->protocol = apr_pstrdup(pproc, lr->protocol);
+                duplr->flags = lr->flags;
+#if APR_VERSION_AT_LEAST(1,6,0)
+                stat = apr_sockaddr_info_copy(&duplr->bind_addr,
+                                              lr->bind_addr, pproc);
+#else
+                stat = apr_sockaddr_info_get(&duplr->bind_addr,
+                                             lr->bind_addr->hostname,
+                                             lr->bind_addr->family,
+                                             lr->bind_addr->port, 0, pproc);
+#endif
                 if (stat != APR_SUCCESS) {
                     ap_log_perror(APLOG_MARK, APLOG_CRIT, stat, p, APLOGNO(10397)
-                                  "failure looking up %s to duplicate "
-                                  "listening socket", hostname);
+                                  "failure duplicating address %pI for "
+                                  "listening socket", lr->bind_addr);
                     return stat;
                 }
-                duplr->bind_addr = sa;
-                duplr->next = NULL;
-                duplr->flags = lr->flags;
 #ifdef IPPROTO_MPTCP
                 if (duplr->flags & AP_LISTEN_MPTCP)
                     sock_proto = IPPROTO_MPTCP;
 #endif
                 stat = apr_socket_create(&duplr->sd, duplr->bind_addr->family,
-                                         SOCK_STREAM, sock_proto, p);
+                                         SOCK_STREAM, sock_proto, pproc);
                 if (stat != APR_SUCCESS) {
                     ap_log_perror(APLOG_MARK, APLOG_CRIT, 0, p, APLOGNO(02640)
                                 "ap_duplicate_listeners: for address %pI, "
@@ -910,7 +966,7 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
                                 duplr->bind_addr);
                     return stat;
                 }
-                stat = make_sock(p, duplr, 1);
+                stat = make_sock(pproc, duplr, 1);
                 if (stat != APR_SUCCESS) {
                     return stat;
                 }
@@ -937,9 +993,33 @@ AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
         }
     }
 
-    ap_listen_buckets = *buckets;
+    /* Close the previous generation's listeners not reused (the children of
+     * that generation still have them open until they exit).  The connections
+     * queued on a socket when its last descriptor is closed are reset, unless
+     * the system migrates them to another socket of the SO_REUSEPORT group
+     * (net.ipv4.tcp_migrate_req=1 on Linux 5.14+).
+     */
+    if (reuse) {
+        for (i = 1; i < num_dup_buckets; i++) {
+            ap_close_listeners_ex(ap_listen_buckets[i]);
+        }
+    }
+
+    /* Keep the buckets for ap_close_listeners() and the next generation */
+    if (listen_buckets_size < *num_buckets) {
+        listen_buckets_size = *num_buckets;
+        ap_listen_buckets = apr_palloc(pproc, listen_buckets_size
+                                              * sizeof(ap_listen_rec *));
+    }
+    memcpy(ap_listen_buckets, *buckets, *num_buckets * sizeof(ap_listen_rec *));
+    num_dup_buckets = *num_buckets;
     ap_num_listen_buckets = *num_buckets;
     return APR_SUCCESS;
+}
+
+AP_DECLARE(int) ap_get_listen_buckets_ratio(void)
+{
+    return ap_listencbratio;
 }
 
 AP_DECLARE_NONSTD(void) ap_close_listeners(void)
@@ -949,10 +1029,11 @@ AP_DECLARE_NONSTD(void) ap_close_listeners(void)
     ap_close_listeners_ex(ap_listeners);
 
     /* Start from index 1 since either ap_duplicate_listeners()
-     * was called and ap_listen_buckets[0] == ap_listeners, or
-     * it wasn't and ap_num_listen_buckets == 0.
+     * was called and ap_listen_buckets[0] == ap_listeners (in this
+     * generation or the previous one), or it wasn't and num_dup_buckets
+     * == 0.
      */
-    for (i = 1; i < ap_num_listen_buckets; i++) {
+    for (i = 1; i < num_dup_buckets; i++) {
         ap_close_listeners_ex(ap_listen_buckets[i]);
     }
 }
@@ -987,7 +1068,7 @@ AP_DECLARE(void) ap_listen_pre_config(void)
 {
     old_listeners = ap_listeners;
     ap_listeners = NULL;
-    ap_listen_buckets = NULL;
+    /* ap_listen_buckets are kept for ap_duplicate_listeners() to reuse */
     ap_num_listen_buckets = 0;
     ap_listenbacklog = DEFAULT_LISTENBACKLOG;
     ap_listentcpdeferaccept = DEFAULT_TCP_DEFER_ACCEPT;

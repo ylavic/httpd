@@ -2574,9 +2574,33 @@ AP_DECLARE(request_rec *) ap_sub_req_lookup_file(const char *new_file,
     return rnew;
 }
 
+/* The asynchronous state of the top-level request of r's tree, if any */
+static ap_request_async_t *subreq_top_async(request_rec *r)
+{
+    core_request_config *req_cfg;
+    request_rec *top = r;
+
+    while (top->main) {
+        top = top->main;
+    }
+    req_cfg = ap_get_core_module_config(top->request_config);
+    if (req_cfg && req_cfg->async && req_cfg->async->r == top) {
+        return req_cfg->async;
+    }
+    return NULL;
+}
+
 AP_DECLARE(int) ap_run_sub_req(request_rec *r)
 {
+    ap_request_async_t *top = subreq_top_async(r);
     int retval = DECLINED;
+
+    /* In progress: the main request's filters can't hold their output while
+     * the subrequest's may go through them
+     */
+    if (top) {
+        top->subreqs++;
+    }
     /* Run the quick handler if the subrequest is not a dirent or file
      * subrequest
      */
@@ -2590,11 +2614,29 @@ AP_DECLARE(int) ap_run_sub_req(request_rec *r)
         retval = OK;
     }
     ap_finalize_sub_req_protocol(r);
+    if (top) {
+        top->subreqs--;
+    }
     return retval;
 }
 
 AP_DECLARE(void) ap_destroy_sub_req(request_rec *r)
 {
+    core_request_config *req_cfg;
+
+    /* A subrequest run by ap_run_sub_req_async() that hasn't completed is
+     * still used (its continuations): its pool goes with the main request's
+     */
+    req_cfg = ap_get_core_module_config(r->request_config);
+    if (req_cfg && req_cfg->async && req_cfg->async->r == r
+        && req_cfg->async->phase != AP_REQUEST_PHASE_DONE) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "subrequest destroyed before it completed "
+                      "(ap_run_sub_req_async()): ignored");
+        AP_DEBUG_ASSERT(0);
+        return;
+    }
+
     /* Reclaim the space */
     apr_pool_destroy(r->pool);
 }

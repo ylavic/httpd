@@ -18,6 +18,7 @@
 #include "http_config.h"
 #include "http_log.h"
 #include "util_filter.h"
+#include "http_request.h"
 
 #include "mod_ratelimit.h"
 
@@ -36,6 +37,9 @@ typedef struct rl_ctx_t
     int chunk_size;
     int burst;
     int do_sleep;
+    int sleep_only;      /* the core refused to pace (or a FLUSH): sleep */
+    int paced;           /* paced until due (ap_filter_pending_until()) */
+    apr_time_t due;
     rl_state_e state;
     apr_bucket_brigade *tmpbb;
     apr_bucket_brigade *holdingbb;
@@ -111,6 +115,9 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         ctx->speed = ratelimit;
         ctx->burst = burst;
         ctx->do_sleep = 0;
+        ctx->sleep_only = 0;
+        ctx->paced = 0;
+        ctx->due = 0;
 
         /* calculate how many bytes / interval we want to send */
         /* speed is bytes / second, so, how many  (speed / 1000 % interval) */
@@ -118,8 +125,39 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         ctx->tmpbb = apr_brigade_create(f->r->pool, ba);
         ctx->holdingbb = apr_brigade_create(f->r->pool, ba);
     }
+    else if (ctx->paced) {
+        /* Paced: called by the core once due, else passed more meanwhile
+         * (by a producer not backing off), kept behind what's held
+         */
+        if (apr_time_now() < ctx->due) {
+            return ap_save_brigade(f, &ctx->holdingbb, &bb, f->r->pool);
+        }
+        ctx->paced = 0;
+        ctx->do_sleep = 0; /* waited already */
+        APR_BRIGADE_PREPEND(bb, ctx->holdingbb);
+    }
     else {
         APR_BRIGADE_PREPEND(bb, ctx->holdingbb);
+    }
+
+    /* A FLUSH keeps its meaning: what comes before it is paced blocking
+     * (sleeping), as without the core's pacing. A WC (e.g. from mod_proxy
+     * streaming) doesn't force a short chunk out when the core paces: each
+     * chunk gets its own.
+     */
+    if (!ctx->sleep_only) {
+        apr_bucket *e, *next;
+        for (e = APR_BRIGADE_FIRST(bb); e != APR_BRIGADE_SENTINEL(bb);
+             e = next) {
+            next = APR_BUCKET_NEXT(e);
+            if (AP_BUCKET_IS_WC(e)) {
+                apr_bucket_delete(e);
+            }
+            else if (APR_BUCKET_IS_FLUSH(e)) {
+                ctx->sleep_only = 1;
+                break;
+            }
+        }
     }
 
     while (!APR_BRIGADE_EMPTY(bb)) {
@@ -211,7 +249,11 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *bb)
                         /* Wait for more (or next call) */
                         break;
                     }
-                    e = apr_bucket_flush_create(ba);
+                    /* Each chunk goes out on its own: a FLUSH, or when the
+                     * core paces the output a WC (no blocking write)
+                     */
+                    e = (ctx->sleep_only) ? apr_bucket_flush_create(ba)
+                                          : ap_bucket_wc_create(ba);
                     APR_BRIGADE_INSERT_TAIL(ctx->tmpbb, e);
                 }
 
@@ -220,7 +262,24 @@ rate_limit_filter(ap_filter_t *f, apr_bucket_brigade *bb)
                 brigade_dump(f->r, bb);
 #endif /* RLFDEBUG */
 
-                if (ctx->do_sleep) {
+                if (ctx->do_sleep && !ctx->sleep_only) {
+                    /* Hold the chunk and the rest until the next interval
+                     * without sleeping, the core calling us again then
+                     */
+                    ctx->due = apr_time_now()
+                               + apr_time_from_msec(RATE_INTERVAL_MS);
+                    rv = ap_filter_pending_until(f, ctx->due);
+                    if (rv == APR_SUCCESS) {
+                        ctx->paced = 1;
+                        APR_BRIGADE_CONCAT(ctx->tmpbb, bb);
+                        return ap_save_brigade(f, &ctx->holdingbb,
+                                               &ctx->tmpbb, f->r->pool);
+                    }
+                    if (rv != APR_EAGAIN) {
+                        ctx->sleep_only = 1;
+                    }
+                }
+                if (ctx->do_sleep && ctx->sleep_only) {
                     apr_sleep(RATE_INTERVAL_MS * 1000);
                 }
                 else {

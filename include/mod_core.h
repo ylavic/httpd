@@ -41,7 +41,7 @@ extern "C" {
 
 /* Handles for core filters */
 AP_DECLARE_DATA extern ap_filter_rec_t *ap_http_input_filter_handle;
-AP_DECLARE_DATA extern ap_filter_rec_t *ap_h1_request_in_filter_handle;
+AP_DECLARE_DATA extern ap_filter_rec_t *ap_h1_header_in_filter_handle;
 AP_DECLARE_DATA extern ap_filter_rec_t *ap_h1_body_in_filter_handle;
 AP_DECLARE_DATA extern ap_filter_rec_t *ap_http_header_filter_handle;
 AP_DECLARE_DATA extern ap_filter_rec_t *ap_chunk_filter_handle;
@@ -55,9 +55,9 @@ apr_status_t ap_http_filter(ap_filter_t *f, apr_bucket_brigade *b,
                             ap_input_mode_t mode, apr_read_type_e block,
                             apr_off_t readbytes);
 
-apr_status_t ap_h1_request_in_filter(ap_filter_t *f, apr_bucket_brigade *bb,
-                                     ap_input_mode_t mode, apr_read_type_e block,
-                                     apr_off_t readbytes);
+apr_status_t ap_h1_header_in_filter(ap_filter_t *f, apr_bucket_brigade *bb,
+                                    ap_input_mode_t mode, apr_read_type_e block,
+                                    apr_off_t readbytes);
 
 apr_status_t ap_h1_body_in_filter(ap_filter_t *f, apr_bucket_brigade *b,
                                      ap_input_mode_t mode, apr_read_type_e block,
@@ -116,6 +116,10 @@ AP_CORE_DECLARE(void) ap_random_parent_after_fork(void);
  * @return 1 if keepalive can be set, 0 otherwise
  */
 AP_CORE_DECLARE(int) ap_h1_set_keepalive(request_rec *r, ap_bucket_response *resp);
+
+/* Set up the requests' asynchronous processing, at post-config (ptemp) */
+AP_CORE_DECLARE(void) ap_request_async_post_config(apr_pool_t *ptemp,
+                                                   server_rec *s);
 
 #ifdef __cplusplus
 }

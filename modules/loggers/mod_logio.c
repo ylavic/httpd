@@ -181,10 +181,13 @@ static apr_status_t logio_in_filter(ap_filter_t *f,
 
     status = ap_get_brigade(f->next, bb, mode, block, readbytes);
 
-    apr_brigade_length (bb, 0, &length);
+    /* The bytes of a speculative read are read again, counted then */
+    if (mode != AP_MODE_SPECULATIVE) {
+        apr_brigade_length (bb, 0, &length);
 
-    if (length > 0)
-        cf->bytes_in += length;
+        if (length > 0)
+            cf->bytes_in += length;
+    }
 
     return status;
 }

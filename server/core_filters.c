@@ -85,7 +85,42 @@ typedef struct {
 typedef struct {
     apr_bucket_brigade *bb;
     apr_bucket_brigade *tmpbb;
+    /* The last nonblocking READBYTES read emptied the socket: its last
+     * recv() got EAGAIN, or returned less than asked where that tells
+     * (ap_core_input_short_drains()), and nothing is held besides the
+     * socket bucket (ap_core_input_drained())
+     */
+    int drained;
 } core_input_ctx_t;
+
+AP_DECLARE(void) ap_core_input_short_drains(conn_rec *c, int on)
+{
+    conn_config_t *cconf = ap_get_core_module_config(c->conn_config);
+
+    if (cconf) {
+        cconf->short_drains = !!on;
+    }
+}
+
+AP_DECLARE(int) ap_core_input_drained(conn_rec *c)
+{
+    ap_filter_t *f;
+    core_input_ctx_t *ctx;
+
+    for (f = c->input_filters; f; f = f->next) {
+        if (f->frec == ap_core_input_filter_handle) {
+            break;
+        }
+    }
+    if (!f || !(ctx = f->ctx) || !ctx->drained) {
+        return 0;
+    }
+
+    /* Nothing pending in the filters above the core either (those holding
+     * data report it, e.g. TLS what's decrypted but not read yet)
+     */
+    return ap_check_input_pending(c) == OK;
+}
 
 
 apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
@@ -125,6 +160,7 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     else {
         ap_filter_reinstate_brigade(f, ctx->bb, NULL);
     }
+    ctx->drained = 0;
 
     /* ### This is bad. */
     BRIGADE_NORMALIZE(ctx->bb);
@@ -142,12 +178,17 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     if (mode == AP_MODE_GETLINE) {
         /* we are reading a single LF line, e.g. the HTTP headers */
         rv = apr_brigade_split_line(b, ctx->bb, block, HUGE_STRING_LEN);
-        /* We should treat EAGAIN here the same as we do for EOF (brigade is
-         * empty).  We do this by returning whatever we have read.  This may
-         * or may not be bogus, but is consistent (for now) with EOF logic.
+
+        /* To distinguish EAGAIN from EOS (for which apr_brigade_split_line()
+         * returns an empty brigade), return an empty brigade only for the
+         * former and APR_EOF for the latter.
          */
         if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
             rv = APR_SUCCESS;
+        }
+        else if (rv == APR_SUCCESS && APR_BRIGADE_EMPTY(b)) {
+            AP_DEBUG_ASSERT(APR_BRIGADE_EMPTY(ctx->bb));
+            rv = APR_EOF;
         }
         goto cleanup;
     }
@@ -231,42 +272,68 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
     /* read up to the amount they specified. */
     if (mode == AP_MODE_READBYTES || mode == AP_MODE_SPECULATIVE) {
         apr_bucket *e;
+        /* Whether the read of the socket bucket emptied the socket: its
+         * recv() got EAGAIN, or returned less than asked if that tells
+         * (short_drains: a socket bucket reads up to APR_BUCKET_BUFF_SIZE
+         * bytes per recv()). Otherwise a short recv() doesn't tell, e.g. the
+         * peer's shutdown may follow the data and an edge-triggered poll
+         * wouldn't report it again.
+         */
+        int short_drains = (cconf && cconf->short_drains);
+        int socket_read = 0, emptied = 0;
 
         AP_DEBUG_ASSERT(readbytes > 0);
 
-        e = APR_BRIGADE_FIRST(ctx->bb);
-        rv = apr_bucket_read(e, &str, &len, block);
-        if (rv != APR_SUCCESS) {
-            if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
+        do {
+            e = APR_BRIGADE_FIRST(ctx->bb);
+            socket_read = APR_BUCKET_IS_SOCKET(e);
+            rv = apr_bucket_read(e, &str, &len, block);
+            if (rv != APR_SUCCESS) {
                 /* getting EAGAIN for a blocking read is an error; not for a
-                 * non-blocking read, return an empty brigade. */
-                rv = APR_SUCCESS;
+                 * non-blocking read, return an empty brigade w/ APR_SUCCESS */
+                if (APR_STATUS_IS_EAGAIN(rv) && block == APR_NONBLOCK_READ) {
+                    rv = APR_SUCCESS;
+                }
+                goto cleanup;
             }
-            goto cleanup;
-        }
-        else if (block == APR_BLOCK_READ && len == 0) {
-            /* We wanted to read some bytes in blocking mode.  We read
-             * 0 bytes.  Hence, we now assume we are EOS.
-             *
-             * When we are in normal mode, return an EOS bucket to the
-             * caller.
-             * When we are in speculative mode, leave ctx->bb empty, so
-             * that the next call returns an EOS bucket.
-             */
-            apr_bucket_delete(e);
+            if (len > 0) {
+                break;
+            }
+            if (APR_BUCKET_IS_METADATA(e)) {
+                APR_BUCKET_REMOVE(e);
+                APR_BRIGADE_INSERT_TAIL(b, e);
+            }
+            else {
+                apr_bucket_delete(e);
+            }
+        } while (!APR_BRIGADE_EMPTY(ctx->bb));
 
-            if (mode == AP_MODE_READBYTES) {
+        if (len == 0) {
+            /* We are at EOS.
+             * In normal blocking mode, return an EOS bucket.
+             * Otherwise it's not expected by the caller, so return APR_EOF
+             * directly.
+             */
+            AP_DEBUG_ASSERT(APR_BRIGADE_EMPTY(ctx->bb));
+            if (mode == AP_MODE_READBYTES && block == APR_BLOCK_READ) {
                 e = apr_bucket_eos_create(c->bucket_alloc);
                 APR_BRIGADE_INSERT_TAIL(b, e);
             }
+            else if (APR_BRIGADE_EMPTY(b)) {
+                rv = APR_EOF;
+            }
             goto cleanup;
+        }
+
+        if (short_drains && socket_read && len < APR_BUCKET_BUFF_SIZE) {
+            emptied = 1;
         }
 
         /* Have we read as much data as we wanted (be greedy)? */
         if (len < readbytes) {
             apr_size_t bucket_len;
 
-            /* We already registered the data in e in len */
+            /* We already accounted for e in len */
             e = APR_BUCKET_NEXT(e);
             while ((len < readbytes) && (rv == APR_SUCCESS)
                    && (e != APR_BRIGADE_SENTINEL(ctx->bb))) {
@@ -280,21 +347,34 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                      * Read from bucket, but non blocking. If there isn't any
                      * more data, well than this is fine as well, we will
                      * not wait for more since we already got some and we are
-                     * only checking if there isn't more.
+                     * only checking if there isn't more. Not from the socket
+                     * when its last recv() emptied it (the read would get
+                     * EAGAIN).
                      */
+                    socket_read = APR_BUCKET_IS_SOCKET(e);
+                    if (socket_read && emptied) {
+                        break;
+                    }
                     rv = apr_bucket_read(e, &str, &bucket_len,
                                          APR_NONBLOCK_READ);
                     if (rv == APR_SUCCESS) {
                         len += bucket_len;
                         e = APR_BUCKET_NEXT(e);
+                        if (short_drains && socket_read && bucket_len
+                            && bucket_len < APR_BUCKET_BUFF_SIZE) {
+                            emptied = 1;
+                        }
+                    }
+                    else if (socket_read && APR_STATUS_IS_EAGAIN(rv)) {
+                        emptied = 1;
                     }
                 }
             }
-        }
 
-        /* We can only return at most what we read. */
-        if (len < readbytes) {
-            readbytes = len;
+            /* We can only return at most what we read. */
+            if (len < readbytes) {
+                readbytes = len;
+            }
         }
 
         rv = apr_brigade_partition(ctx->bb, readbytes, &e);
@@ -325,6 +405,14 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
 
         /* Take what was originally there and place it back on ctx->bb */
         APR_BRIGADE_CONCAT(ctx->bb, ctx->tmpbb);
+
+        /* Drained if the socket was emptied and nothing else is held */
+        if (emptied && mode == AP_MODE_READBYTES
+            && block == APR_NONBLOCK_READ
+            && !APR_BRIGADE_EMPTY(ctx->bb)
+            && APR_BUCKET_IS_SOCKET(APR_BRIGADE_FIRST(ctx->bb))) {
+            ctx->drained = 1;
+        }
     }
 
 cleanup:

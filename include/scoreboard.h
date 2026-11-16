@@ -149,6 +149,9 @@ struct process_score {
     apr_uint32_t keep_alive;        /* async connections in keep alive */
     apr_uint32_t suspended;         /* connections suspended by some module */
     apr_uint32_t wait_io;           /* async connections waiting an IO in the MPM */
+    apr_uint32_t shutdown;          /* async connections shutting down before close */
+    apr_uint32_t backlog;           /* async connections waiting for a worker */
+    apr_uint32_t workers_live;      /* running worker threads (for async MPMs) */
 };
 
 /* Scoreboard is now in 'local' memory, since it isn't updated once created,

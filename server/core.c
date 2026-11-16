@@ -220,6 +220,7 @@ static void *create_core_dir_config(apr_pool_t *a, char *dir)
 
     conf->cgi_pass_auth = AP_CGI_PASS_AUTH_UNSET;
     conf->qualify_redirect_url = AP_CORE_CONFIG_UNSET; 
+    conf->async_requests = AP_CORE_CONFIG_UNSET;
 
     return (void *)conf;
 }
@@ -454,6 +455,7 @@ static void *merge_core_dir_configs(apr_pool_t *a, void *basev, void *newv)
     }
 
     AP_CORE_MERGE_FLAG(qualify_redirect_url, conf, base, new);
+    AP_CORE_MERGE_FLAG(async_requests, conf, base, new);
 
     return (void*)conf;
 }
@@ -1989,6 +1991,15 @@ static const char *set_qualify_redirect_url(cmd_parms *cmd, void *d_, int flag)
     core_dir_config *d = d_;
 
     d->qualify_redirect_url = flag ? AP_CORE_CONFIG_ON : AP_CORE_CONFIG_OFF;
+
+    return NULL;
+}
+
+static const char *set_async_requests(cmd_parms *cmd, void *d_, int flag)
+{
+    core_dir_config *d = d_;
+
+    d->async_requests = flag ? AP_CORE_CONFIG_ON : AP_CORE_CONFIG_OFF;
 
     return NULL;
 }
@@ -4953,6 +4964,9 @@ AP_INIT_TAKE2("CGIVar", set_cgi_var, NULL, OR_FILEINFO,
 AP_INIT_FLAG("QualifyRedirectURL", set_qualify_redirect_url, NULL, OR_FILEINFO,
              "Controls whether the REDIRECT_URL environment variable is fully "
              "qualified"),
+AP_INIT_FLAG("AsyncRequests", set_async_requests, NULL, ACCESS_CONF|RSRC_CONF,
+             "Controls whether the requests' handlers can wait asynchronously "
+             "(suspend them) when the MPM can"),
 AP_INIT_FLAG("StrictHostCheck", set_core_server_flag, 
              (void *)APR_OFFSETOF(core_server_config, strict_host_check),  
              RSRC_CONF,
@@ -5023,7 +5037,7 @@ AP_INIT_TAKE1("ProtocolsHonorOrder", set_protocols_honor_order, NULL, RSRC_CONF,
               "'off' (default) or 'on' to respect given order of protocols, "
               "by default the client specified order determines selection"),
 AP_INIT_TAKE1("AsyncFilter", set_async_filter, NULL, RSRC_CONF,
-              "'network', 'connection' (default) or 'request' to limit the "
+              "'network', 'connection' or 'request' (default) to limit the "
               "types of filters that support asynchronous handling"),
 AP_INIT_FLAG("MergeSlashes", set_core_server_flag, 
              (void *)APR_OFFSETOF(core_server_config, merge_slashes),  
@@ -5572,7 +5586,7 @@ static conn_rec *core_create_conn(apr_pool_t *ptrans, server_rec *s,
     c->id = id;
     c->bucket_alloc = alloc;
     c->async_filter = sconf->async_filter;
-
+    c->keepalive = AP_CONN_UNKNOWN;
     c->clogging_input_filters = 0;
 
     if (sconf->conn_log_level) {
@@ -6186,9 +6200,9 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_get_pollfd_from_conn(core_get_pollfd_from_conn, NULL, NULL,
                                  APR_HOOK_REALLY_LAST);
 
-    ap_hook_input_pending(ap_filter_input_pending, NULL, NULL,
+    ap_hook_input_pending(ap_core_input_pending, NULL, NULL,
                           APR_HOOK_MIDDLE);
-    ap_hook_output_pending(ap_filter_output_pending, NULL, NULL,
+    ap_hook_output_pending(ap_core_output_pending, NULL, NULL,
                            APR_HOOK_MIDDLE);
 
     /* register the core's insert_filter hook and register core-provided

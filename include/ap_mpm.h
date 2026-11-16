@@ -176,14 +176,19 @@ AP_DECLARE(apr_status_t) ap_os_create_privileged_process(
 #define AP_MPMQ_IS_ASYNC             14
 /** MPM generation */
 #define AP_MPMQ_GENERATION           15
-/** MPM can drive serf internally  */
+/** MPM can drive serf internally (none does anymore: always 0) */
 #define AP_MPMQ_HAS_SERF             16
 /** MPM supports suspending/resuming connections */
 #define AP_MPMQ_CAN_SUSPEND          17
-/** MPM supports additional pollfds */
-#define AP_MPMQ_CAN_POLL             18
+/* 18 was AP_MPMQ_CAN_POLL (trunk only), removed with the poll callbacks */
 /** MPM supports CONN_STATE_ASYNC_WAITIO */
 #define AP_MPMQ_CAN_WAITIO           19
+/** MPM implements the register_wait hook */
+#define AP_MPMQ_CAN_REGISTER_WAIT    21
+/** Number of connections a child is meant to handle at once, those waiting
+ *  asynchronously (without holding a thread) included; not necessarily a
+ *  hard limit */
+#define AP_MPMQ_MAX_CONNECTIONS      22
 /** @} */
 
 /**
@@ -205,54 +210,220 @@ typedef void (ap_mpm_callback_fn_t)(void *baton);
 
 /* only added support in the Event MPM....  check for APR_ENOTIMPL */
 AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c);
-/* only added support in the Event MPM....  check for APR_ENOTIMPL */
-AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(
-        apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton);
+/** The result of a wait (ap_mpm_register_wait()), given to its continuation */
+typedef enum {
+    AP_MPM_WAIT_READY,    /**< Some of the pfds are ready (rtnevents set) */
+    AP_MPM_WAIT_TIMEOUT,  /**< The wait timed out */
+    AP_MPM_WAIT_ERROR,    /**< The MPM could not wait (e.g. pollset failure) */
+    AP_MPM_WAIT_NOTIFIED  /**< The wait was notified (ap_mpm_notify()) */
+} ap_mpm_wait_result_e;
+
+/** Notifies a suspended wait from any thread (ap_mpm_notifier_create()) */
+typedef struct ap_mpm_notifier_t ap_mpm_notifier_t;
 
 /**
- * Register a callback on the readability or writability on a group of
- * sockets/pipes.
- * @param p Pool used by the MPM for its internal allocations
- * @param pfds Array of apr_pollfd_t
- * @param cbfn The callback function
- * @param baton userdata for the callback function
- * @return APR_SUCCESS if all sockets/pipes could be added to a pollset,
- * APR_ENOTIMPL if no asynch support, or an apr_pollset_add error.
- * @remark When activity is found on any 1 socket/pipe in the list, all are removed
- * from the pollset and only 1 callback is issued.
- * @remark The passed in pool can be cleared by cbfn and tofn when called back,
- *         it retains no MPM persistent data and won't be used until the next call
- *         to ap_mpm_register_poll_callback[_timeout].
+ * The continuation of a suspended request, called by the MPM on a worker
+ * thread when the wait registered by ap_mpm_register_wait() completes.
+ * @param c The suspended connection
+ * @param r The suspended request, or NULL
+ * @param why The result of the wait
+ * @param pfds The pfds of the wait, with their rtnevents set for
+ * AP_MPM_WAIT_READY
+ * @param baton The baton given to ap_mpm_register_wait()
+ * @remark The callback either registers a wait again
+ * (ap_mpm_register_wait()), or gives the connection back to the MPM
+ * (ap_mpm_resume_suspended()), and must not touch @a c or @a r after that.
  */
-
-AP_DECLARE(apr_status_t) ap_mpm_register_poll_callback(
-        apr_pool_t *p, const apr_array_header_t *pfds,
-        ap_mpm_callback_fn_t *cbfn, void *baton);
+typedef void (ap_mpm_continuation_fn_t)(conn_rec *c, request_rec *r,
+                                        ap_mpm_wait_result_e why,
+                                        const apr_array_header_t *pfds,
+                                        void *baton);
 
 /**
- * Register a callback on the readability or writability on a group of sockets/pipes,
- * with a timeout.
- * @param p Pool used by the MPM for its internal allocations
- * @param pfds Array of apr_pollfd_t
- * @param cbfn The callback function
- * @param tofn The callback function if the timeout expires
- * @param baton userdata for the callback function
- * @param timeout timeout for I/O in microseconds, unlimited if <= 0
- * @return APR_SUCCESS if all sockets/pipes could be added to a pollset,
- * APR_ENOTIMPL if no asynch support, or an apr_pollset_add error.
- * @remark When activity is found on any 1 socket/pipe in the list, all are removed
- * from the pollset and only 1 callback is issued. 
- * @remark For each call, only one of tofn or cbfn will be called, never both.
- * @remark The passed in pool can be cleared by cbfn and tofn when called back,
- *         it retains no MPM persistent data and won't be used until the next call
- *         to ap_mpm_register_poll_callback[_timeout].
+ * Suspend the processing of a request until some pfds are ready, its
+ * notifier is notified, or a timeout.
+ * @param c The connection
+ * @param p The pool to allocate the wait from; the pfds are removed from the
+ * MPM when this pool is cleared or destroyed
+ * @param pfds The apr_pollfd_t to wait for (their client_data is used by the
+ * MPM), possibly none (NULL or empty)
+ * @param timeout The timeout of the wait, or -1 for none
+ * @param notifier The notifier of the wait (ap_mpm_notifier_create()), or NULL
+ * @param pfds_flags The AP_MPM_WAIT_* flags of each pfd (pfds_flags[i] for
+ * the i-th of @a pfds, as many), or NULL for none
+ * @param fn The continuation called by the MPM when the wait completes
+ * @param baton The baton passed to @a fn
+ * @return APR_SUCCESS, APR_ENOTIMPL if the MPM doesn't support it (see
+ * AP_MPMQ_CAN_REGISTER_WAIT) or the connection isn't handled by the MPM,
+ * APR_EINVAL if nothing could complete the wait, APR_EBUSY if a wait is
+ * registered already or @a notifier served a wait and wasn't re-armed
+ * (ap_mpm_notifier_rearm()), or an error.
+ * @remark It can be called from a handler (which then returns SUSPENDED), or
+ * from the continuation of a previous wait. Either way the MPM arms the
+ * wait once no thread is processing the connection anymore, so @a fn can't
+ * run concurrently with the caller.
+ * @remark The wait completes when any of @a pfds is ready (the first to
+ * fire), not all of them: the continuation tells which from their
+ * rtnevents, and can register a wait again for the others.
  */
+AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
+                                              const apr_array_header_t *pfds,
+                                              apr_interval_time_t timeout,
+                                              ap_mpm_notifier_t *notifier,
+                                              const unsigned int *pfds_flags,
+                                              ap_mpm_continuation_fn_t *fn,
+                                              void *baton);
 
-AP_DECLARE(apr_status_t) ap_mpm_register_poll_callback_timeout(
-        apr_pool_t *p, const apr_array_header_t *pfds,
-        ap_mpm_callback_fn_t *cbfn, ap_mpm_callback_fn_t *tofn,
-        void *baton, apr_time_t timeout);
+/**
+ * Declare timeouts that the module gives to its waits (ap_mpm_register_wait()),
+ * as a hint for the MPM to prepare for them (e.g. a timeout queue per value,
+ * cheaper than a timer per wait).
+ * @param timeouts The timeouts (apr_interval_time_t), negative ones ignored
+ * @return APR_SUCCESS, or APR_ENOTIMPL if the MPM doesn't use the hint
+ * @remark It's called at post-config, for each configuration (the values
+ * declared for the previous one are forgotten). It's never required: a wait
+ * with a timeout not declared works the same, possibly at a higher cost. So
+ * modules declare the fixed values they wait with (e.g. configured timeouts),
+ * not the variable ones (e.g. what's left of a time limit).
+ */
+AP_DECLARE(apr_status_t) ap_mpm_register_timeouts(
+        const apr_array_header_t *timeouts);
 
+/**
+ * Flag of a pfd for ap_mpm_register_wait() (pfds_flags): keep it registered
+ * in the MPM once the wait completes (armed, or its readiness remembered),
+ * for the next waits on it, until ap_mpm_release_pfds() or
+ * ap_mpm_release_pfd(), or the connection is resumed
+ * (ap_mpm_resume_suspended(), the request is done) or closed. Meanwhile the
+ * owner of a socket or file (pipe) must release it before giving it up
+ * (closing it, or letting another connection use it), mod_proxy does for its
+ * backend connections; a kept descriptor whose pool is cleaned up is released
+ * then too, but not if it's closed otherwise (apr_socket_close(),
+ * apr_file_close()). A pfd kept already stays kept for the next waits, with
+ * or without the flag. An MPM that can't keep pfds ignores the flag (each
+ * wait registers its pfds).
+ */
+#define AP_MPM_WAIT_KEEP_PFDS (1u << 0)
+
+/**
+ * Flag of a pfd for ap_mpm_register_wait() (pfds_flags), with
+ * AP_MPM_WAIT_KEEP_PFDS: the caller drained it before waiting, i.e. it waits
+ * for each event only after the operation it waits for (read, write) failed
+ * with EAGAIN since the last wait, so a kept pfd that fired for the last wait
+ * needs no check for a readiness the caller would have consumed. Without it,
+ * an MPM that doesn't re-arm the kept pfds checks it (the caller may have
+ * stopped reading or writing before EAGAIN, and no new event would come).
+ */
+#define AP_MPM_WAIT_DRAINED (1u << 1)
+
+/**
+ * Release the pfds of an array as ap_mpm_release_pfd() does for each.
+ * @param pfds The pfds to release (those not kept are ignored)
+ * @return APR_SUCCESS, or the last error of ap_mpm_release_pfd()
+ */
+AP_DECLARE(apr_status_t) ap_mpm_release_pfds(const apr_array_header_t *pfds);
+
+/**
+ * Release a socket or file (pipe) kept for whichever connection
+ * (AP_MPM_WAIT_KEEP_PFDS), before giving it up (closing it, or letting
+ * another connection use it).
+ * @param pfd The descriptor to release (desc_type and desc only)
+ * @return APR_SUCCESS (also if it's not kept), APR_ENOTIMPL if the MPM
+ * doesn't support it, APR_EBUSY if a wait is registered for the connection
+ * keeping it, or an error
+ * @remark It must be called from the thread running the connection keeping
+ * it, while no wait is registered for it (e.g. from its handler or a
+ * continuation, where the descriptor's owner gives it up).
+ */
+AP_DECLARE(apr_status_t) ap_mpm_release_pfd(const apr_pollfd_t *pfd);
+
+/**
+ * Create a notifier for the next wait of a request (ap_mpm_register_wait()).
+ * @param notifier The created notifier
+ * @param c The connection
+ * @param p The pool to allocate the notifier from, which must outlive the wait
+ * @return APR_SUCCESS, or APR_ENOTIMPL if the MPM doesn't support notifiers
+ * or the connection isn't handled by the MPM
+ * @remark A notifier serves a single wait, unless re-armed
+ * (ap_mpm_notifier_rearm()) once that wait completed. It can be notified
+ * before the wait is registered or armed: the wait then completes as soon
+ * as it is armed, so nothing is lost between the creation (or the re-arm)
+ * and the wait.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
+                                                conn_rec *c, apr_pool_t *p);
+
+/**
+ * Notify a wait, from any thread: its continuation runs with
+ * AP_MPM_WAIT_NOTIFIED.
+ * @param notifier The notifier
+ * @remark Once the wait has completed (its continuation called for
+ * whatever reason) this does nothing, and a re-arm drops the notification
+ * (ap_mpm_notifier_rearm()): it never completes the next wait. After the
+ * re-arm, it counts for the next wait as for a new notifier. The caller
+ * must ensure that @a notifier is not used after its pool is cleared or
+ * destroyed, e.g. by notifying it and canceling the reason to notify it
+ * under the same lock.
+ */
+AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier);
+
+/**
+ * Re-arm a notifier for another wait (ap_mpm_register_wait()), once its
+ * previous wait has completed: it's then as newly created, without any
+ * allocation, a notification made before the re-arm dropped.
+ * @param notifier The notifier
+ * @return APR_SUCCESS once its previous wait has completed (its
+ * continuation called for whatever reason), or if no wait was registered
+ * with it since its creation or last re-arm, or was dropped unarmed;
+ * APR_EBUSY while its wait is registered or armed (nothing changed); or
+ * APR_ENOTIMPL if the MPM doesn't support notifiers
+ * @remark Re-arming is opt-in: a notifier not re-armed serves a single wait.
+ * It's called from the thread processing the request, as the waits are
+ * registered (e.g. the continuation of the previous wait). The notifier's
+ * pool must outlive every wait it serves.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier);
+
+/**
+ * Attach a notifier to another one, its parent, which is given to the waits
+ * (ap_mpm_register_wait()) instead of it: one wait for several notifiers.
+ * Notifying it (ap_mpm_notify()) notifies the parent, until it's detached
+ * (ap_mpm_notifier_detach()); meanwhile it serves a wait as if given to it
+ * (it can't be re-armed nor attached again), the parent's waits completing
+ * for it until it's detached, whose notifications are kept: a parent re-armed
+ * while a notifier attached to it is notified is notified (its next wait
+ * completes as soon as it is armed), so no notification is lost between the
+ * parent's waits.
+ * @param notifier The notifier
+ * @param parent The parent, not attached itself
+ * @return APR_SUCCESS; APR_EBUSY if @a notifier served a wait and wasn't
+ * re-armed, or serves one; APR_EINVAL if @a parent is @a notifier, is attached
+ * itself, or @a notifier is a parent; or APR_ENOTIMPL if the MPM doesn't
+ * support it
+ * @remark A notification made before the attach counts, as for a wait.
+ * @remark It's called from the thread processing the request, as the waits
+ * are registered. Detach the notifier before its parent's pool is cleaned up.
+ */
+AP_DECLARE(apr_status_t) ap_mpm_notifier_attach(ap_mpm_notifier_t *notifier,
+                                                ap_mpm_notifier_t *parent);
+
+/**
+ * Whether a notifier was notified since its creation or its last re-arm,
+ * e.g. which notifiers attached to a parent completed its wait.
+ * @param notifier The notifier
+ * @return non-zero if notified, zero otherwise or if the MPM doesn't support
+ * notifiers
+ */
+AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier);
+
+/**
+ * Detach a notifier from its parent (ap_mpm_notifier_attach()), the wait it
+ * served done: notifying it does nothing from now on, until it's re-armed
+ * (ap_mpm_notifier_rearm()) for another wait.
+ * @param notifier The notifier, attached or not (nothing done then)
+ * @remark It's called from the thread processing the request.
+ */
+AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier);
 
 typedef enum mpm_child_status {
     MPM_CHILD_STARTED,

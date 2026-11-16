@@ -388,6 +388,90 @@ AP_DECLARE(apr_socket_t *) ap_get_conn_socket(conn_rec *c);
 #define AP_CORE_MODULE_INDEX  (AP_DEBUG_ASSERT(core_module.module_index == 0), 0)
 #endif
 
+/** The phase of a top-level request, for ap_request_can_suspend() */
+typedef enum {
+    AP_REQUEST_PHASE_NONE,    /**< in no phase that can suspend */
+    AP_REQUEST_PHASE_HANDLER, /**< running the handlers (ap_invoke_handler()) */
+    AP_REQUEST_PHASE_DONE     /**< finished (ap_request_finish_suspended()) */
+} ap_request_phase_e;
+
+/** The state of a request's waits, core's own (opaque) */
+struct ap_request_waitset;
+
+/** The state of a request's body reads (ap_request_read_body()), core's
+ *  own (opaque) */
+struct ap_request_body;
+
+/**
+ * @brief The asynchronous state of a top-level request, allocated by
+ * ap_process_async_request(), or of a subrequest, allocated by
+ * ap_run_sub_req_async(): core's own, may change; modules use the
+ * ap_request_*() functions (http_request.h).
+ */
+typedef struct ap_request_async_t {
+    /** The request */
+    request_rec *r;
+    /** The top-level request's state (this one for the top-level request):
+     * its runs and its pending waits are those of every request of its tree
+     * (one MPM wait per connection, for all of them) */
+    struct ap_request_async_t *top;
+    /** Its phase */
+    ap_request_phase_e phase;
+    /** The state of its waits (ap_request_wait()), on first use: its client
+     * context, and in the top-level request's state the pending waits */
+    struct ap_request_waitset *waitset;
+    /** Where its handler chain suspended (ap_invoke_handler()), once it did:
+     * the index of the handler that returned SUSPENDED */
+    int handler_pos;
+    /** The handler chosen for the chain (r->handler while it runs) */
+    const char *handler;
+    /** r->handler before the chain, restored once the handlers are done */
+    const char *old_handler;
+    /** Set by the end of the request for the run in progress, if any (a
+     * flag of the thread running it, which can't touch the request once
+     * ended); the top-level request's */
+    int *ended;
+    /** A thread runs the request (its first run, or a continuation), set
+     * atomically at a run's entry (a run entered while set is a bug); the
+     * top-level request's */
+    apr_uint32_t running;
+    /** Its handlers suspended it (a run returned SUSPENDED), until it's
+     * resumed or ends */
+    unsigned int suspended :1;
+    /** A subrequest's deadline (ap_run_sub_req_async()) was reached */
+    unsigned int deadline_reached :1;
+    /** The subrequests of the tree in progress (ap_run_sub_req(), or
+     *  ap_run_sub_req_async() until done), whose output may go through the
+     *  main request's filters; the top-level request's */
+    int subreqs;
+    /** Where the end of the top-level request is (its handlers done): 1
+     *  before its error response if any (ap_die()), 2 from it until the end
+     *  (the EOR), 0 before; its filters may hold their output at both
+     *  points (ap_filter_pending_wait()), the end waiting for them */
+    unsigned int hold_point :2;
+    /** The handlers' status, for ap_die() once the filters' holds before it
+     *  are over */
+    int end_status;
+    /** For a subrequest run by ap_run_sub_req_async(): its done function
+     * (ap_sub_req_done_fn) and baton, its deadline (zero for none), and the
+     * module whose log level its log lines follow */
+    void (*done)(request_rec *rsub, int status, void *baton);
+    void *done_baton;
+    apr_time_t deadline;
+    int module_index;
+    /** For a subrequest run by ap_run_sub_req_async() as the work of a
+     *  delegated hold (ap_request_hold_delegate(), or a request filter's
+     *  ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED): its holder,
+     *  which its end releases */
+    struct ap_request_holder_t *holder;
+    /** The subrequest in progress as the work of a request output filter's
+     *  delegated hold (one at a time), which the request's end waits for,
+     *  and how many subrequests of the tree are in progress for it (with
+     *  its own); the top-level request's */
+    struct ap_request_async_t *delegate;
+    int subreqs_delegated;
+} ap_request_async_t;
+
 /**
  * @brief  Per-request configuration
 */
@@ -441,6 +525,18 @@ typedef struct {
     /** Should addition of charset= be suppressed for this request?
      */
     int suppress_charset;
+
+    /** The asynchronous state of a top-level request processed by
+     * ap_process_async_request() or of a subrequest run by
+     * ap_run_sub_req_async(), NULL otherwise (other subrequests, internally
+     * redirected requests)
+     */
+    ap_request_async_t *async;
+
+    /** The state of the request's body reads (ap_request_read_body()), on
+     * first use
+     */
+    struct ap_request_body *body;
 } core_request_config;
 
 /* Standard entries that are guaranteed to be accessible via
@@ -684,6 +780,10 @@ typedef struct {
     apr_hash_t *cgi_var_rules;
 
     apr_size_t read_buf_size;
+
+    /** AsyncRequests: whether the requests can suspend (AP_CORE_CONFIG_*),
+     * see ap_request_can_suspend() */
+    unsigned int async_requests :2;
 } core_dir_config;
 
 /* macro to implement off by default behaviour */
@@ -794,6 +894,34 @@ apr_status_t ap_core_input_filter(ap_filter_t *f, apr_bucket_brigade *b,
                                   ap_input_mode_t mode, apr_read_type_e block,
                                   apr_off_t readbytes);
 apr_status_t ap_core_output_filter(ap_filter_t *f, apr_bucket_brigade *b);
+
+/**
+ * Whether the last nonblocking AP_MODE_READBYTES read of the core input
+ * filter emptied the connection's socket, so that reading it again would get
+ * EAGAIN until new data arrive: its last recv() got EAGAIN and the core holds
+ * no data. Only when the core input filter is the connection's first input
+ * filter (none above it may hold data, e.g. TLS).
+ * @param c The connection
+ * @return Non-zero if drained
+ */
+AP_DECLARE(int) ap_core_input_drained(conn_rec *c);
+
+/**
+ * Tell the core input filter whether a recv() of the connection's socket
+ * returning less than asked empties it, so that the read doesn't recv()
+ * again for EAGAIN and counts as drained (ap_core_input_drained()): when the
+ * poll that found the socket readable reports the peer's half-close
+ * (APR_POLLRDHUP) and didn't, the socket staying registered (e.g. kept
+ * edge-triggered by the MPM), so that an end of file can't be queued unseen
+ * behind the data (a next poll reports it); or when the caller polls the
+ * socket level-triggered itself (the next poll reports what's left, an end of
+ * file included). Otherwise a short recv() doesn't tell, the read goes on
+ * until EAGAIN (or the end of file).
+ * @param c The connection
+ * @param on Non-zero if a short recv() empties the socket, zero otherwise
+ * (the default)
+ */
+AP_DECLARE(void) ap_core_input_short_drains(conn_rec *c, int on);
 
 
 AP_DECLARE(const char*) ap_get_server_protocol(server_rec* s);

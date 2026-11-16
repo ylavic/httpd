@@ -113,7 +113,8 @@ class TestStatusLineCR:
             f"injected header in response headers: {raw.split(hide_backslash)[0]!r}"
 
         env.httpd_error_log.ignore_recent(
-            lognos=["AH00957", "AH01106", "AH01114"]
+            lognos=["AH00898", "AH00957", "AH01106", "AH01114"],
+            matches=[r'.*\[proxy_http:warn\].*']
         )
 
     def test_proxy_06_002_interim_status_cr(self, env):
@@ -151,7 +152,8 @@ class TestStatusLineCR:
             f"injected header in response: {headers_section!r}"
 
         env.httpd_error_log.ignore_recent(
-            lognos=["AH01106"]
+            lognos=["AH00898", "AH01106"],
+            matches=[r'.*\[proxy_http:warn\].*']
         )
 
     def test_proxy_06_003_interim_102_ok(self, env):

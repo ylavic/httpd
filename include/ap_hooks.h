@@ -138,6 +138,63 @@
         APR_IMPLEMENT_EXTERNAL_HOOK_RUN_FIRST(ap,AP,ret,name,args_decl, \
                                               args_use,decline)
 
+/**
+ * Implement a hook as AP_IMPLEMENT_HOOK_RUN_FIRST does, plus its runner from
+ * a position, ap_run_<i>name</i>_from(), which runs the functions from *pos
+ * on and leaves at *pos the index of the one that stopped the run (or the
+ * number of functions if none did), so that the caller can continue the run
+ * later from *pos + 1 (e.g. after a function returned SUSPENDED).
+ *
+ * @param ret The return type of the hook (and the hook runners)
+ * @param name The name of the hook
+ * @param args_decl The declaration of the arguments for the hook, for example
+ * "(request_rec *r)"
+ * @param args_use The arguments for the hook as used in a call, for example
+ * "(r)"
+ * @param from_args_decl The declaration of the arguments for the runner from
+ * a position: the hook's and the position, for example
+ * "(request_rec *r, int *pos)"
+ * @param pos The name of the position (int *) in from_args_decl
+ * @param decline The "decline" return value
+ * @return decline or an error.
+ * @remark Declare the runner from a position by hand beside the hook's
+ * AP_DECLARE_HOOK(): it is generated in the file implementing the hook,
+ * where the hook's functions are (static). The order of the functions is
+ * fixed once they are sorted (before the children start), so a position
+ * remains valid for the life of a child.
+ * @note There is no optional variant (the hook must be linked into the
+ * Apache core).
+ */
+#define AP_IMPLEMENT_HOOK_RUN_FIRST_FROM(ret,name,args_decl,args_use, \
+                                         from_args_decl,pos,decline) \
+        AP_IMPLEMENT_HOOK_RUN_FIRST(ret,name,args_decl,args_use,decline) \
+        AP_DECLARE(ret) ap_run_##name##_from from_args_decl \
+        { \
+            ap_LINK_##name##_t *pHook; \
+            int n = *(pos); \
+            ret rv = decline; \
+            APR_HOOK_INT_DCL_UD; \
+            APR_HOOK_PROBE_ENTRY(ud, ap, name, args_use); \
+            if (_hooks.link_##name) { \
+                pHook = (ap_LINK_##name##_t *)_hooks.link_##name->elts; \
+                for (; n < _hooks.link_##name->nelts; ++n) { \
+                    APR_HOOK_PROBE_INVOKE(ud, ap, name, \
+                                          (char *)pHook[n].szName, \
+                                          args_use); \
+                    rv = pHook[n].pFunc args_use; \
+                    APR_HOOK_PROBE_COMPLETE(ud, ap, name, \
+                                            (char *)pHook[n].szName, rv, \
+                                            args_use); \
+                    if (rv != decline) { \
+                        break; \
+                    } \
+                } \
+            } \
+            *(pos) = n; \
+            APR_HOOK_PROBE_RETURN(ud, ap, name, rv, args_use); \
+            return rv; \
+        }
+
 /* Note that the other optional hook implementations are straightforward but
  * have not yet been needed
  */

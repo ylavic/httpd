@@ -621,6 +621,19 @@ AP_DECLARE(apr_status_t) ap_filter_reinstate_brigade(ap_filter_t *f,
                                                      apr_bucket **flush_upto);
 
 /**
+ * Say whether the input an input filter keeps pending (set aside with
+ * ap_filter_adopt_brigade()) needs more input from the network before it's
+ * readable, e.g. the start of a line kept after a nonblocking AP_MODE_GETLINE
+ * read returned EAGAIN: ap_check_input_pending() then doesn't count it as
+ * readable (AGAIN), so a caller waits for the socket rather than reading
+ * again at once. Readable by default; the filter says so again when what it
+ * keeps changes.
+ * @param f The current (input) filter
+ * @param more Non-zero if more input is needed, zero once readable
+ */
+AP_DECLARE(void) ap_filter_pending_more(ap_filter_t *f, int more);
+
+/**
  * Adopt a bucket brigade as is (no setaside nor copy).
  * @param f The current filter
  * @param bb The bucket brigade adopted.  This brigade is always empty
@@ -633,7 +646,8 @@ AP_DECLARE(void) ap_filter_adopt_brigade(ap_filter_t *f,
 
 /**
  * This function calculates whether there are any as yet unsent
- * buffered brigades in downstream filters, and returns non zero
+ * buffered brigades in downstream filters, or request filters holding their
+ * output (until a time, room or the wait of a context), and returns non zero
  * if so.
  *
  * A filter should use this to determine whether the passing of data
@@ -645,27 +659,199 @@ AP_DECLARE(void) ap_filter_adopt_brigade(ap_filter_t *f,
 AP_DECLARE(int) ap_filter_should_yield(ap_filter_t *f);
 
 /**
- * This function determines whether there is unwritten data in the output
+ * This function determines whether there is pending data in the output
  * filters, and if so, attempts to make a single write to each filter
- * with unwritten data.
+ * with pending data.
+ *
+ * AGAIN has the output's meaning: something is still pending in the
+ * filters, so the caller waits for what that output waits for (the
+ * connection to be writable) before writing more; it doesn't mean that
+ * something can be done now.
  *
  * @param c The connection.
- * @return If no unwritten data remains, this function returns DECLINED.
- * If some unwritten data remains, this function returns OK. If any
- * attempt to write data failed, this functions returns a positive integer.
+ * @return OK if no pending data remain, AGAIN if some remain (wait for
+ * their targets), DONE if the connection is aborted, anything else on
+ * error.
  */
-AP_DECLARE_NONSTD(int) ap_filter_output_pending(conn_rec *c);
+AP_DECLARE(int) ap_check_output_pending(conn_rec *c);
 
 /**
  * This function determines whether there is pending data in the input
  * filters. Pending data is data that has been read from the underlying
  * socket but not yet returned to the application.
  *
+ * AGAIN has the input's meaning, the opposite of the output's: data can be
+ * read now without the socket being readable, so the caller reads rather
+ * than waiting for the socket. Data a filter keeps but needs more input for
+ * (ap_filter_pending_more()) is not readable.
+ *
  * @param c The connection.
- * @return If no pending data remains, this function returns DECLINED.
- * If some pending data remains, this function returns OK.
+ * @return OK if no pending data remain (wait for the socket before
+ * reading), AGAIN if some remain (readable now), DONE if the connection is
+ * aborted, anything else on error.
  */
-AP_DECLARE_NONSTD(int) ap_filter_input_pending(conn_rec *c);
+AP_DECLARE(int) ap_check_input_pending(conn_rec *c);
+
+/**
+ * Hook called to determine whether we should stay within the write completion
+ * phase, i.e. whether some output is still pending in the filters.
+ * @param c The current connection
+ * @return OK if no output is pending (writing more won't wait for previous
+ * output), AGAIN if some is pending (wait for the connection to be writable
+ * before writing more), DECLINED to let the next hook decide, DONE if the
+ * connection is aborted, anything else on error.
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(int, output_pending, (conn_rec *c))
+
+/**
+ * Hook called to determine whether any data is pending in the input filters.
+ * @param c The current connection
+ * @return OK if no input is pending (a read would wait for the socket),
+ * AGAIN if some is pending and readable without the socket (read it rather
+ * than waiting), DECLINED to let the next hook decide, DONE if the connection
+ * is aborted, anything else on error.
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(int, input_pending, (conn_rec *c))
+
+/**
+ * The core output_pending hook.
+ */
+AP_DECLARE_NONSTD(int) ap_core_output_pending(conn_rec *c);
+
+/**
+ * @brief What the output pending in a connection's filters waits for, core's
+ * own (ap_output_pending_targets())
+ */
+typedef struct {
+    /** APR_POLLOUT if it waits for the connection to be writable (room),
+     *  else 0 */
+    apr_int16_t events;
+    /** Else, if not zero, the time a request filter pacing its output
+     *  passes more (apr_time_now() base) */
+    apr_time_t due;
+    /** Else, if not zero, a request filter holds its output until the wait
+     *  of a context completes (a pending wait of its own) */
+    int held;
+} ap_output_targets_t;
+
+/**
+ * What the output pending in a connection's filters waits for, after
+ * ap_check_output_pending() returned AGAIN: the lowest pending filter's
+ * target (the one closest to the network), as recorded by that call (no
+ * second walk): room, a time, or a held filter's wait. Core's own, for the
+ * waits of a request's client context (ap_request_wait()).
+ * @param c The connection
+ * @param t Filled with the targets
+ * @remark Room when an output_pending hook other than the core's said
+ *         AGAIN.
+ */
+AP_CORE_DECLARE(void) ap_output_pending_targets(conn_rec *c,
+                                                ap_output_targets_t *t);
+
+/**
+ * Whether a request filter of the connection is pending in its output
+ * filters, with data or a reason (holding its output), core's own.
+ * @param c The connection
+ * @param drop Non-zero to drop what those filters hold (their reasons
+ *        cleared, the held data destroyed), a hold's wait being canceled or
+ *        completed already
+ * @return Non-zero if some is (or was, when dropped)
+ */
+AP_CORE_DECLARE(int) ap_output_pending_request(conn_rec *c, int drop);
+
+/**
+ * The wait of a request filter holding its output or input on a context
+ * (ap_filter_pending_wait()) completed, core's own: the output walk calls
+ * an output filter again, an input filter is read again.
+ * @param f The filter
+ * @param status The wait's status, as given to a continuation
+ */
+AP_CORE_DECLARE(void) ap_filter_hold_done(ap_filter_t *f, apr_status_t status);
+
+/* http_request.h's ap_request_holder_t (C89 forbids repeating its typedef) */
+struct ap_request_holder_t;
+
+/**
+ * The holder of a request filter's delegated hold (ap_filter_pending_wait()
+ * with AP_FILTER_HOLD_DELEGATED), core's own: part of the filter, its
+ * fields set by the core when the filter delegates.
+ * @param f The filter
+ * @return The holder
+ */
+AP_CORE_DECLARE(struct ap_request_holder_t *) ap_filter_holder(ap_filter_t *f);
+
+/**
+ * Make a holder the one whose delegated hold awaits its work on its
+ * request's connection (ap_request_hold_delegate(), or a request filter's
+ * ap_filter_pending_wait() with AP_FILTER_HOLD_DELEGATED), core's own:
+ * one at a time per connection, until the work takes it
+ * (ap_request_holder_take()) or it's withdrawn
+ * (ap_request_holder_withdraw()). A request filter's that its call returns
+ * without starting the work is released then (logged).
+ * @param c The connection
+ * @param holder The holder
+ * @return APR_SUCCESS, or APR_EBUSY if another one awaits its work
+ */
+AP_CORE_DECLARE(apr_status_t) ap_request_holder_await(conn_rec *c,
+                                                      struct ap_request_holder_t *holder);
+
+/**
+ * Take the holder of r whose delegated hold awaits its work on the
+ * connection, made by the code calling (a request filter's call in
+ * progress, or a module's code before it starts the work), now given that
+ * work (no longer awaiting it), core's own: the core releases it when the
+ * work ends, or at once if the work ends at once.
+ * @param c The connection
+ * @param r The request whose holder may await
+ * @return The holder, or NULL if none of r awaits its work
+ */
+AP_CORE_DECLARE(struct ap_request_holder_t *) ap_request_holder_take(conn_rec *c,
+                                                                     request_rec *r);
+
+/**
+ * Withdraw a holder still awaiting its work on the connection, core's own.
+ * @param c The connection
+ * @param holder The holder
+ * @return Non-zero if it awaited its work (no longer), zero otherwise
+ */
+AP_CORE_DECLARE(int) ap_request_holder_withdraw(conn_rec *c,
+                                                struct ap_request_holder_t *holder);
+
+/**
+ * Undo a request filter's delegated hold whose work ended at once, core's
+ * own: what the filter gave to hold is back in its brigade, the filter goes
+ * on in its call as if it hadn't held.
+ * @param f The filter
+ */
+AP_CORE_DECLARE(void) ap_filter_hold_undo(ap_filter_t *f);
+
+/**
+ * Whether a request input filter of the connection holds its input on a
+ * context (ap_filter_pending_wait()), core's own: the waits for the
+ * connection's input wait for that hold too.
+ * @param c The connection
+ * @return Non-zero if one does
+ */
+AP_CORE_DECLARE(int) ap_input_pending_held(conn_rec *c);
+
+/**
+ * The number of filter calls in progress on a connection (ap_get_brigade(),
+ * ap_pass_brigade(), nested), core's own: non-zero when the code calling it
+ * runs from a filter, which can't return SUSPENDED up.
+ * @param c The connection
+ * @param calls The number to set if not negative (e.g. zero while the
+ *        handlers of a subrequest run from a filter, then the previous
+ *        number back), else unchanged
+ * @return The number before
+ */
+AP_CORE_DECLARE(int) ap_filter_calls(conn_rec *c, int calls);
+
+/**
+ * The core input_pending hook.
+ */
+AP_DECLARE_NONSTD(int) ap_core_input_pending(conn_rec *c);
 
 /**
  * Flush function for apr_brigade_* calls.  This calls ap_pass_brigade
@@ -775,7 +961,8 @@ AP_DECLARE(void) ap_filter_protocol(ap_filter_t* f, unsigned int proto_flags);
  * about write completion (calling ap_filter_reinstate_brigade() with non-NULL
  * flush_upto), those can setaside WC buckets and the preceding data provided
  * they have first determined that the next filter(s) have pending data
- * already, usually by calling ap_filter_should_yield(f->next).
+ * already, usually by calling ap_filter_should_yield(f->next), or that they
+ * are pending themselves (a request filter holding its output for a reason).
  */
 
 /** Write Completion (WC) bucket data mark */

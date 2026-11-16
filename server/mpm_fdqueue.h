@@ -27,7 +27,7 @@
 
 #include <apr.h>
 
-/* This code is not AP_DECLARE()ed/exported, and used by MPMs event/worker
+/* This code is AP_DECLARE()ed/exported but used by MPMs event/worker
  * only (for now), not worth thinking about w/o threads either...
  */
 #if APR_HAS_THREADS
@@ -40,27 +40,46 @@
 #include <apr_thread_cond.h>
 #include <apr_network_io.h>
 
+struct fd_queue_t;      /* opaque */
 struct fd_queue_info_t; /* opaque */
 struct fd_queue_elem_t; /* opaque */
+typedef struct fd_queue_t fd_queue_t;
 typedef struct fd_queue_info_t fd_queue_info_t;
 typedef struct fd_queue_elem_t fd_queue_elem_t;
 
 AP_DECLARE(apr_status_t) ap_queue_info_create(fd_queue_info_t **queue_info,
-                                              apr_pool_t *pool, int max_idlers,
-                                              int max_recycled_pools);
+                                              apr_pool_t *pool, int max_recycled_pools);
 AP_DECLARE(apr_status_t) ap_queue_info_set_idle(fd_queue_info_t *queue_info,
                                                 apr_pool_t *pool_to_recycle);
 AP_DECLARE(apr_status_t) ap_queue_info_try_get_idler(fd_queue_info_t *queue_info);
-AP_DECLARE(apr_status_t) ap_queue_info_wait_for_idler(fd_queue_info_t *queue_info,
-                                                      int *had_to_block);
+AP_DECLARE(apr_status_t) ap_queue_info_wait_for_idler(fd_queue_info_t *queue_info);
 AP_DECLARE(apr_uint32_t) ap_queue_info_num_idlers(fd_queue_info_t *queue_info);
 AP_DECLARE(apr_status_t) ap_queue_info_term(fd_queue_info_t *queue_info);
 
-AP_DECLARE(void) ap_queue_info_pop_pool(fd_queue_info_t *queue_info,
-                                        apr_pool_t **recycled_pool);
+/* Async API */
+AP_DECLARE(apr_int32_t) ap_queue_info_idlers_inc(fd_queue_info_t *queue_info);
+AP_DECLARE(apr_int32_t) ap_queue_info_idlers_dec(fd_queue_info_t *queue_info);
+AP_DECLARE(apr_int32_t) ap_queue_info_idlers_count(fd_queue_info_t *queue_info);
+
+AP_DECLARE(apr_pool_t *) ap_queue_info_pop_pool(fd_queue_info_t *queue_info);
 AP_DECLARE(void) ap_queue_info_push_pool(fd_queue_info_t *queue_info,
                                          apr_pool_t *pool_to_recycle);
 AP_DECLARE(void) ap_queue_info_free_idle_pools(fd_queue_info_t *queue_info);
+
+enum ap_queue_event_type_e
+{
+    AP_QUEUE_EVENT_SOCK,
+    AP_QUEUE_EVENT_BATON,
+};
+typedef enum ap_queue_event_type_e ap_queue_event_type_e;
+
+struct sock_event_t
+{
+    apr_pool_t *p;
+    apr_socket_t *sd;
+    void *baton;
+};
+typedef struct sock_event_t sock_event_t;
 
 struct timer_event_t
 {
@@ -68,38 +87,85 @@ struct timer_event_t
     apr_time_t when;
     ap_mpm_callback_fn_t *cbfunc;
     void *baton;
-    int canceled;
-    apr_array_header_t *pfds;
+    apr_interval_time_t timeout;
+    struct apr_skiplistnode *node; /* the node in the timers skiplist, if any */
 };
 typedef struct timer_event_t timer_event_t;
 
-struct fd_queue_t
+struct ap_queue_event_t
 {
-    APR_RING_HEAD(timers_t, timer_event_t) timers;
-    fd_queue_elem_t *data;
-    unsigned int nelts;
-    unsigned int bounds;
-    unsigned int in;
-    unsigned int out;
-    apr_thread_mutex_t *one_big_mutex;
-    apr_thread_cond_t *not_empty;
-    volatile int terminated;
+    /* event data */
+    ap_queue_event_type_e type;
+    union {
+        sock_event_t *se;
+        void *baton;
+    } data;
+
+    /* called back when the event is pushed/popped,
+     * under the queue lock (must not block!)
+     */
+    void (*cb)(void *baton, int pushed);
+    void *cb_baton;
+
+    /* link in container when queued (for internal use) */
+    fd_queue_elem_t *elem;
+
+    /* when it was pushed and its class, for the MPM's stats */
+    apr_time_t queued_at;
+    int qclass;
 };
-typedef struct fd_queue_t fd_queue_t;
+typedef struct ap_queue_event_t ap_queue_event_t;
 
-AP_DECLARE(apr_status_t) ap_queue_create(fd_queue_t **pqueue,
-                                         int capacity, apr_pool_t *p);
-AP_DECLARE(apr_status_t) ap_queue_push_socket(fd_queue_t *queue,
-                                              apr_socket_t *sd, void *sd_baton,
+AP_DECLARE(apr_status_t) ap_queue_create(fd_queue_t **pqueue, int capacity,
+                                         apr_pool_t *p);
+/* Use nlanes lanes (up to 8), popped by weighted round-robin with the given
+ * weights (> 0, in lanes order); an event goes to the lane of its qclass
+ * (lane 0 if out of range, sockets too). To call once, before the queue is
+ * used by other threads.
+ */
+AP_DECLARE(apr_status_t) ap_queue_set_lanes(fd_queue_t *queue,
+                                            unsigned int nlanes,
+                                            const unsigned int *weights);
+/* The number of elements in a lane (unlocked, for stats or heuristics) */
+AP_DECLARE(apr_uint32_t) ap_queue_lane_nelts(fd_queue_t *queue,
+                                             unsigned int lane);
+/* The queued_at of the oldest event in a lane, 0 if empty (unlocked) */
+AP_DECLARE(apr_time_t) ap_queue_lane_head_time(fd_queue_t *queue,
+                                               unsigned int lane);
+
+/* mpm_event API (queue of any event) */
+/* Don't wake up a waiting popper (the pusher pops the event itself) */
+#define AP_QUEUE_PUSH_NO_SIGNAL (1u << 0)
+/* APR_INCOMPLETE rather than APR_SUCCESS when the event is queued but more
+ * events are queued than waiters wait for one (or were woken up and will pop
+ * one): one is left for the caller to get popped otherwise
+ */
+#define AP_QUEUE_PUSH_CHECK_WAITERS (1u << 1)
+/* Push an event, with AP_QUEUE_PUSH_* flags */
+AP_DECLARE(apr_status_t) ap_queue_push_event(fd_queue_t *queue,
+                                             ap_queue_event_t *event,
+                                             unsigned int flags);
+AP_DECLARE(apr_status_t) ap_queue_pop_event(fd_queue_t *queue,
+                                            ap_queue_event_t **pevent);
+/* Like ap_queue_pop_event() but APR_EAGAIN instead of waiting when empty */
+AP_DECLARE(apr_status_t) ap_queue_trypop_event(fd_queue_t *queue,
+                                               ap_queue_event_t **pevent);
+/* Like ap_queue_pop_event() but APR_TIMEUP after waiting for timeout */
+AP_DECLARE(apr_status_t) ap_queue_pop_event_timeout(fd_queue_t *queue,
+                                                    ap_queue_event_t **pevent,
+                                                    apr_interval_time_t timeout);
+AP_DECLARE(apr_status_t) ap_queue_lock(fd_queue_t *queue);
+AP_DECLARE(void) ap_queue_kill_event_locked(fd_queue_t *queue,
+                                            ap_queue_event_t *event);
+AP_DECLARE(apr_status_t) ap_queue_unlock(fd_queue_t *queue);
+
+/* mpm_worker API (queue of socket_event_t only) */
+AP_DECLARE(apr_status_t) ap_queue_push_socket(fd_queue_t *queue, apr_socket_t *sd,
                                               apr_pool_t *p);
-AP_DECLARE(apr_status_t) ap_queue_push_timer(fd_queue_t *queue,
-                                             timer_event_t *te);
-AP_DECLARE(apr_status_t) ap_queue_pop_something(fd_queue_t *queue,
-                                                apr_socket_t **sd, void **sd_baton,
-                                                apr_pool_t **p, timer_event_t **te);
-#define                  ap_queue_pop_socket(q_, s_, p_) \
-                            ap_queue_pop_something((q_), (s_), NULL, (p_), NULL)
+AP_DECLARE(apr_status_t) ap_queue_pop_socket(fd_queue_t *queue, apr_socket_t **psd,
+                                             apr_pool_t **pp);
 
+/* common API */
 AP_DECLARE(apr_status_t) ap_queue_interrupt_all(fd_queue_t *queue);
 AP_DECLARE(apr_status_t) ap_queue_interrupt_one(fd_queue_t *queue);
 AP_DECLARE(apr_status_t) ap_queue_term(fd_queue_t *queue);

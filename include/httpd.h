@@ -465,6 +465,8 @@ AP_DECLARE(const char *) ap_get_server_built(void);
                          */
 #define SUSPENDED   -3  /**< Module will handle the remainder of the request.
                          *   The core will never invoke the request again */
+#define AGAIN       -4  /**< Module wants to be called again when
+                         *   more data is available */
 
 /** Returned by the bottom-most filter if no data was written.
  *  @see ap_pass_brigade(). */
@@ -770,6 +772,19 @@ typedef apr_uint64_t ap_request_bnotes_t;
 /** @} // values_request_rec_body */
 
 /**
+ * request_rec.expecting_100 flag, only while it is set (the client waits for
+ * a 100 Continue): HTTP_IN may send the 100 on a nonblocking read too (by
+ * default only on a blocking read, for readers not ready for it yet such as
+ * mod_proxy_http before the backend agrees). Set around the reads that allow
+ * it; sending the 100 resets expecting_100 to 0 (flag included). If (some of)
+ * the 100 can't be written without blocking, the read returns APR_EAGAIN with
+ * the 100 pending in the connection's output filters: the reader must wait
+ * for the connection to be writable (ap_check_output_pending()) before
+ * waiting for the client to send its body.
+ */
+#define AP_EXPECT_100_NONBLOCK   0x2
+
+/**
  * @defgroup values_request_rec_used_path_info Possible values for request_rec.used_path_info
  * @ingroup APACHE_CORE_DAEMON
  * @{
@@ -968,7 +983,8 @@ struct request_rec {
     int read_body;
     /** reading chunked transfer-coding */
     int read_chunked;
-    /** is client waiting for a 100 response? */
+    /** is client waiting for a 100 response? (non-zero if so, possibly
+     *  with AP_EXPECT_100_NONBLOCK) */
     unsigned expecting_100;
     /** The optional kept body of the request. */
     apr_bucket_brigade *kept_body;
@@ -1103,13 +1119,6 @@ struct request_rec {
     int no_cache;
     /** There is no local copy of this response */
     int no_local_copy;
-
-    /** Mutex protect callbacks registered with ap_mpm_register_timed_callback
-     * from being run before the original handler finishes running
-     */
-#if APR_HAS_THREADS
-    apr_thread_mutex_t *invoke_mtx;
-#endif
 
     /** A struct containing the components of URI */
     apr_uri_t parsed_uri;
@@ -1330,7 +1339,7 @@ typedef enum  {
     CONN_STATE_PROCESSING,          /* Processed by process_connection hooks */
     CONN_STATE_HANDLER,             /* Processed by the modules handlers */
     CONN_STATE_WRITE_COMPLETION,    /* Flushed by the MPM before entering CONN_STATE_KEEPALIVE */
-    CONN_STATE_SUSPENDED,           /* Suspended in the MPM until ap_run_resume_suspended() */
+    CONN_STATE_SUSPENDED,           /* Suspended from the MPM until ap_run_resume_suspended() */
     CONN_STATE_LINGER,              /* MPM flushes then closes the connection with lingering */
     CONN_STATE_LINGER_NORMAL,       /* MPM has started lingering close with normal timeout */
     CONN_STATE_LINGER_SHORT,        /* MPM has started lingering close with short timeout */
@@ -1361,6 +1370,14 @@ struct conn_state_t {
     conn_state_e state;
     /** Whether to read instead of write, or write instead of read */
     conn_sense_e sense;
+    /** The request being read nonblocking, kept by ap_read_request_ex()
+     *  across APR_EAGAIN until its head is complete (or it fails). */
+    request_rec *partial_request;
+    /** Set by the MPM when the wait of CONN_STATE_ASYNC_WAITIO timed out, for
+     *  one last pass of the process_connection hooks: they can answer the
+     *  timeout (e.g. a 408 for a request not read in time) but not wait
+     *  again (CONN_STATE_ASYNC_WAITIO then closes the connection). */
+    int timed_out;
 };
 
 /* Per-vhost config... */
@@ -2345,6 +2362,7 @@ AP_DECLARE(int) ap_parse_strict_length(apr_off_t *len, const char *str);
  * The unit of the time interval is given as postfix string to the numeric
  * string. Currently the following units are understood (case insensitive):
  *
+ * us    : microseconds
  * ms    : milliseconds
  * s     : seconds
  * mi[n] : minutes

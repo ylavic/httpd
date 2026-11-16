@@ -744,14 +744,171 @@
  *                         connection_added() and ap_mpm_note_extra_
  *                         connection_removed(), and ap_mpm_wait_for_extra_
  *                         connections(), to mpm_common.h
+ * 20260601.1  (2.5.1-dev) Add AGAIN, ap_check_input_pending() and
+ *                         ap_check_output_pending()
+ * 20260601.2  (2.5.1-dev) Add min_connection_timeout hook and
+ *                         ap_get_connection_timeout()
+ * 20260601.3  (2.5.1-dev) Add ap_mpm_poll_suspended() and
+ *                         AP_MPMQ_CAN_POLL_SUSPENDED
+ * 20260601.4  (2.5.1-dev) Axe ap_mpm_register_poll_callback,
+ *                         ap_mpm_register_poll_callback_timeout and
+ *                         AP_MPMQ_CAN_POLL
+ * 20260601.5  (2.5.1-dev) Axe ap_mpm_poll_suspended() and
+ *                         AP_MPMQ_CAN_POLL_SUSPENDED
+ * 20260601.6  (2.5.1-dev) Add ap_mpm_register_wait(), ap_mpm_continuation_fn_t,
+ *                         ap_mpm_wait_result_e, AP_MPM_WAIT_KEEP_PFDS,
+ *                         AP_MPM_WAIT_DRAINED, ap_mpm_release_pfd(),
+ *                         ap_mpm_release_pfds(), ap_mpm_notifier_t,
+ *                         ap_mpm_notifier_create(), ap_mpm_notify(),
+ *                         ap_mpm_notifier_rearm(),
+ *                         ap_mpm_register_timeouts(),
+ *                         AP_MPMQ_CAN_REGISTER_WAIT and
+ *                         AP_MPMQ_MAX_CONNECTIONS to ap_mpm.h, and the
+ *                         mpm_register_wait, mpm_release_pfd,
+ *                         mpm_notifier_create, mpm_notify,
+ *                         mpm_notifier_rearm and
+ *                         mpm_register_timeouts hooks to mpm_common.h;
+ *                         conn_state_t->partial_request,
+ *                         conn_state_t->timed_out and
+ *                         AP_EXPECT_100_NONBLOCK to httpd.h;
+ *                         ap_read_request_ex(), ap_send_interim_response_ex(),
+ *                         AP_SEND_INTERIM_NONBLOCK, ap_h1_head_kind_e,
+ *                         AP_H1_HEAD_OPT_STRICT, AP_H1_HEAD_OPT_BACKEND,
+ *                         AP_H1_HEAD_OPT_MERGE, ap_h1_head_opts_t
+ *                         (with its echo_protocol field),
+ *                         ap_h1_head_t, ap_h1_head_parser_t,
+ *                         ap_h1_head_opts_init_() (and its macro
+ *                         ap_h1_head_opts_init()), ap_h1_head_parser_create(),
+ *                         ap_h1_head_parse(), ap_h1_head_parser_reset(),
+ *                         ap_h1_head_parser_status(), ap_h1_set_trailers_opts()
+ *                         and ap_h1_get_trailers_opts() to http_protocol.h;
+ *                         process_score->shutdown, ->backlog and
+ *                         ->workers_live to scoreboard.h;
+ *                         AP_SHUTDOWN_CONN_* to http_connection.h;
+ *                         ap_request_finish_suspended(),
+ *                         ap_request_resume_suspended_() (and its macro
+ *                         without the trailing "_"),
+ *                         ap_request_can_suspend(), ap_wait_direction_e,
+ *                         AP_REQUEST_WAIT_DRAINED,
+ *                         AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT,
+ *                         ap_request_waitctx_t, ap_request_continuation_fn,
+ *                         ap_request_waitctx_client_(),
+ *                         ap_request_waitctx_conn_(),
+ *                         ap_request_waitctx_pfd_(),
+ *                         ap_request_waitctx_timer_(),
+ *                         ap_request_waitctx_notifier_() (and their macros
+ *                         without the trailing "_"),
+ *                         ap_request_waitctx_release(), ap_request_wait(),
+ *                         ap_request_wait_any(), ap_request_waitctx_ready(),
+ *                         AP_REQUEST_BODY_SETASIDE, AP_REQUEST_BODY_BLOCK,
+ *                         ap_request_read_body_(),
+ *                         ap_request_wait_body_(), ap_request_body_run_(),
+ *                         ap_request_discard_body_() (and their macros
+ *                         without the trailing "_"),
+ *                         ap_request_body_sink_fn,
+ *                         ap_request_body_done_fn, ap_sub_req_done_fn and
+ *                         ap_run_sub_req_async_() (and its macro without
+ *                         the trailing "_") to http_request.h;
+ *                         ap_h1_header_in_filter_handle to mod_core.h;
+ *                         ap_proxy_direction_e, ap_proxy_handler_resume(),
+ *                         ap_proxy_handler_done(), proxy_req_conf->async,
+ *                         ap_proxy_conn_pool_waiter,
+ *                         ap_proxy_conn_pool_waiter_make(),
+ *                         ap_proxy_acquire_connection_ex(),
+ *                         ap_proxy_cancel_conn_pool_waiter(),
+ *                         ap_proxy_connect_state,
+ *                         ap_proxy_connect_backend_ex(),
+ *                         ap_proxy_connect_backend_cancel(),
+ *                         ap_proxy_spool_state, ap_proxy_spool_input_ex(),
+ *                         ap_proxy_tunnel_step(), ap_proxy_tunnel_done_fn and
+ *                         ap_proxy_tunnel_run_ex(),
+ *                         ap_proxy_wait_continuation_fn (the core's
+ *                         ap_request_continuation_fn),
+ *                         AP_PROXY_WAIT_DRAINED, ap_proxy_wait(),
+ *                         ap_proxy_scheme_handler_fn,
+ *                         ap_proxy_acquire_connection_async(),
+ *                         ap_proxy_request_can_suspend(),
+ *                         ap_proxy_h1_head_opts_() (and its macro
+ *                         ap_proxy_h1_head_opts()), the limit_response_* and
+ *                         http_unsafe* fields of proxy_dir_conf and
+ *                         proxy_worker_shared, proxy_conn_rec->backend_wait
+ *                         to mod_proxy.h;
+ *                         ap_get_listen_buckets_ratio() to ap_listen.h;
+ *                         AP_IMPLEMENT_HOOK_RUN_FIRST_FROM to ap_hooks.h;
+ *                         ap_run_handler_from() and
+ *                         ap_invoke_handler_resume() to http_config.h; and
+ *                         ap_core_input_drained(), ap_request_phase_e,
+ *                         ap_request_async_t (with its top, waits,
+ *                         handler_pos, handler, old_handler, ended, running,
+ *                         suspended, deadline_reached, done, done_baton,
+ *                         deadline and module_index),
+ *                         core_request_config->async,
+ *                         core_request_config->body (struct
+ *                         ap_request_body) and
+ *                         core_dir_config->async_requests to http_core.h
+ * 20260601.7  (2.5.1-dev) Add ap_proxy_hold_connection() and
+ *                         proxy_conn_rec->holder to mod_proxy.h
+ * 20260601.8  (2.5.1-dev) Add ap_mpm_notifier_attach(),
+ *                         ap_mpm_notifier_notified() and
+ *                         ap_mpm_notifier_detach() to ap_mpm.h, and the
+ *                         mpm_notifier_attach, mpm_notifier_notified and
+ *                         mpm_notifier_detach hooks to mpm_common.h
+ * 20260601.9  (2.5.1-dev) Add ap_request_wait_cancel() to http_request.h
+ * 20260601.10 (2.5.1-dev) ap_mpm_register_wait() and the mpm_register_wait
+ *                         hook take AP_MPM_WAIT_KEEP_PFDS and
+ *                         AP_MPM_WAIT_DRAINED per pfd (pfds_flags) instead
+ *                         of flags for the whole wait
+ * 20260601.11 (2.5.1-dev) Add ap_output_targets_t,
+ *                         ap_output_pending_targets() and
+ *                         ap_output_pending_request() to util_filter.h
+ * 20260601.12 (2.5.1-dev) Add ap_filter_pending_wait(),
+ *                         ap_filter_pending_notify() and
+ *                         ap_request_filter_hold() to http_request.h,
+ *                         ap_filter_hold_done() to util_filter.h, and
+ *                         ap_request_async_t->subreqs to http_core.h
+ * 20260601.13 (2.5.1-dev) Add ap_request_async_t->hold_point and
+ *                         ->end_status to http_core.h, and
+ *                         ap_request_drop_holds() to http_request.h
+ * 20260601.14 (2.5.1-dev) Add ap_filter_pending_more() to util_filter.h
+ * 20260601.15 (2.5.1-dev) Add ap_input_pending_held() to util_filter.h
+ * 20260601.16 (2.5.1-dev) Add ap_filter_pending_until() to http_request.h
+ * 20260601.17 (2.5.1-dev) Add ap_filter_calls() to util_filter.h
+ * 20260601.18 (2.5.1-dev) Add AP_FILTER_HOLD_DELEGATED to http_request.h,
+ *                         ap_filter_hold_delegate() and
+ *                         ap_filter_hold_undo() to util_filter.h, and
+ *                         ap_request_async_t->holder, ->delegate and
+ *                         ->subreqs_delegated to http_core.h
+ * 20260601.19 (2.5.1-dev) Add ap_request_hold_end_e, ap_request_holder_t,
+ *                         ap_request_hold_release_fn,
+ *                         ap_request_hold_delegate() and
+ *                         ap_request_hold_withdraw() to http_request.h, and
+ *                         ap_filter_holder(), ap_request_holder_await(),
+ *                         ap_request_holder_take() and
+ *                         ap_request_holder_withdraw() to util_filter.h;
+ *                         ap_request_async_t->holder is an
+ *                         ap_request_holder_t; ap_filter_hold_delegate()
+ *                         removed from util_filter.h
+ * 20260601.20 (2.5.1-dev) Add AP_PROXY_TUNNEL_HOLD_BOTH,
+ *                         ap_proxy_tunnel_hold() and
+ *                         ap_proxy_tunnel_hold_status() to mod_proxy.h
+ * 20260601.21 (2.5.1-dev) Add AP_PROXY_TUNNEL_HOLD_DELEGATED to mod_proxy.h
+ * 20260601.22 (2.5.1-dev) Add ap_request_holder_t.timeout to http_request.h
+ * 20260601.23 (2.5.1-dev) Add ap_core_input_short_drains() to http_core.h
+ * 20261114.0  (2.5.1-dev) Axe ap_mpm_register_timed_callback() and the
+ *                         mpm_register_timed_callback hook (a request waits
+ *                         for a delay with a timer wait context,
+ *                         ap_request_waitctx_timer(), a connection with
+ *                         ap_mpm_register_wait() and only a timeout);
+ *                         AP_MPMQ_HAS_SERF is always 0 (no MPM drives serf);
+ *                         r->invoke_mtx removed from request_rec
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
 
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
-#define MODULE_MAGIC_NUMBER_MAJOR 20211221
+#define MODULE_MAGIC_NUMBER_MAJOR 20261114
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 35             /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 0     /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a

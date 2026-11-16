@@ -68,11 +68,17 @@
     APR_HOOK_LINK(drop_privileges) \
     APR_HOOK_LINK(mpm) \
     APR_HOOK_LINK(mpm_query) \
-    APR_HOOK_LINK(mpm_register_timed_callback) \
-    APR_HOOK_LINK(mpm_register_poll_callback) \
-    APR_HOOK_LINK(mpm_register_poll_callback_timeout) \
     APR_HOOK_LINK(mpm_get_name) \
     APR_HOOK_LINK(mpm_resume_suspended) \
+    APR_HOOK_LINK(mpm_register_wait) \
+    APR_HOOK_LINK(mpm_register_timeouts) \
+    APR_HOOK_LINK(mpm_release_pfd) \
+    APR_HOOK_LINK(mpm_notifier_create) \
+    APR_HOOK_LINK(mpm_notify) \
+    APR_HOOK_LINK(mpm_notifier_rearm) \
+    APR_HOOK_LINK(mpm_notifier_attach) \
+    APR_HOOK_LINK(mpm_notifier_notified) \
+    APR_HOOK_LINK(mpm_notifier_detach) \
     APR_HOOK_LINK(end_generation) \
     APR_HOOK_LINK(child_status) \
     APR_HOOK_LINK(output_pending) \
@@ -106,22 +112,43 @@ AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm,
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm_query,
                             (int query_code, int *result, apr_status_t *_rv),
                             (query_code, result, _rv), DECLINED)
-AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_timed_callback,
-                            (apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton),
-                            (t, cbfn, baton), APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_resume_suspended,
                             (conn_rec *c),
                             (c), APR_ENOTIMPL)
-AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_poll_callback,
-                            (apr_pool_t *p, const apr_array_header_t *pds,
-                             ap_mpm_callback_fn_t *cbfn, void *baton),
-                            (p, pds, cbfn, baton), APR_ENOTIMPL)
-AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_poll_callback_timeout,
-                            (apr_pool_t *p, const apr_array_header_t *pds,
-                             ap_mpm_callback_fn_t *cbfn,
-                             ap_mpm_callback_fn_t *tofn,
-                             void *baton, apr_time_t timeout),
-                            (p, pds, cbfn, tofn, baton, timeout), APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_wait,
+                            (conn_rec *c, apr_pool_t *p,
+                             const apr_array_header_t *pfds,
+                             apr_interval_time_t timeout,
+                             ap_mpm_notifier_t *notifier,
+                             const unsigned int *pfds_flags,
+                             ap_mpm_continuation_fn_t *fn, void *baton),
+                            (c, p, pfds, timeout, notifier, pfds_flags, fn,
+                             baton),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_register_timeouts,
+                            (const apr_array_header_t *timeouts), (timeouts),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_release_pfd,
+                            (const apr_pollfd_t *pfd), (pfd), APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_create,
+                            (ap_mpm_notifier_t **notifier, conn_rec *c,
+                             apr_pool_t *p),
+                            (notifier, c, p), APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(int, mpm_notify,
+                            (ap_mpm_notifier_t *notifier), (notifier), DECLINED)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_rearm,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_attach,
+                            (ap_mpm_notifier_t *notifier,
+                             ap_mpm_notifier_t *parent),
+                            (notifier, parent), APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_notified,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
+AP_IMPLEMENT_HOOK_RUN_FIRST(apr_status_t, mpm_notifier_detach,
+                            (ap_mpm_notifier_t *notifier), (notifier),
+                            APR_ENOTIMPL)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, output_pending,
                             (conn_rec *c), (c), DECLINED)
 AP_IMPLEMENT_HOOK_RUN_FIRST(int, input_pending,
@@ -620,26 +647,73 @@ AP_DECLARE(apr_status_t) ap_mpm_resume_suspended(conn_rec *c)
     return ap_run_mpm_resume_suspended(c);
 }
 
-AP_DECLARE(apr_status_t) ap_mpm_register_timed_callback(apr_time_t t,
-        ap_mpm_callback_fn_t *cbfn, void *baton)
+AP_DECLARE(apr_status_t) ap_mpm_register_wait(conn_rec *c, apr_pool_t *p,
+                                              const apr_array_header_t *pfds,
+                                              apr_interval_time_t timeout,
+                                              ap_mpm_notifier_t *notifier,
+                                              const unsigned int *pfds_flags,
+                                              ap_mpm_continuation_fn_t *fn,
+                                              void *baton)
 {
-    return ap_run_mpm_register_timed_callback(t, cbfn, baton);
+    return ap_run_mpm_register_wait(c, p, pfds, timeout, notifier,
+                                    pfds_flags, fn, baton);
 }
 
-AP_DECLARE(apr_status_t) ap_mpm_register_poll_callback(
-        apr_pool_t *p, const apr_array_header_t *pfds,
-        ap_mpm_callback_fn_t *cbfn, void *baton)
+AP_DECLARE(apr_status_t) ap_mpm_register_timeouts(
+        const apr_array_header_t *timeouts)
 {
-    return ap_run_mpm_register_poll_callback(p, pfds, cbfn, baton);
+    return ap_run_mpm_register_timeouts(timeouts);
 }
 
-AP_DECLARE(apr_status_t) ap_mpm_register_poll_callback_timeout(
-        apr_pool_t *p, const apr_array_header_t *pfds,
-        ap_mpm_callback_fn_t *cbfn, ap_mpm_callback_fn_t *tofn,
-        void *baton, apr_time_t timeout)
+AP_DECLARE(apr_status_t) ap_mpm_release_pfds(const apr_array_header_t *pfds)
 {
-    return ap_run_mpm_register_poll_callback_timeout(p, pfds, cbfn, tofn,
-                                                     baton, timeout);
+    apr_status_t rv, final_rv = APR_SUCCESS;
+    int i;
+
+    for (i = 0; pfds && i < pfds->nelts; i++) {
+        rv = ap_mpm_release_pfd(&APR_ARRAY_IDX(pfds, i, apr_pollfd_t));
+        if (rv != APR_SUCCESS) {
+            final_rv = rv;
+        }
+    }
+    return final_rv;
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_release_pfd(const apr_pollfd_t *pfd)
+{
+    return ap_run_mpm_release_pfd(pfd);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_notifier_create(ap_mpm_notifier_t **notifier,
+                                                conn_rec *c, apr_pool_t *p)
+{
+    return ap_run_mpm_notifier_create(notifier, c, p);
+}
+
+AP_DECLARE(void) ap_mpm_notify(ap_mpm_notifier_t *notifier)
+{
+    (void)ap_run_mpm_notify(notifier);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_notifier_rearm(ap_mpm_notifier_t *notifier)
+{
+    return ap_run_mpm_notifier_rearm(notifier);
+}
+
+AP_DECLARE(apr_status_t) ap_mpm_notifier_attach(ap_mpm_notifier_t *notifier,
+                                                ap_mpm_notifier_t *parent)
+{
+    return ap_run_mpm_notifier_attach(notifier, parent);
+}
+
+AP_DECLARE(int) ap_mpm_notifier_notified(ap_mpm_notifier_t *notifier)
+{
+    return ap_run_mpm_notifier_notified(notifier) == APR_SUCCESS;
+}
+
+AP_DECLARE(void) ap_mpm_notifier_detach(ap_mpm_notifier_t *notifier)
+{
+    (void)ap_run_mpm_notifier_detach(notifier);
 }
 
 AP_DECLARE(const char *)ap_show_mpm(void)

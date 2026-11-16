@@ -113,7 +113,7 @@ AP_DECLARE(int) ap_setup_listeners(server_rec *s);
  * This function duplicates ap_listeners into multiple buckets when configured
  * to (see ListenCoresBucketsRatio) and the platform supports it (eg. number of
  * online CPU cores and SO_REUSEPORT available).
- * @param p The config pool
+ * @param p The pool of the returned buckets array
  * @param s The global server_rec
  * @param buckets The array of listeners buckets.
  * @param num_buckets The total number of listeners buckets (array size).
@@ -121,10 +121,22 @@ AP_DECLARE(int) ap_setup_listeners(server_rec *s);
  *         according to the platform capacities, otherwise (positive) it
  *         will be preserved. The number of listeners duplicated will
  *         always match *num_buckets, be it computed or given.
+ * @remark Like ap_listeners, the duplicated listeners live in the process
+ *         pool and the ones of the previous call that match (same bucket,
+ *         address, protocol and flags) are reused, the others closed.
  */
 AP_DECLARE(apr_status_t) ap_duplicate_listeners(apr_pool_t *p, server_rec *s,
                                                 ap_listen_rec ***buckets,
                                                 int *num_buckets);
+
+/**
+ * Get the configured ListenCoresBucketsRatio.
+ * @return The ratio, 0 when not configured.
+ * @remark For an MPM computing the number of buckets it passes to
+ *         ap_duplicate_listeners(); ap_have_so_reuseport tells whether
+ *         more than one bucket is possible.
+ */
+AP_DECLARE(int) ap_get_listen_buckets_ratio(void);
 
 /**
  * Loop through the global ap_listen_rec list and close each of the sockets.

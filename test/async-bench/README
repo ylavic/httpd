@@ -1,0 +1,284 @@
+Async proxying and MPM queuing: benchmark harness and checks (prototype)
+
+Build the Go tools (Go >= 1.21, no module needed):
+  go build -o backend backend.go     # backend: GET /?d=MS answers 512 bytes after MS ms,
+                                     # "Upgrade: echo" gets a 101 then an echo,
+                                     # GET /?s=BYTES streams BYTES, POST reads its body
+  go build -o loadgen loadgen.go     # load generator (closed loop, or open loop -rate;
+                                     # paced uploads -upload, slow reads -rchunk)
+  go build -o tunnelgen tunnelgen.go # tunnels (Upgrade: echo) sending a message every -i
+  go build -o fcgibackend fcgibackend.go # FastCGI backend: GET /?d=MS answers 512 bytes
+                                     # after MS ms, /?s=BYTES streams BYTES, POST reads
+                                     # its body; -raw ADDR misbehaves (closes early)
+  go build -o schemebackend schemebackend.go # AJP13 (-ajp), SCGI (-scgi) and uwsgi
+                                     # (-uwsgi) responders: ?d=MS, ?s=BYTES, ?close=0, ?proto=
+
+Build mod_aptest (its "aptest-queue" handler, controlled service times):
+  cd ../pyhttpd/mod_aptest && $PREFIX/bin/apxs -c mod_aptest.c
+
+The scripts start their own httpd from an install prefix ($PREFIX, e.g. built
+from this tree) with their own configuration under WORKDIR, on 127.0.0.1
+ports 18431-18435 (checks) and 18500-18510 (bench, queue). They pin httpd on
+CPUs 0-3 and the tools on 4-7 (taskset); for stable numbers use a fixed CPU
+frequency (cpupower frequency-set -g performance, no turbo). CPUS="HTTPD
+BACKEND TOOLS" changes the CPUs of the benches (e.g. CPUS="0-1 2 3" on 4
+CPUs). The benches using bench.py's helpers and the checks also run on
+FreeBSD (cpuset, ps, truss and netstat for taskset, /proc, strace and ss);
+queue.py is Linux only.
+
+bench.py PREFIX WORKDIR [delays] [backend_ms]
+  ProxyAsyncDelay benchmark: blocking (-1) vs async (0, 1ms, 10ms) against
+  backends answering in 0/1/10/100ms, 64 clients on one child of 8 threads;
+  throughput, latency percentiles, CPU and context switches per request of
+  the httpd tree. POOLMAX sets the backend pool's max= (256 by default, below
+  CLIENTS for a pool-bound run where requests wait for a connection); STRACE=1
+  adds the httpd child's syscalls per request (strace -c over the measured
+  window, which slows it down: only the per-request ratios are meaningful).
+  Build httpd optimized for numbers that mean something (-O2, no AP_DEBUG).
+  Run it several times into log files, then medians.py LOG... for the median
+  of each cell.
+
+tunnelbench.py PREFIX WORKDIR [tunnels,...]
+  Tunnel benchmark: 100, 1000 and 5000 tunnels by default (Upgrade: echo
+  through mod_proxy_http, async), each sending a SIZE-byte message (64) every
+  INTERVAL (1s) to the backend's echo; messages/s, latency percentiles, CPU
+  and context switches per message, and syscalls with STRACE=1 (the
+  epoll_ctl churn per message). DELAY=-1 for blocking tunnels (one thread
+  each, so no more tunnels than ThreadsPerChild). medians.py reads its logs
+  too.
+
+bodybench.py PREFIX WORKDIR [delays] [scenarios]
+  Large-body benchmark: blocking (-1) vs async (0) by default, 16 clients,
+  responses of SIZE bytes (4MB) streamed by the backend in CHUNK-byte writes
+  (64KB) and read by clients slower than the backend (down-slow: a CHUNK read
+  every PAUSE, 1ms) or as fast as possible (down-fast), and uploads of SIZE
+  bytes written a CHUNK every PAUSE (up). On loopback these hardly make a
+  request wait more than once (large socket buffers), so down-crawl and
+  up-crawl read or send CRAWL_SIZE bytes (1MB) a CRAWL_CHUNK (16KB) every
+  CRAWL_PAUSE (20ms), down-crawl through the client's receive buffer and
+  httpd's SendBufferSize set to CRAWL_CHUNK: about 60 waits per request.
+  Requests/s, MB/s, latency percentiles, CPU and context switches per MB of
+  the httpd tree, and syscalls per request with STRACE=1. medians.py reads its
+  logs too.
+
+queue.py PREFIX MOD_APTEST_SO WORKDIR [scenario...]
+  MPM queuing scenarios (burst, overload-cpu, blocked, async-mix, progress,
+  two-children): a background load and open-loop probes (a new connection
+  each, latency from the scheduled time) against "aptest-queue", with the
+  server's backlog stats (mpm_event's "backlog sojourn" lines, LogLevel
+  mpm_event:trace2) aggregated over the measured window and httpd's CPU use.
+  The admission's target and interval (ms, 5 and 100 by default) are set at
+  build time (-DAP_EVENT_ADMISSION_TARGET=, -DAP_EVENT_ADMISSION_INTERVAL=).
+
+checks/async-*-check.py PREFIX WORKDIR
+  Functional checks of the async proxy paths, each comparing blocking ("sync")
+  and async (ProxyAsyncDelay 0) modes (MODES="sync async" by default):
+  proto (response wait), body (response body), send (request body), head
+  (response head), connect, pool (waiting for a connection of an exhausted
+  pool, max= and acquire=), prefetch (request body before acquiring), tls
+  (backend handshake), remote (the CONNECT exchange with a forward proxy,
+  ProxyRemote, in front of the tls backend), balancer (failover,
+  failonstatus/failontimeout), shutdown (graceful and hard restarts/stops
+  with suspended requests), exit (httpd -X stopped with a request suspended,
+  its pools destroyed at exit), 100 (Expect: 100-continue end-to-end, ping=, ping
+  timeout, final responses instead of 100, the 100 sent by httpd itself, and
+  uploads waiting for the 100 not holding a worker), tunnel (Upgrade: tunnels
+  exchanging data, many on few threads, the idle timeout, either side
+  closing, a large transfer to a slow client, Upgrades answered late or
+  refused; tunnels being async by default, "sync" is ProxyAsyncDelay -1
+  there, and the "default", "wstunnel" (mod_proxy_wstunnel) and "connect"
+  (mod_proxy_connect) modes are added), fcgi (mod_proxy_fcgi against
+  fcgibackend: waits on few threads, timeout=, large streamed responses,
+  request bodies, the backend closing early or down, pipelined requests,
+  backend keep-alive with disablereuse=off, flushes (flushpackets=on) and an
+  error's ErrorDocument after an async wait to clients that stop reading),
+  redirect (an ErrorDocument proxied over http and fcgi: internally
+  redirected requests don't suspend; and after an async wait, proxied to the
+  same backend reusing its connection), schemes (mod_proxy_ajp,
+  mod_proxy_scgi and mod_proxy_uwsgi against schemebackend: waits on few
+  threads, timeout=, large responses, request bodies, early close, backend
+  down, a pool of one connection), balancer-wait (requests waiting for a
+  usable member until the balancer's timeout=, the backend coming back or
+  not), tlsfront (mod_ssl's client connections: silent clients timing out in
+  the handshake, clients not reading the server's handshake flight, slow TLS
+  downloads of a large static file, a TLS backend not reading the proxy's
+  handshake flight, none holding a worker).
+  PASSOPTS adds ProxyPass options (e.g. max=32 to not be bounded by the
+  backend connection pool).
+
+checks/async-wait-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  The core's request waits (ap_request_wait()) without mod_proxy, through
+  mod_aptest's "aptest-wait" handler (built with the install's apxs into
+  WORKDIR unless MOD_APTEST_SO is given): many timers on few threads,
+  crawling uploads (1MB, 16KB every 20ms) and crawling readers of an echo
+  (small socket buffers), chunked uploads whose trailers trickle, the read
+  timeouts (Timeout, and RequestReadTimeout's body= winning over it), a TLS
+  upload cut in the middle of a record, clients aborting mid-upload, a
+  notifier and its context serving several waits (re-armed, a stale
+  notification dropped, a re-arm in flight refused, a wait without the
+  re-arm declined and logged), several waits of a request pending at once
+  (a notifier, two descriptor contexts on one pipe, two timers completing
+  together and called in the order they were made, a wait canceled, one
+  dropped by the request's end; no worker held, 16 requests at once; a
+  subrequest run by the notifier's continuation while the others are
+  pending: suspended with them), the MPM's keep and drained
+  flags of each descriptor of a wait (two pipes, five MPM waits, from
+  mpm_event's trace7 lines for a connection from 127.0.0.2), 200
+  descriptor contexts per request made in subpools destroyed after their
+  waits, and a graceful stop during waits;
+  "sync" is AsyncRequests Off (every wait
+  blocks: the same results, and the blocking timers: as many as the threads
+  holding them all, as many more as wait for a worker without being closed
+  by Timeout, then beyond: some closed, the accepting stopped, the server
+  serving after), "async" also checks that no worker is held (mod_status)
+  and the times.
+
+checks/async-refuse-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  The core abandoning a request whose waits the MPM refuses (a bug of the
+  core or the MPM, made by mod_aptest's "AP-Test-Refuse-Wait" header; built
+  as for async-wait-check): ap_mpm_register_wait() failing, or the re-arm
+  of the request's notifier failing, in the request's first run and in a
+  run from a continuation; the connection closed at once without a
+  response, the error logged once, no crash, the server serving the same
+  requests after. "sync" is AsyncRequests Off (nothing refused: answered as
+  usual). Port 18472.
+
+checks/async-resume-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Handler chains resumed after a suspension (ap_request_resume_suspended()),
+  through mod_aptest's AptestSuspend handlers acting before the others
+  (mod_aptest built as for async-wait-check): suspended then DECLINED to a
+  static file or to mod_proxy (suspending in turn, backend's -addr on port
+  18448), two suspending handlers in a row, a handler answering, a 403 with
+  a local or a proxied ErrorDocument, the output filters answering an error
+  (one response), a resume before the handler returned SUSPENDED (refused
+  and logged; a debug build asserts, the child aborts), the suspending
+  location in a subrequest (mod_include), pipelined requests behind
+  suspended ones, many clients on few threads, ExtendedStatus' Total Duration
+  (no time counted while suspended in "async") and a graceful stop during
+  suspensions; "sync" is AsyncRequests Off (the handlers block: the same
+  responses), "async" also checks that no worker is held (mod_status).
+
+checks/async-reqbody-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  The core's request body reader (ap_request_read_body(),
+  ap_request_wait_body(), ap_request_body_run(), ap_request_discard_body())
+  through mod_aptest's "aptest-body" handler (AptestBody pull, sink,
+  discard; mod_aptest built as for async-wait-check) and AptestSuspend's
+  "read": Content-Length and chunked bodies, small and 8MB (digests),
+  crawling uploads on few threads, trickling trailers, Expect: 100-continue,
+  LimitRequestBody (413 by Content-Length and mid-body), the reader's 408
+  (Timeout) and mod_reqtimeout's (RequestReadTimeout body=), a malformed
+  chunk, a TLS upload cut in a record, clients aborting mid-upload, the
+  discard (a small leftover keeping the connection, over the limit by
+  Content-Length or chunked, a 100 Continue never sent), a body read then
+  replayed to mod_proxy_http (this server's /pull, on port 18452),
+  mod_proxy_scgi and mod_proxy_uwsgi (schemebackend on ports 18453-18454),
+  blocking reads from an output filter (AP_REQUEST_BODY_BLOCK), the error
+  log, and graceful and immediate stops during uploads; "sync" is
+  AsyncRequests Off (the reads block: the same responses), "async" also
+  checks that no worker is held (mod_status). Ports 18449-18454.
+
+checks/async-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Subrequests run asynchronously (ap_run_sub_req_async()) through
+  mod_aptest's AptestSubreq handler acting before the others (mod_aptest
+  built as for async-wait-check), their output passed to the client or
+  captured by an output filter of the subrequest: proxied subrequests
+  (backend's -addr on port 18456) suspended while mod_proxy waits, 1, 3 and
+  8 per request (8 streamed ones: the backend's descriptor kept by the MPM,
+  never more than EVENT_KEPT_MAX), subrequests suspended by AptestSuspend
+  then resumed to a static file, a nested subrequest, DECLINED to a static
+  file after the subrequests, a subrequest reaching its timeout (504 to the
+  caller, "async" only: blocking subrequests have no deadline), pipelined
+  requests behind requests running subrequests, many clients on few threads,
+  mod_auth_form's replay of a login form's request (the subrequest suspended
+  by AptestSuspend), the error log and a graceful stop during subrequests;
+  then mod_include's include virtual of a proxied URL, from its filter with
+  the filter's hold delegated to the subrequest (no worker held in
+  "async"), and two includes in a document, the second one's onerror run
+  after it fails, with the same output.
+  "sync" is AsyncRequests Off (the subrequests block: the same responses),
+  "async" also checks that no worker is held (mod_status). Ports
+  18455-18456.
+
+checks/async-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Request filters holding their output or input (ap_filter_pending_wait())
+  through mod_aptest's AptestHold filters (mod_aptest built as for
+  async-wait-check): a static file's EOS held on a timer and on a notifier
+  by 16 clients on 4 threads, then by two filters of a request in turn, a
+  burst of connections waiting for a worker longer than Timeout (served late,
+  none reset), a connection filter wanting to read to write (AptestWantRead:
+  the MPM polling for input, not spinning on output), each chunk of a
+  proxied stream held (the
+  backend's -addr on port 18462), a 1MB response passed in pieces held for
+  room to crawling readers, ap_die()'s 404 held by a protocol filter (the
+  second hold point), request bodies held by an input filter while the core's
+  body reader and mod_proxy wait for the client (completed by the hold, with
+  nothing more on the socket), holds refused while a subrequest writes
+  through the filter, pipelined requests, TLS, a hold longer than Timeout
+  (given up, the connection closed), the core's invariants in the error log
+  and a graceful stop while holding (shorter than Timeout: answered). "sync" is AsyncRequests Off (the holds
+  refused, the filter sleeping: the same responses), "async" also checks
+  that no worker is held (mod_status). Ports 18460-18462.
+
+checks/async-filter-subreq-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Request filters delegating their holds to subrequests
+  (AP_FILTER_HOLD_DELEGATED, then ap_run_sub_req_async()) through mod_aptest's
+  AptestFilterSubreq filter (mod_aptest built as for async-wait-check): 1, 3
+  and 8 proxied subrequests in turn at a static file's EOS (captured, or
+  passed below the filter), 3 before the first data of 8 proxied streams on
+  4 threads (mid-stream, the producer paused), 16 clients on 4 threads, a
+  subrequest reaching its timeout (504), the work's timeout bounding the
+  request's end rather than Timeout (a subrequest whose own timeout is
+  longer than Timeout completing past it, one without a timeout getting
+  Timeout: 504), ap_die()'s 404 held by a protocol filter running one (the
+  second hold point), a subrequest's own filter (refused, blocking), the
+  core's checks of a filter running ap_run_sub_req_async() without a
+  delegated hold (run blocking, logged) and of a delegated hold without its
+  work (released, logged), pipelined requests, the core's invariants in the
+  error log and a graceful stop.
+  "sync" is AsyncRequests Off (the holds refused, the subrequests blocking:
+  the same responses), "async" also checks that no worker is held
+  (mod_status). Ports 18465-18466 (the backend's -addr on 18466).
+
+checks/async-pace-check.py PREFIX WORKDIR
+  Paced output (ap_filter_pending_until()): mod_ratelimit (rate-limit
+  200KB/s) pacing a 200KB static file and a proxied stream for 8 clients on
+  4 threads (the rate kept, no worker held), a FLUSH reaching it (mod_proxy
+  streaming blocking with ProxyAsyncDelay -1: it sleeps as before),
+  mod_dialup's pulses a second apart (V.92) on timer waits, pipelined paced
+  responses in order, and the core's invariants in the error log. "sync" is
+  AsyncRequests Off (the filters sleep: the same bytes and rates), "async"
+  also checks that no worker is held (mod_status). Ports 18463-18464 (the
+  backend's -addr on 18464).
+
+checks/async-tunnel-hold-check.py PREFIX [MOD_APTEST_SO] WORKDIR
+  Tunnels held by their forward hooks (ap_proxy_tunnel_hold()) through
+  mod_aptest's AptestTunnelHold hook (mod_aptest built as for
+  async-wait-check), on mod_proxy_http's Upgrade tunnels to an echo backend
+  sending ticks or not: 8 tunnels on 2 threads holding each message 300ms,
+  the ticks flowing while the client's message is held (and not with
+  "pause"), a hold longer than the idle timeout (each direction on its own
+  idle clock: the other direction quiet ends the tunnel at the idle
+  timeout, flowing it keeps the tunnel until both are idle), a service's
+  answer timing out (APR_TIMEUP to the hook), a hold without timeout
+  bounded by the idle timeout, a delegated subrequest per message (proxied,
+  the ticks flowing meanwhile; static, ended at once), a TLS front with two
+  messages decrypted at once, holds on sockets in both directions (no
+  EVENT_KEPT_MAX line) and a graceful stop while held. "sync"
+  is ProxyAsyncDelay -1 (a synchronous tunnel: the holds refused, the hook
+  working blocking: the same bytes), "async" also checks that no worker is
+  held (mod_status), the times and the ticks. Ports 18467-18471 (the
+  backend's -addr on 18471).
+
+checks/h1-head-check.py PREFIX WORKDIR
+  The HTTP/1 head rules on both sides (ap_h1_head_parse()): request heads
+  from a client (HttpProtocolOptions Strict and Unsafe, LimitRequestLine,
+  LimitRequestFieldSize, LimitRequestFields: line ends, NUL bytes, field
+  names and values, obs-folds, the limits at limit + 1 and + 2, empty lines
+  before the request line, HTTP/0.9, the client closing), and response heads
+  and trailers from a raw backend through mod_proxy_http
+  (ProxyHttpProtocolOptions Strict and Unsafe, the ProxyLimitResponse*
+  limits: the same rules, stray CRLFs, malformed status lines, interim
+  responses, the backend closing), each head sent whole, one byte per packet
+  and split in two at every offset (SPLITS="whole byte every"), the cause of
+  each error logged; the response heads in MODES="sync async", the request
+  heads in the first mode.

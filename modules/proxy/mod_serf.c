@@ -27,37 +27,53 @@
 #include "apr_uri.h"
 #include "apr_strings.h"
 #include "apr_version.h"
-#include "ap_mpm.h"
+#include "apr_poll.h"
 
 module AP_MODULE_DECLARE_DATA serf_module;
-static int mpm_supprts_serf = 0;
 
 typedef struct {
     int on;
     int preservehost;
     apr_uri_t url;
-} serf_config_t;
+} modserf_dir_config_t;
 
 typedef struct {
   const char *name;
   const char *provider;
   apr_table_t *params;
-} serf_cluster_t;
+} modserf_cluster_t;
 
 typedef struct {
-  /* name -> serf_cluster_t* */
+  /* name -> modserf_cluster_t* */
   apr_hash_t *clusters;
-} serf_server_config_t;
+} modserf_server_config_t;
+
+/* A socket that serf polls when driven by the request's waits
+ * (serf_context_create_ex()), waited for through a wait context made in a
+ * pool of its own, for as long as serf has the socket registered.
+ */
+typedef struct modserf_wait_pfd_t {
+    struct modserf_wait_pfd_t *next;
+    apr_pool_t *pool;
+    apr_pollfd_t pfd;           /* desc and reqevents (copied) */
+    void *serf_baton;
+    ap_request_waitctx_t *ctx;
+} modserf_wait_pfd_t;
 
 typedef struct {
     int rstatus;
     int want_ssl;
     int done_headers;
     int keep_reading;
+    int async;                  /* driven by the request's waits */
     request_rec *r;
     apr_pool_t *serf_pool;
+    serf_context_t *serf_ctx;
+    apr_pool_t *wait_pool;      /* async: the sockets' pools' parent */
+    apr_pool_t *iter_pool;      /* async: cleared after each iteration */
+    modserf_wait_pfd_t *pfds;   /* async: the sockets serf polls */
     apr_bucket_brigade *tmpbb;
-    serf_config_t *conf;
+    modserf_dir_config_t *conf;
     serf_ssl_context_t *ssl_ctx;
     serf_bucket_alloc_t *bkt_alloc;
     serf_bucket_t *body_bkt;
@@ -66,43 +82,6 @@ typedef struct {
 #if !APR_VERSION_AT_LEAST(1,4,0)
 #define apr_time_from_msec(x) (x * 1000)
 #endif
-
-/**
- * This works right now because all timers are invoked in the single listener
- * thread in the Event MPM -- the same thread that serf callbacks are made
- * from, so we don't technically need a mutex yet, but with the Simple MPM,
- * invocations are made from worker threads, and we need to figure out locking
- */
-static void timed_cleanup_callback(void *baton)
-{
-    s_baton_t *ctx = baton;
-
-    /* Causes all serf connections to unregister from the event mpm */
-    if (ctx->rstatus) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, ctx->rstatus, ctx->r, APLOGNO(01119)
-                      "serf: request returned: %d", ctx->rstatus);
-        ctx->r->status = HTTP_OK;
-        apr_pool_destroy(ctx->serf_pool);
-        ap_die(ctx->rstatus, ctx->r);
-    }
-    else {
-        apr_bucket *e;
-        apr_brigade_cleanup(ctx->tmpbb);
-        e = apr_bucket_flush_create(ctx->r->connection->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(ctx->tmpbb, e);
-        e = apr_bucket_eos_create(ctx->r->connection->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(ctx->tmpbb, e);
-
-        /* TODO: return code? bleh */
-        ap_pass_brigade(ctx->r->output_filters, ctx->tmpbb);
-
-        apr_pool_destroy(ctx->serf_pool);
-
-        ap_finalize_request_protocol(ctx->r);
-        ap_process_request_after_handler(ctx->r);
-        return;
-    }
-}
 
 static void closed_connection(serf_connection_t *conn,
                               void *closed_baton,
@@ -118,26 +97,119 @@ static void closed_connection(serf_connection_t *conn,
         ctx->rstatus = HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (mpm_supprts_serf) {
-        ap_mpm_register_timed_callback(apr_time_from_msec(1),
-                                       timed_cleanup_callback, ctx);
-    }
     ctx->keep_reading = 0;
 }
 
-static serf_bucket_t* conn_setup(apr_socket_t *sock,
-                                 void *setup_baton,
-                                 apr_pool_t *pool)
+/* Whether the certificate's name (a subjectAltName DNS entry or the
+ * subject's CN) matches the backend's hostname, case-insensitively: a
+ * leading "*." in the name stands for one label of the hostname.
+ */
+static int name_matches(const char *name, const char *hostname)
+{
+    if (name[0] == '*' && name[1] == '.') {
+        const char *dot = ap_strchr_c(hostname, '.');
+
+        return dot && dot != hostname && !ap_cstr_casecmp(name + 1, dot);
+    }
+    return !ap_cstr_casecmp(name, hostname);
+}
+
+/* serf's server certificate callback: serf calls it for the certificate
+ * (depth 0) even when OpenSSL accepted it, and for any failure of the
+ * chain, and its status replaces OpenSSL's verdict. Fail on the chain's
+ * failures, as serf does without a callback, and at depth 0 on a
+ * certificate whose names don't match the backend's hostname: those of the
+ * subjectAltName DNS entries, else the subject's CN when it has no such
+ * entry. serf doesn't give the IP entries: a backend named by an IP
+ * address is matched textually against the DNS entries or the CN, so a
+ * certificate with only an IP entry is refused.
+ */
+static apr_status_t server_cert_check(void *baton, int failures,
+                                      const serf_ssl_certificate_t *cert)
+{
+    s_baton_t *ctx = baton;
+    const char *hostname = ctx->conf->url.hostname;
+    apr_pool_t *pool;
+    apr_hash_t *info, *subject;
+    apr_array_header_t *sans;
+    int found = 0, have_dns = 0;
+
+    if (failures || !cert) {
+        return SERF_ERROR_SSL_CERT_FAILED;
+    }
+    if (serf_ssl_cert_depth(cert) != 0) {
+        return APR_SUCCESS;
+    }
+
+    apr_pool_create(&pool, ctx->r->pool);
+    info = serf_ssl_cert_certificate(cert, pool);
+    sans = info ? apr_hash_get(info, "subjectAltName", APR_HASH_KEY_STRING)
+                : NULL;
+    if (sans) {
+        int i;
+
+        for (i = 0; i < sans->nelts && !found; i++) {
+            have_dns = 1;
+            found = name_matches(APR_ARRAY_IDX(sans, i, const char *),
+                                 hostname);
+        }
+    }
+    if (!have_dns) {
+        subject = serf_ssl_cert_subject(cert, pool);
+        if (subject) {
+            const char *cn = apr_hash_get(subject, "CN",
+                                          APR_HASH_KEY_STRING);
+
+            found = cn && name_matches(cn, hostname);
+        }
+    }
+    apr_pool_destroy(pool);
+
+    if (!found) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, ctx->r, APLOGNO()
+                      "serf: the backend's certificate doesn't match its "
+                      "hostname %s", hostname);
+        return SERF_ERROR_SSL_CERT_FAILED;
+    }
+    return APR_SUCCESS;
+}
+
+static apr_status_t conn_setup(apr_socket_t *sock,
+                               serf_bucket_t **read_bkt,
+                               serf_bucket_t **write_bkt,
+                               void *setup_baton,
+                               apr_pool_t *pool)
 {
     serf_bucket_t *c;
     s_baton_t *ctx = setup_baton;
 
     c = serf_bucket_socket_create(sock, ctx->bkt_alloc);
     if (ctx->want_ssl) {
+        apr_status_t rv;
+
         c = serf_bucket_ssl_decrypt_create(c, ctx->ssl_ctx, ctx->bkt_alloc);
+        if (!ctx->ssl_ctx) {
+            ctx->ssl_ctx = serf_bucket_ssl_decrypt_context_get(c);
+        }
+
+        /* Verify the backend's certificate against the default CAs and
+         * its hostname (a failure ends the connection with
+         * SERF_ERROR_SSL_CERT_FAILED), and send the name for SNI. */
+        rv = serf_ssl_use_default_certificates(ctx->ssl_ctx);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        serf_ssl_server_cert_callback_set(ctx->ssl_ctx, server_cert_check,
+                                          ctx);
+        serf_ssl_set_hostname(ctx->ssl_ctx, ctx->conf->url.hostname);
+
+        /* Encrypt the write side with the same context */
+        *write_bkt = serf_bucket_ssl_encrypt_create(*write_bkt, ctx->ssl_ctx,
+                                                    ctx->bkt_alloc);
     }
 
-    return c;
+    *read_bkt = c;
+    return APR_SUCCESS;
 }
 
 static int copy_headers_in(void *vbaton, const char *key, const char *value)
@@ -278,17 +350,12 @@ static apr_status_t handle_response(serf_request_t *request,
     rv = serf_bucket_response_status(response, &sl);
     if (rv) {
         if (APR_STATUS_IS_EAGAIN(rv)) {
-            return APR_SUCCESS;
+            return rv;
         }
 
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, ctx->r, APLOGNO(01121) "serf_bucket_response_status...");
 
         ctx->rstatus = HTTP_INTERNAL_SERVER_ERROR;
-
-        if (mpm_supprts_serf) {
-            ap_mpm_register_timed_callback(apr_time_from_msec(1),
-                                           timed_cleanup_callback, ctx);
-        }
 
         return rv;
     }
@@ -331,10 +398,6 @@ static apr_status_t handle_response(serf_request_t *request,
 
             ctx->rstatus = ap_pass_brigade(ctx->r->output_filters, ctx->tmpbb);
 
-            if (mpm_supprts_serf) {
-                ap_mpm_register_timed_callback(apr_time_from_msec(1),
-                                               timed_cleanup_callback, ctx);
-            }
             return APR_EOF;
         }
 
@@ -342,7 +405,7 @@ static apr_status_t handle_response(serf_request_t *request,
 
         /* XXXX: Should we send a flush now? */
         if (APR_STATUS_IS_EAGAIN(rv)) {
-            return APR_SUCCESS;
+            return rv;
         }
 
     } while (1);
@@ -379,18 +442,6 @@ static apr_status_t setup_request(serf_request_t *request,
 
     serf_bucket_headers_setn(hdrs_bkt, "Accept-Encoding", "gzip");
 
-    if (ctx->want_ssl) {
-        if (ctx->ssl_ctx == NULL) {
-            *req_bkt = serf_bucket_ssl_encrypt_create(*req_bkt, NULL,
-                                           ctx->bkt_alloc);
-            ctx->ssl_ctx = serf_bucket_ssl_encrypt_context_get(*req_bkt);
-        }
-        else {
-            *req_bkt = serf_bucket_ssl_encrypt_create(*req_bkt, ctx->ssl_ctx,
-                                                      ctx->bkt_alloc);
-        }
-    }
-
     *acceptor = accept_response;
     *acceptor_baton = ctx;
     *handler = handle_response;
@@ -399,30 +450,309 @@ static apr_status_t setup_request(serf_request_t *request,
     return APR_SUCCESS;
 }
 
-/* TODO: rewrite drive_serf to make it async */
-static int drive_serf(request_rec *r, serf_config_t *conf)
+/* serf registers a socket to poll (serf_context_create_ex()): the request
+ * will wait for it through a wait context of its own.
+ */
+static apr_status_t socket_add(void *user_baton, apr_pollfd_t *pfd,
+                                       void *serf_baton)
+{
+    s_baton_t *ctx = user_baton;
+    modserf_wait_pfd_t *wp;
+    apr_pool_t *p;
+    apr_status_t rv;
+
+    rv = apr_pool_create(&p, ctx->wait_pool);
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+    apr_pool_tag(p, "mod_serf_wait");
+    wp = apr_pcalloc(p, sizeof(*wp));
+    wp->pool = p;
+    wp->pfd = *pfd;
+    wp->pfd.client_data = NULL;
+    wp->serf_baton = serf_baton;
+    wp->ctx = ap_request_waitctx_pfd(ctx->r, p, pfd);
+    wp->next = ctx->pfds;
+    ctx->pfds = wp;
+    return APR_SUCCESS;
+}
+
+/* serf unregisters a socket (before closing it, or to register it again
+ * with other events): its wait context is released with its pool.
+ */
+static apr_status_t socket_remove(void *user_baton, apr_pollfd_t *pfd,
+                                          void *serf_baton)
+{
+    s_baton_t *ctx = user_baton;
+    modserf_wait_pfd_t **pwp, *wp;
+
+    for (pwp = &ctx->pfds; (wp = *pwp) != NULL; pwp = &wp->next) {
+        if (wp->serf_baton == serf_baton
+            && wp->pfd.desc_type == pfd->desc_type
+            && wp->pfd.desc.s == pfd->desc.s) {
+            *pwp = wp->next;
+            ap_request_waitctx_release(wp->ctx);
+            apr_pool_destroy(wp->pool);
+            return APR_SUCCESS;
+        }
+    }
+    return APR_NOTFOUND;
+}
+
+/* The ready sockets, from the request's last wait, in ready (as many as
+ * ctx->pfds): their serf batons as client_data, the ready directions as
+ * rtnevents, or all the requested ones (but for errors) if none was found
+ * ready (an error the next I/O reports). Returns how many.
+ */
+static int wait_ready(s_baton_t *ctx, apr_pollfd_t *ready)
+{
+    modserf_wait_pfd_t *wp;
+    int all, n = 0;
+
+    for (all = 0; all < 2 && !n; all++) {
+        for (wp = ctx->pfds; wp; wp = wp->next) {
+            apr_int16_t events = 0;
+
+            if (all) {
+                events = wp->pfd.reqevents & (APR_POLLIN | APR_POLLOUT);
+            }
+            else {
+                unsigned int d = ap_request_waitctx_ready(wp->ctx);
+                if (d & AP_WAIT_IN) {
+                    events |= APR_POLLIN;
+                }
+                if (d & AP_WAIT_OUT) {
+                    events |= APR_POLLOUT;
+                }
+            }
+            if (events) {
+                ready[n] = wp->pfd;
+                ready[n].rtnevents = events;
+                ready[n].client_data = wp->serf_baton;
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* Have serf process the events of its ready sockets, those still registered
+ * (an earlier one may have closed another).
+ */
+static apr_status_t trigger(s_baton_t *ctx, const apr_pollfd_t *ready,
+                                    int nready)
+{
+    int i;
+
+    for (i = 0; i < nready; i++) {
+        modserf_wait_pfd_t *wp;
+        apr_status_t rv;
+
+        for (wp = ctx->pfds; wp; wp = wp->next) {
+            if (wp->serf_baton == ready[i].client_data
+                && wp->pfd.desc.s == ready[i].desc.s) {
+                break;
+            }
+        }
+        if (!wp) {
+            continue;
+        }
+        rv = serf_event_trigger(ctx->serf_ctx, ready[i].client_data,
+                                &ready[i]);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+/* The end of an asynchronously driven response: serf's connections closed
+ * and their wait contexts released (with serf's pool) while the request is
+ * alive. Returns the handler's final status.
+ */
+static int async_done(s_baton_t *ctx, int rc)
+{
+    apr_pool_destroy(ctx->serf_pool);
+    ctx->serf_ctx = NULL;
+    apr_pool_destroy(ctx->wait_pool);
+    apr_pool_destroy(ctx->iter_pool);
+
+    if (rc == OK && ctx->rstatus) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, ctx->rstatus, ctx->r, APLOGNO(01119)
+                      "serf: request returned: %d", ctx->rstatus);
+        ctx->r->status = HTTP_OK;
+        rc = ctx->rstatus;
+    }
+    return rc;
+}
+
+static void wait_continuation(request_rec *r, apr_status_t status,
+                              void *baton);
+
+/* Drive serf until the response is done or serf waits for its sockets: the
+ * request waits for them (ap_request_wait_any()), its continuation coming
+ * back here. Returns SUSPENDED while waiting, else the handler's final
+ * status (serf done with).
+ */
+static int drive_async(s_baton_t *ctx)
+{
+    request_rec *r = ctx->r;
+    apr_status_t rv;
+    int rc;
+
+    for (;;) {
+        modserf_wait_pfd_t *wp;
+        apr_pollfd_t *ready;
+        ap_request_waitctx_t **ctxs;
+        unsigned int *directions;
+        int n = 0, nready = 0, i = 0;
+
+        rv = serf_context_prerun(ctx->serf_ctx);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "serf_context_prerun()");
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+        if (!ctx->keep_reading) {
+            rc = OK;
+            break;
+        }
+        for (wp = ctx->pfds; wp; wp = wp->next) {
+            n++;
+        }
+        if (!n) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "serf: no socket to wait for");
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+        ready = apr_palloc(ctx->iter_pool, n * sizeof(*ready));
+
+        ctxs = apr_palloc(ctx->iter_pool, n * sizeof(*ctxs));
+        directions = apr_palloc(ctx->iter_pool, n * sizeof(*directions));
+        for (wp = ctx->pfds; wp; wp = wp->next, i++) {
+            ctxs[i] = wp->ctx;
+            directions[i] = 0;
+            if (wp->pfd.reqevents & APR_POLLOUT) {
+                directions[i] |= AP_WAIT_OUT;
+            }
+            if ((wp->pfd.reqevents & APR_POLLIN) || !directions[i]) {
+                /* A hangup or an error shows as readable */
+                directions[i] |= AP_WAIT_IN;
+            }
+        }
+        rc = ap_request_wait_any(ctxs, n, directions, 0,
+                                 wait_continuation, ctx);
+        if (rc == SUSPENDED) {
+            apr_pool_clear(ctx->iter_pool);
+            return SUSPENDED;
+        }
+        if (rc != OK) {
+            /* Not DECLINED: every wait of serf's sockets can suspend once
+             * ap_request_can_suspend() was true, and the core logs and
+             * asserts why a wait fails otherwise.
+             */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "serf: waiting for the backend returned %d", rc);
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+        nready = wait_ready(ctx, ready);
+
+        rv = trigger(ctx, ready, nready);
+        apr_pool_clear(ctx->iter_pool);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "serf_event_trigger()");
+            rc = HTTP_INTERNAL_SERVER_ERROR;
+            break;
+        }
+    }
+
+    return async_done(ctx, rc);
+}
+
+/* The continuation of the request's wait for serf's sockets */
+static void wait_continuation(request_rec *r, apr_status_t status,
+                                      void *baton)
+{
+    s_baton_t *ctx = baton;
+    int rc;
+
+    if (status == APR_SUCCESS) {
+        apr_pollfd_t *ready;
+        modserf_wait_pfd_t *wp;
+        int n = 0, nready;
+        apr_status_t rv;
+
+        for (wp = ctx->pfds; wp; wp = wp->next) {
+            n++;
+        }
+        ready = apr_palloc(ctx->iter_pool, (n ? n : 1) * sizeof(*ready));
+        nready = wait_ready(ctx, ready);
+        rv = trigger(ctx, ready, nready);
+        apr_pool_clear(ctx->iter_pool);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "serf_event_trigger()");
+            rc = async_done(ctx, HTTP_INTERNAL_SERVER_ERROR);
+        }
+        else {
+            rc = drive_async(ctx);
+        }
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                      "serf: waiting for the backend");
+        rc = async_done(ctx, APR_STATUS_IS_TIMEUP(status)
+                                  ? HTTP_GATEWAY_TIME_OUT
+                                  : HTTP_INTERNAL_SERVER_ERROR);
+    }
+    if (rc != SUSPENDED) {
+        ap_request_finish_suspended(r, rc);
+    }
+}
+
+static int drive_serf(request_rec *r, modserf_dir_config_t *conf)
 {
     apr_status_t rv = 0;
     apr_pool_t *pool;
     apr_sockaddr_t *address;
+    apr_uri_t host_info = conf->url;
     s_baton_t *baton = apr_palloc(r->pool, sizeof(s_baton_t));
     /* XXXXX: make persistent/per-process or something.*/
     serf_context_t *serfme;
     serf_connection_t *conn;
-    serf_server_config_t *ctx =
-        (serf_server_config_t *)ap_get_module_config(r->server->module_config,
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *)ap_get_module_config(r->server->module_config,
                                                      &serf_module);
 
+    /* Without holding the thread when the request can suspend: serf
+     * driven by the request's waits for its sockets.
+     */
+    baton->async = ap_request_can_suspend(r);
+    if (baton->async) {
+        /* Before serf's pool, so destroyed after it with the request's
+         * (serf unregistering its sockets then).
+         */
+        apr_pool_create(&baton->wait_pool, r->pool);
+        apr_pool_tag(baton->wait_pool, "mod_serf_waits");
+        apr_pool_create(&baton->iter_pool, r->pool);
+        apr_pool_tag(baton->iter_pool, "mod_serf_iter");
+    }
+    baton->pfds = NULL;
+
     /* Allocate everything out of a subpool, with a shorter lifetime than
-     * the main request, so that we can cleanup safely and remove our events
-     * from the main serf context in the async mpm mode.
+     * the main request, so that we can cleanup safely and unregister serf's
+     * sockets from the request's waits.
      */
     apr_pool_create(&pool, r->pool);
     apr_pool_tag(pool, "mod_serf_drive");
     if (strcmp(conf->url.scheme, "cluster") == 0) {
         int rc;
         ap_serf_cluster_provider_t *cp;
-        serf_cluster_t *cluster;
+        modserf_cluster_t *cluster;
         apr_array_header_t *servers = NULL;
         apr_uint32_t pick = 0;
         ap_serf_server_t *choice;
@@ -477,6 +807,10 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
         rv = apr_sockaddr_info_get(&address, choice->ip,
                                    APR_UNSPEC, choice->port, 0,
                                    pool);
+        host_info.scheme = "http";
+        host_info.hostname = (char *)choice->ip;
+        host_info.port = choice->port;
+        host_info.port_str = apr_itoa(pool, choice->port);
     }
     else {
         /* XXXXX: cache dns? */
@@ -490,18 +824,16 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (mpm_supprts_serf) {
-        serfme = ap_lookup_provider("mpm_serf", "instance", "0");
-        if (!serfme) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01129) "mpm lied to us about supporting serf.");
-            return HTTP_INTERNAL_SERVER_ERROR;
-        }
+    baton->r = r;
+    if (baton->async) {
+        serfme = serf_context_create_ex(baton, socket_add,
+                                        socket_remove, pool);
     }
     else {
         serfme = serf_context_create(pool);
     }
+    baton->serf_ctx = serfme;
 
-    baton->r = r;
     baton->conf = conf;
     baton->serf_pool = pool;
     baton->bkt_alloc = serf_bucket_allocator_create(pool, NULL, NULL);
@@ -560,16 +892,30 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
         baton->body_bkt = serf_bucket_file_create(fp, baton->bkt_alloc);
     }
 
+#if SERF_VERSION_AT_LEAST(1, 4, 0)
+    /* serf_connection_create() doesn't set up the connection's config
+     * since serf 1.4, which serf needs to open it */
+    rv = serf_connection_create3(&conn, serfme, host_info, address,
+                                 conn_setup, baton,
+                                 closed_connection, baton,
+                                 pool);
+    if (rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "serf_connection_create3() for %pI", address);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+#else
     conn = serf_connection_create(serfme, address,
                                   conn_setup, baton,
                                   closed_connection, baton,
                                   pool);
+#endif
 
     /* XXX: Is it correct that we don't use the returned serf_request_t? */
     serf_connection_request_create(conn, setup_request, baton);
 
-    if (mpm_supprts_serf) {
-        return SUSPENDED;
+    if (baton->async) {
+        return drive_async(baton);
     }
     else {
         do {
@@ -594,7 +940,7 @@ static int drive_serf(request_rec *r, serf_config_t *conf)
 
 static int serf_handler(request_rec *r)
 {
-    serf_config_t *conf = ap_get_module_config(r->per_dir_config,
+    modserf_dir_config_t *conf = ap_get_module_config(r->per_dir_config,
                                                &serf_module);
 
     if (conf->on == 0) {
@@ -619,7 +965,7 @@ static const char *add_pass(cmd_parms *cmd, void *vconf,
 {
     int i;
     apr_status_t rv;
-    serf_config_t *conf = (serf_config_t *) vconf;
+    modserf_dir_config_t *conf = (modserf_dir_config_t *) vconf;
 
     if (argc < 1) {
         return "SerfPass must have at least a URI.";
@@ -668,9 +1014,9 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
     const char *rv;
     ap_serf_cluster_provider_t *backend;
     int i;
-    serf_cluster_t *cluster = NULL;
-    serf_server_config_t *ctx =
-        (serf_server_config_t *)ap_get_module_config(cmd->server->module_config,
+    modserf_cluster_t *cluster = NULL;
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *)ap_get_module_config(cmd->server->module_config,
                                                      &serf_module);
 
     const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
@@ -683,7 +1029,7 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
         return "SerfCluster must have at least a name and provider.";
     }
 
-    cluster = apr_palloc(cmd->pool, sizeof(serf_cluster_t));
+    cluster = apr_palloc(cmd->pool, sizeof(modserf_cluster_t));
     cluster->name = apr_pstrdup(cmd->pool, argv[0]);
     cluster->provider = apr_pstrdup(cmd->pool, argv[1]);
     cluster->params = apr_table_make(cmd->pool, 6);
@@ -730,7 +1076,7 @@ static const char *add_cluster(cmd_parms *cmd, void *d,
 
 static void *create_dir_config(apr_pool_t *p, char *dummy)
 {
-    serf_config_t *new = (serf_config_t *) apr_pcalloc(p, sizeof(serf_config_t));
+    modserf_dir_config_t *new = (modserf_dir_config_t *) apr_pcalloc(p, sizeof(modserf_dir_config_t));
     new->on = 0;
     new->preservehost = 1;
     return new;
@@ -738,8 +1084,8 @@ static void *create_dir_config(apr_pool_t *p, char *dummy)
 
 static void *create_server_config(apr_pool_t *p, server_rec *s)
 {
-    serf_server_config_t *ctx =
-        (serf_server_config_t *) apr_pcalloc(p, sizeof(serf_server_config_t));
+    modserf_server_config_t *ctx =
+        (modserf_server_config_t *) apr_pcalloc(p, sizeof(modserf_server_config_t));
 
     ctx->clusters = apr_hash_make(p);
 
@@ -748,9 +1094,9 @@ static void *create_server_config(apr_pool_t *p, server_rec *s)
 
 static void * merge_server_config(apr_pool_t *p, void *basev, void *overridesv)
 {
-    serf_server_config_t *ctx = apr_pcalloc(p, sizeof(serf_server_config_t));
-    serf_server_config_t *base = (serf_server_config_t *) basev;
-    serf_server_config_t *overrides = (serf_server_config_t *) overridesv;
+    modserf_server_config_t *ctx = apr_pcalloc(p, sizeof(modserf_server_config_t));
+    modserf_server_config_t *base = (modserf_server_config_t *) basev;
+    modserf_server_config_t *overrides = (modserf_server_config_t *) overridesv;
 
     ctx->clusters = apr_hash_overlay(p, base->clusters, overrides->clusters);
     return ctx;
@@ -1092,18 +1438,6 @@ static const ap_serf_cluster_provider_t builtin_static =
     NULL
 };
 
-static int serf_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
-{
-    apr_status_t rv;
-    rv = ap_mpm_query(AP_MPMQ_HAS_SERF, &mpm_supprts_serf);
-
-    if (rv != APR_SUCCESS) {
-        mpm_supprts_serf = 0;
-    }
-
-    return OK;
-}
-
 static void register_hooks(apr_pool_t *p)
 {
     ap_register_provider(p, AP_SERF_CLUSTER_PROVIDER,
@@ -1111,8 +1445,6 @@ static void register_hooks(apr_pool_t *p)
 
     ap_register_provider(p, AP_SERF_CLUSTER_PROVIDER,
                          "static", "0", &builtin_static);
-
-    ap_hook_post_config(serf_post_config, NULL, NULL, APR_HOOK_MIDDLE);
 
     ap_hook_handler(serf_handler, NULL, NULL, APR_HOOK_FIRST);
 }

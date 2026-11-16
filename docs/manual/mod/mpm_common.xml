@@ -353,6 +353,14 @@ in *BSDs.</compatibility>
     The number of children processes needs to be a multiple of the number 
     of buckets to optimally accept connections.</p>
 
+    <p>With few threads per child (e.g. one), children sharing a
+    listening socket can hold the keep-alive connections unevenly
+    (a connection staying with the child that accepted it), so that
+    some children have requests waiting for their threads while others
+    are idle; <directive>ListenCoresBucketsRatio</directive> spreads the
+    new connections over the children, the system distributing them
+    evenly between the buckets' sockets.</p>
+
     <note>
     <title>Multiple <directive>Listen</directive>ers or Apache HTTP servers on
     the same IP address and port</title>
@@ -429,7 +437,7 @@ in *BSDs.</compatibility>
 <name>MaxRequestWorkers</name>
 <description>Maximum number of connections that will be processed
 simultaneously</description>
-<syntax>MaxRequestWorkers <var>number</var></syntax>
+<syntax>MaxRequestWorkers <var>number</var>|auto</syntax>
 <default>See usage for details</default>
 <contextlist><context>server config</context></contextlist>
 <modulelist><module>event</module><module>worker</module>
@@ -481,6 +489,89 @@ simultaneously</description>
     ThreadsPerChild of 25, decreasing to nearest multiple 75, for a
     maximum of 3 servers.
     </example>
+
+    <p>With <module>event</module> (available in Apache HTTP Server 2.5.1
+    and later), <code>auto</code> in place of the number derives the
+    processes and threads from the client connections to hold (<directive
+    module="event">MaxClientConnections</directive>) and the CPUs the server
+    can run on (its CPU affinity where the system tells, e.g. taskset or
+    cpusets, else the online CPUs; a CPU quota, e.g. a container's, is not
+    taken into account). With <module>event</module> a client holds a thread
+    only while its request is processed (see the <a
+    href="event.html#admission">admission of new connections</a>), so a few
+    child processes of a few threads each hold many clients:</p>
+    <ul>
+      <li><directive module="mpm_common">ThreadsPerChild</directive> is 2
+      (1 on a single CPU).</li>
+      <li>A child process holds up to (the soft limit of open files - 64 -
+      the listening sockets) / 2 connections (a proxied client holds the
+      connection to its backend too). The number of children is what's needed
+      to hold <directive module="event">MaxClientConnections</directive>,
+      but at least enough for their threads to cover the CPUs (half as
+      many children as CPUs), rounded up to a multiple of the listeners
+      buckets the CPUs would have (see <directive
+      module="mpm_common">ListenCoresBucketsRatio</directive>), and each
+      child stops accepting connections beyond its share of <directive
+      module="event">MaxClientConnections</directive>.</li>
+      <li><directive>MaxRequestWorkers</directive> is the threads of all
+      the children, <directive module="mpm_common">StartServers</directive>
+      all the children, and <directive module="mpm_common"
+      >ServerLimit</directive> leaves room for the children of a graceful
+      restart (four times the number of children, unless set higher).</li>
+      <li>The children are kept running, all of them: one that exits (or
+      stops accepting connections to exit, e.g. after <directive
+      module="mpm_common">MaxConnectionsPerChild</directive>) is replaced
+      right away, and none is stopped because its threads are idle
+      (<directive module="mpm_common">MinSpareThreads</directive> and
+      <directive module="mpm_common">MaxSpareThreads</directive> have no
+      effect, a warning tells when they are set).</li>
+      <li>The threads of a child grow while they are blocked: when none is
+      idle, work has been waiting for one longer than <directive
+      module="event">AsyncAdmissionTarget</directive>, and the process uses
+      less than half of the CPU time of its threads (they wait for
+      something rather than compute), a thread is added, up to <directive
+      module="mpm_common">ThreadLimit</directive>; one added this way exits
+      once idle for 10 seconds, or once the child hasn't been short of
+      threads for 10 seconds. <directive module="mpm_common"
+      >ThreadLimit</directive> defaults to <directive module="event"
+      >MaxClientConnections</directive> divided by the children (a thread
+      per client when all of them block), 1024 at most. Requests that don't
+      block never add threads, nor do requests using the CPU. Where the
+      system lacks <code>getrusage()</code>, the threads don't grow.
+      <directive module="mpm_common">ThreadLimit</directive> is the
+      ceiling of these threads: raise it when modules that block the
+      threads are in use, each thread costing its stack (see <directive
+      module="mpm_common">ThreadStackSize</directive>), a memory pool and
+      an allocator.</li>
+    </ul>
+    <p>Any of these directives can still be set, <code>auto</code> derives
+    only the others, and a warning tells when the explicit values can't hold
+    <directive module="event">MaxClientConnections</directive>. A notice
+    tells when the soft limit of open files of the server (e.g. <code>ulimit
+    -n</code>) limits the default <directive module="event"
+    >MaxClientConnections</directive> well below the hard limit, nothing
+    raises it. For instance, with the server restricted to 4 CPUs and a
+    limit of 4096 open files:</p>
+
+    <example><title>Example</title>
+    <highlight language="config">
+MaxRequestWorkers auto
+MaxClientConnections 5000
+    </highlight>
+    </example>
+
+    <p>gives 3 child processes of 2 threads (each holding up to 2015
+    connections), each accepting up to 1834 connections.</p>
+
+    <p>Sites with modules handling the requests synchronously, blocking a
+    thread while they wait (e.g. <module>mod_cgid</module> waiting for the
+    script, mod_php, a synchronous backend), get threads added while they
+    block. <directive module="mpm_common">ThreadLimit</directive> set to
+    <directive module="mpm_common">ThreadsPerChild</directive> keeps the
+    threads fixed, and an explicit <directive module="mpm_common"
+    >ThreadsPerChild</directive> starts each child with more threads
+    (e.g. the requests blocking at once). Modules that are not thread-safe
+    need <module>prefork</module>, as with any threaded MPM.</p>
 
     <p><directive>MaxRequestWorkers</directive> was called
     <directive>MaxClients</directive> before version 2.3.13. The old name is still
@@ -534,6 +625,10 @@ will handle during its life</description>
     <p>Setting <directive>MaxConnectionsPerChild</directive> to a
     non-zero value limits the amount of memory that a process can consume
     by (accidental) memory leakage.</p>
+
+    <p>Not to be confused with <directive module="event"
+    >MaxClientConnections</directive> (<module>event</module>), the number
+    of client connections the server holds at once.</p>
 </usage>
 </directivesynopsis>
 
@@ -581,6 +676,10 @@ will handle during its life</description>
 	ThreadsPerChild</directive>.</li>
       </ul>
     </note>
+    <p>With <module>event</module> and <code><directive
+    module="mpm_common">MaxRequestWorkers</directive> auto</code>, it has no
+    effect: the child processes are kept running whatever their idle
+    threads.</p>
 </usage>
 <seealso><directive module="mpm_common">MinSpareThreads</directive></seealso>
 <seealso><directive module="mpm_common">StartServers</directive></seealso>
@@ -621,6 +720,10 @@ spikes</description>
     <p>The value of <directive>MinSpareThreads</directive> must be at
     least 1. Values less than 1 will be automatically increased to 1
     and a warning will be logged.</p>
+    <p>With <module>event</module> and <code><directive
+    module="mpm_common">MaxRequestWorkers</directive> auto</code>, it has no
+    effect: the child processes are kept running whatever their idle
+    threads.</p>
 </usage>
 <seealso><directive module="mpm_common">MaxSpareThreads</directive></seealso>
 <seealso><directive module="mpm_common">StartServers</directive></seealso>
@@ -893,6 +996,22 @@ per child process</description>
     <p>The default value for <directive>ThreadLimit</directive> is
     <code>1920</code> when used with <module>mpm_winnt</module> and
     <code>64</code> when used with the others.</p>
+
+    <p>With <module>event</module> and <code><directive
+    module="mpm_common">MaxRequestWorkers</directive> auto</code>, the threads
+    of a child grow up to <directive>ThreadLimit</directive> while they are
+    blocked, and it defaults to <directive module="event"
+    >MaxClientConnections</directive> divided by the number of children
+    (1024 at most); setting it to <directive
+    module="mpm_common">ThreadsPerChild</directive> keeps the threads
+    fixed. It is the ceiling of the threads that grow: raise it when
+    modules that block the threads are in use, each thread costing its
+    stack (see <directive module="mpm_common">ThreadStackSize</directive>),
+    a memory pool and an allocator. The scoreboard (shared memory) holds
+    that many worker entries per child slot, so a large one makes it larger
+    and <module>mod_status</module>'s requests longer; the busy and idle
+    workers it shows can exceed <directive
+    module="mpm_common">MaxRequestWorkers</directive> then.</p>
 
     <note><title>Note</title>
       <p>There is a hard limit of <code>ThreadLimit 20000</code> (or

@@ -1,0 +1,10 @@
+backend
+loadgen
+tunnelgen
+fcgibackend
+schemebackend
+.gocache/
+.gopath/
+run-*/
+round*.log
+__pycache__/

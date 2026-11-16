@@ -883,6 +883,44 @@ PROXY_DECLARE(int) ap_proxy_pre_http_request(conn_rec *c, request_rec *r)
     return OK;
 }
 
+PROXY_DECLARE(void) ap_proxy_h1_head_opts_(ap_h1_head_opts_t *opts,
+                                           request_rec *r,
+                                           proxy_worker *worker,
+                                           ap_h1_head_kind_e kind,
+                                           int module_index)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+    const proxy_worker_shared *s = worker->s;
+    int unsafe;
+
+    ap_h1_head_opts_init_(opts, r, kind, AP_H1_HEAD_OPT_BACKEND,
+                          module_index);
+
+    unsafe = (s->http_unsafe_set) ? s->http_unsafe : dconf->http_unsafe;
+    if (unsafe) {
+        opts->flags &= ~AP_H1_HEAD_OPT_STRICT;
+    }
+    if (s->limit_response_line_set) {
+        opts->limit_start_line = s->limit_response_line;
+    }
+    else if (dconf->limit_response_line_set) {
+        opts->limit_start_line = dconf->limit_response_line;
+    }
+    if (s->response_field_size_set) {
+        opts->limit_field = s->response_field_size;
+    }
+    else if (dconf->limit_response_fieldsize_set) {
+        opts->limit_field = dconf->limit_response_fieldsize;
+    }
+    if (s->limit_response_fields_set) {
+        opts->limit_fields = s->limit_response_fields;
+    }
+    else if (dconf->limit_response_fields_set) {
+        opts->limit_fields = dconf->limit_response_fields;
+    }
+}
+
 PROXY_DECLARE(const char *) ap_proxy_location_reverse_map(request_rec *r,
                               proxy_dir_conf *conf, const char *url)
 {
@@ -1516,8 +1554,131 @@ PROXY_DECLARE(proxy_worker *) ap_proxy_balancer_get_best_worker(proxy_balancer *
  * CONNECTION related...
  */
 
+/* The context of a request's waits for a backend connection with
+ * ap_proxy_wait() (ap_request_waitctx_conn() or _pfd()), in its
+ * proxy_req_async, and attached to the connection (its backend_wait) until
+ * the connection is released or closed: the context is released then,
+ * before another request can use the connection.
+ */
+struct proxy_backend_wait {
+    ap_request_waitctx_t *ctx; /* NULL when released */
+    proxy_conn_rec *conn;       /* the connection it's for */
+    apr_socket_t *sock;         /* its socket then */
+    conn_rec *connection;       /* its conn_rec then, if any */
+};
+
+/* Release the wait context of the request whose ap_proxy_wait() waited for
+ * the connection, if any: from the thread running that request, which is
+ * releasing or closing the connection.
+ */
+static void proxy_backend_wait_release(proxy_conn_rec *conn)
+{
+    struct proxy_backend_wait *bw = conn->backend_wait;
+
+    if (!bw) {
+        return;
+    }
+    conn->backend_wait = NULL;
+    if (bw->ctx) {
+        ap_request_waitctx_release(bw->ctx);
+        bw->ctx = NULL;
+    }
+    bw->conn = NULL;
+}
+
+/* The request is gone (its pool cleaned up): detach its context from a
+ * connection never released for it.
+ */
+static apr_status_t proxy_backend_wait_cleanup(void *baton)
+{
+    struct proxy_backend_wait *bw = baton;
+
+    if (bw->conn) {
+        if (bw->conn->backend_wait == bw) {
+            bw->conn->backend_wait = NULL;
+        }
+        bw->conn = NULL;
+    }
+    return APR_SUCCESS;
+}
+
+/* The request's wait context for a backend connection (ap_proxy_wait()):
+ * through its filters if it has a conn_rec (ap_request_waitctx_conn()),
+ * else its socket (ap_request_waitctx_pfd()). The context made for another
+ * connection, or socket, is released first. NULL without a socket.
+ */
+static ap_request_waitctx_t *proxy_backend_wait_ctx(request_rec *r,
+                                                    proxy_conn_rec *conn)
+{
+    struct proxy_req_async *ra = ap_proxy_req_async(r);
+    struct proxy_backend_wait *bw = ra->backend_wait;
+
+    if (!conn || !conn->sock) {
+        return NULL;
+    }
+    if (!bw) {
+        bw = apr_pcalloc(r->pool, sizeof(*bw));
+        apr_pool_cleanup_register(r->pool, bw, proxy_backend_wait_cleanup,
+                                  apr_pool_cleanup_null);
+        ra->backend_wait = bw;
+    }
+    else if (bw->ctx && bw->conn == conn && bw->sock == conn->sock
+             && bw->connection == conn->connection) {
+        return bw->ctx;
+    }
+    else if (bw->conn) {
+        /* Still attached to that connection (not released yet) */
+        proxy_backend_wait_release(bw->conn);
+    }
+
+    if (conn->connection) {
+        bw->ctx = ap_request_waitctx_conn(r, r->pool, conn->connection);
+    }
+    else {
+        apr_pollfd_t pfd;
+
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.desc_type = APR_POLL_SOCKET;
+        pfd.desc.s = conn->sock;
+        bw->ctx = ap_request_waitctx_pfd(r, r->pool, &pfd);
+    }
+    bw->conn = conn;
+    bw->sock = conn->sock;
+    bw->connection = conn->connection;
+    conn->backend_wait = bw;
+    return bw->ctx;
+}
+
+/* Release the socket of a backend connection from the MPM if it's kept there
+ * (AP_MPM_WAIT_KEEP_PFDS), before it's closed or released for another
+ * request to use: through the wait context of the request that waited for
+ * it if any, else directly (where no request is at hand, e.g. a pool
+ * cleanup).
+ */
+static void release_kept_pfd(proxy_conn_rec *conn)
+{
+    apr_pollfd_t pfd;
+    apr_status_t rv;
+
+    if (!conn->sock) {
+        return;
+    }
+    proxy_backend_wait_release(conn);
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = conn->sock;
+    rv = ap_mpm_release_pfd(&pfd);
+    if (rv != APR_SUCCESS && !APR_STATUS_IS_ENOTIMPL(rv)) {
+        ap_log_perror(APLOG_MARK, APLOG_ERR, rv, conn->pool, APLOGNO()
+                      "releasing the MPM's pollfd of a backend connection "
+                      "for (%s:%d) failed", conn->worker->s->hostname_ex,
+                      (int)conn->worker->s->port);
+    }
+}
+
 static void socket_cleanup(proxy_conn_rec *conn)
 {
+    release_kept_pfd(conn);
     conn->sock = NULL;
     conn->tmp_bb = NULL;
     conn->connection = NULL;
@@ -1648,6 +1809,25 @@ static proxy_conn_rec *connection_make(apr_pool_t *p, proxy_worker *worker)
     return conn;
 }
 
+#if APR_HAS_THREADS
+/* Notify the first waiter of an exhausted pool, if any, the waiters' mutex
+ * held. The released connection is reserved for it, so that the acquirers
+ * coming meanwhile don't take it (they'd go before the waiters).
+ */
+static void notify_first_conn_pool_waiter(struct proxy_conn_pool_waiters *pw)
+{
+    if (!APR_RING_EMPTY(&pw->ring, ap_proxy_conn_pool_waiter, link)) {
+        ap_proxy_conn_pool_waiter *waiter = APR_RING_FIRST(&pw->ring);
+        APR_RING_REMOVE(waiter, link);
+        waiter->queued = 0;
+        waiter->notified = 1;
+        apr_atomic_inc32(&pw->reserved);
+        apr_atomic_dec32(&pw->nqueued);
+        waiter->fn(waiter->baton);
+    }
+}
+#endif
+
 static void connection_cleanup(void *theconn)
 {
     proxy_conn_rec *conn = (proxy_conn_rec *)theconn;
@@ -1661,6 +1841,15 @@ static void connection_cleanup(void *theconn)
                       ap_proxy_worker_get_name(worker));
         return;
     }
+
+    /* Not held by its request anymore */
+    if (conn->holder) {
+        conn->holder->held = NULL;
+        conn->holder = NULL;
+    }
+
+    /* Not registered in the MPM for this connection anymore */
+    release_kept_pfd(conn);
 
     if (conn->r) {
         apr_pool_destroy(conn->r->pool);
@@ -1691,6 +1880,27 @@ static void connection_cleanup(void *theconn)
     if (worker->s->hmax && worker->cp->res) {
         conn->inreslist = 1;
         apr_reslist_release(worker->cp->res, (void *)conn);
+#if APR_HAS_THREADS
+        /* Notify the first waiter (ap_proxy_acquire_connection_ex()), under
+         * the lock so that it can't be canceled (and go away) meanwhile, if
+         * any: the acquirers count themselves in nqueued before checking the
+         * acquired connections, and we check nqueued after releasing ours,
+         * both with atomic read-modify-writes (ordered whatever the atomics'
+         * implementation), so either they see the release or we see them.
+         * Hence apr_atomic_add32(x, 0) for these reads: apr_atomic_read32()
+         * isn't ordered after a previous update everywhere (e.g. the mutex
+         * based or ppc implementations, a plain load there).
+         */
+        if (worker->cp->pool_waiters) {
+            struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+            apr_atomic_dec32(&pw->acquired);
+            if (apr_atomic_add32(&pw->nqueued, 0)) {
+                apr_thread_mutex_lock(pw->mutex);
+                notify_first_conn_pool_waiter(pw);
+                apr_thread_mutex_unlock(pw->mutex);
+            }
+        }
+#endif
     }
     else {
         worker->cp->conn = conn;
@@ -1736,6 +1946,7 @@ static apr_status_t connection_constructor(void **resource, void *params,
                                            apr_pool_t *pool)
 {
     apr_pool_t *p;
+    apr_allocator_t *alloc;
     proxy_conn_rec *conn;
     proxy_worker *worker = (proxy_worker *)params;
 
@@ -1743,8 +1954,22 @@ static apr_status_t connection_constructor(void **resource, void *params,
      * Create a subpool for each connection
      * This keeps the memory consumption constant
      * when it's recycled or destroyed.
+     *
+     * It has its own allocator, without a mutex: a connection is used by one
+     * thread at a time (handed over through the reslist and its lock), while
+     * the worker's pool allocator (shared by all its connections) has a mutex
+     * that the threads using connections at the same time contend on. Like
+     * the MPM's connections, its free memory is bounded by MaxMemFree.
      */
-    apr_pool_create(&p, pool);
+    if (apr_allocator_create(&alloc) != APR_SUCCESS) {
+        return APR_ENOMEM;
+    }
+    apr_allocator_max_free_set(alloc, ap_max_mem_free);
+    if (apr_pool_create_ex(&p, pool, NULL, alloc) != APR_SUCCESS) {
+        apr_allocator_destroy(alloc);
+        return APR_ENOMEM;
+    }
+    apr_allocator_owner_set(alloc, p);
     apr_pool_tag(p, "proxy_conn_pool");
     conn = connection_make(p, worker);
     conn->inreslist = 1;
@@ -2283,7 +2508,7 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
 {
     APR_OPTIONAL_FN_TYPE(http2_get_num_workers) *get_h2_num_workers;
     apr_status_t rv = APR_SUCCESS;
-    int max_threads, minw, maxw;
+    int max_threads, minw, maxw, can_wait = 0;
 
     if (worker->s->status & PROXY_WORKER_INITIALIZED) {
         /* The worker is already initialized */
@@ -2332,12 +2557,31 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
              */
             max_threads = max_threads - 1 + maxw;
         }
-        if (max_threads > 1) {
+        /* With an MPM that can suspend the requests waiting for their backend
+         * (they don't hold a thread then, see ProxyAsyncDelay), a child has
+         * more requests in flight than threads, even with a single thread.
+         */
+        if (ap_mpm_query(AP_MPMQ_CAN_REGISTER_WAIT, &can_wait) != APR_SUCCESS) {
+            can_wait = 0;
+        }
+        if (max_threads > 1 || can_wait) {
             /* Default hmax is max_threads to scale with the load and never
              * wait for an idle connection to proceed.
              */
             if (worker->s->hmax == 0) {
+                int max_conns = 0;
+
                 worker->s->hmax = max_threads;
+
+                /* With an MPM that can suspend the requests waiting for their
+                 * backend, scale with the connections a child handles at once
+                 * instead.
+                 */
+                if (can_wait
+                    && ap_mpm_query(AP_MPMQ_MAX_CONNECTIONS, &max_conns) == APR_SUCCESS
+                    && max_conns > worker->s->hmax) {
+                    worker->s->hmax = max_conns;
+                }
             }
             if (worker->s->smax == -1 || worker->s->smax > worker->s->hmax) {
                 worker->s->smax = worker->s->hmax;
@@ -2403,6 +2647,20 @@ PROXY_DECLARE(apr_status_t) ap_proxy_initialize_worker(proxy_worker *worker, ser
                 if (rv == APR_SUCCESS && worker->s->acquire_set) {
                     apr_reslist_timeout_set(worker->cp->res, worker->s->acquire);
                 }
+#if APR_HAS_THREADS
+                /* For ap_proxy_acquire_connection_ex()'s waiters */
+                if (rv == APR_SUCCESS) {
+                    struct proxy_conn_pool_waiters *pw;
+                    pw = apr_pcalloc(worker->cp->pool, sizeof(*pw));
+                    APR_RING_INIT(&pw->ring, ap_proxy_conn_pool_waiter, link);
+                    rv = apr_thread_mutex_create(&pw->mutex,
+                                                 APR_THREAD_MUTEX_DEFAULT,
+                                                 worker->cp->pool);
+                    if (rv == APR_SUCCESS) {
+                        worker->cp->pool_waiters = pw;
+                    }
+                }
+#endif
 
             }
             else {
@@ -2586,6 +2844,26 @@ PROXY_DECLARE(const char *) ap_proxy_interpolate(request_rec *r,
     }
 }
 
+proxy_req_conf *ap_proxy_req_conf(request_rec *r)
+{
+    proxy_req_conf *rconf = ap_get_module_config(r->request_config,
+                                                 &proxy_module);
+    if (!rconf) {
+        rconf = apr_pcalloc(r->pool, sizeof(*rconf));
+        ap_set_module_config(r->request_config, &proxy_module, rconf);
+    }
+    return rconf;
+}
+
+struct proxy_req_async *ap_proxy_req_async(request_rec *r)
+{
+    proxy_req_conf *rconf = ap_proxy_req_conf(r);
+    if (!rconf->async) {
+        rconf->async = apr_pcalloc(r->pool, sizeof(*rconf->async));
+    }
+    return rconf->async;
+}
+
 static apr_array_header_t *proxy_vars(request_rec *r, apr_array_header_t *hdr)
 {
     int i;
@@ -2628,8 +2906,7 @@ PROXY_DECLARE(int) ap_proxy_canon_url(request_rec *r)
         /* create per-request copy of reverse proxy conf,
          * and interpolate vars in it
          */
-        proxy_req_conf *rconf = apr_palloc(r->pool, sizeof(proxy_req_conf));
-        ap_set_module_config(r->request_config, &proxy_module, rconf);
+        proxy_req_conf *rconf = ap_proxy_req_conf(r);
         rconf->raliases = proxy_vars(r, dconf->raliases);
         rconf->cookie_paths = proxy_vars(r, dconf->cookie_paths);
         rconf->cookie_domains = proxy_vars(r, dconf->cookie_domains);
@@ -2816,7 +3093,56 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
                                                proxy_worker *worker,
                                                server_rec *s)
 {
+    return ap_proxy_acquire_connection_ex(proxy_function, conn, worker, s,
+                                          NULL);
+}
+
+PROXY_DECLARE(ap_proxy_conn_pool_waiter *) ap_proxy_conn_pool_waiter_make(apr_pool_t *p,
+                                                                          ap_proxy_conn_pool_waiter_fn *fn,
+                                                                          void *baton)
+{
+    ap_proxy_conn_pool_waiter *waiter = apr_pcalloc(p, sizeof(*waiter));
+
+    waiter->fn = fn;
+    waiter->baton = baton;
+    return waiter;
+}
+
+PROXY_DECLARE(void) ap_proxy_cancel_conn_pool_waiter(proxy_worker *worker,
+                                                     ap_proxy_conn_pool_waiter *waiter)
+{
+#if APR_HAS_THREADS
+    if (worker->cp && worker->cp->pool_waiters) {
+        struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+        apr_thread_mutex_lock(pw->mutex);
+        if (waiter->queued) {
+            APR_RING_REMOVE(waiter, link);
+            waiter->queued = 0;
+            apr_atomic_dec32(&pw->nqueued);
+        }
+        else if (waiter->notified) {
+            /* Notified for a released connection that it won't acquire:
+             * the next waiter takes it, or its notification would be lost.
+             */
+            waiter->notified = 0;
+            apr_atomic_dec32(&pw->reserved);
+            notify_first_conn_pool_waiter(pw);
+        }
+        apr_thread_mutex_unlock(pw->mutex);
+    }
+#endif
+}
+
+PROXY_DECLARE(int) ap_proxy_acquire_connection_ex(const char *proxy_function,
+                                                  proxy_conn_rec **conn,
+                                                  proxy_worker *worker,
+                                                  server_rec *s,
+                                                  ap_proxy_conn_pool_waiter *waiter)
+{
     apr_status_t rv;
+#if APR_HAS_THREADS
+    struct proxy_conn_pool_waiters *reserved = NULL;
+#endif
 
     if (!PROXY_WORKER_IS_USABLE(worker)) {
         /* Retry the worker */
@@ -2831,8 +3157,79 @@ PROXY_DECLARE(int) ap_proxy_acquire_connection(const char *proxy_function,
         }
     }
 
+#if APR_HAS_THREADS
+    /* Don't block on an exhausted pool if the caller can wait otherwise:
+     * queue the waiter (notified when a connection is released). The check
+     * and the queuing are under the lock taken by the release to notify a
+     * waiter, so no notification is lost.
+     *
+     * The connections reserved for the notified waiters count as acquired
+     * (FIFO), and so does the one reserved here until apr_reslist_acquire()
+     * returns, so that no other acquirer can make it block.
+     *
+     * The release takes the lock only if nqueued says that a waiter may be
+     * queued, so count ourselves there before the check (see
+     * connection_cleanup()).
+     */
+    if (waiter && worker->s->hmax && worker->cp->res && worker->cp->pool_waiters) {
+        struct proxy_conn_pool_waiters *pw = worker->cp->pool_waiters;
+        int notified;
+
+        apr_thread_mutex_lock(pw->mutex);
+        notified = waiter->notified;
+        if (notified) {
+            /* Acquiring now, the notification and its reservation are used */
+            waiter->notified = 0;
+            apr_atomic_dec32(&pw->reserved);
+        }
+        if (!waiter->queued) {
+            apr_atomic_inc32(&pw->nqueued);
+        }
+        if (apr_atomic_add32(&pw->acquired, 0) + apr_atomic_read32(&pw->reserved)
+                >= (apr_uint32_t)worker->s->hmax) {
+            /* A notified waiter keeps its place, its connection was taken
+             * by an acquirer which doesn't wait (blocking).
+             */
+            if (!waiter->queued) {
+                if (notified) {
+                    APR_RING_INSERT_HEAD(&pw->ring, waiter,
+                                         ap_proxy_conn_pool_waiter, link);
+                }
+                else {
+                    APR_RING_INSERT_TAIL(&pw->ring, waiter,
+                                         ap_proxy_conn_pool_waiter, link);
+                }
+                waiter->queued = 1;
+            }
+            apr_thread_mutex_unlock(pw->mutex);
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO()
+                         "%s: connection pool exhausted for (%s:%d), "
+                         "waiting", proxy_function, worker->s->hostname_ex,
+                         (int)worker->s->port);
+            return SUSPENDED;
+        }
+        if (!waiter->queued) {
+            apr_atomic_dec32(&pw->nqueued);
+        }
+        apr_atomic_inc32(&pw->reserved);
+        reserved = pw;
+        apr_thread_mutex_unlock(pw->mutex);
+    }
+#endif
+
     if (worker->s->hmax && worker->cp->res) {
         rv = apr_reslist_acquire(worker->cp->res, (void **)conn);
+#if APR_HAS_THREADS
+        /* Count the acquired connection before giving up the reservation:
+         * the check above may over-count meanwhile, never under-count.
+         */
+        if (rv == APR_SUCCESS && worker->cp->pool_waiters) {
+            apr_atomic_inc32(&worker->cp->pool_waiters->acquired);
+        }
+        if (reserved) {
+            apr_atomic_dec32(&reserved->reserved);
+        }
+#endif
     }
     else {
         /* create the new connection if the previous was destroyed */
@@ -3577,76 +3974,129 @@ PROXY_DECLARE(int) ap_proxy_is_socket_connected(apr_socket_t *sock)
 #endif /* USE_ALTERNATE_IS_CONNECTED */
 
 
+/* A CONNECT exchange with a remote proxy, possibly in progress (see
+ * send_http_connect()).
+ */
+typedef struct {
+    char buffer[HUGE_STRING_LEN]; /* the request, then the reply's head */
+    apr_size_t len;               /* the request's length, then the reply's */
+    apr_size_t sent;              /* how much of the request was sent */
+    int started;                  /* the request is built */
+    int receiving;                /* the request is sent, read the reply */
+    int draining;                 /* the reply's head didn't fit the buffer */
+    char tail[3];                 /* the last bytes read while draining */
+    apr_size_t tail_len;
+} proxy_connect_exchange;
+
 /*
- * Send a HTTP CONNECT request to a remote proxy.
+ * Send a HTTP CONNECT request to a remote proxy and read its reply.
  * The proxy is given by "backend", the target server
  * is contained in the "forward" member of "backend".
+ * With a nonblocking socket, returns APR_EAGAIN (or an error) when the socket
+ * isn't ready for *events, to be called again with the same x then.
  */
 static apr_status_t send_http_connect(proxy_conn_rec *backend,
-                                      server_rec *s)
+                                      server_rec *s,
+                                      proxy_connect_exchange *x,
+                                      apr_int16_t *events)
 {
     int status;
     apr_size_t nbytes;
-    apr_size_t left;
-    int complete = 0;
-    char buffer[HUGE_STRING_LEN];
-    char drain_buffer[HUGE_STRING_LEN];
+    char *buffer = x->buffer;
     remote_connect_info *connect_info = backend->forward;
-    int len = 0;
 
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00948)
-                 "CONNECT: sending the CONNECT request for %s:%d "
-                 "to the remote proxy %pI (%s)",
-                 connect_info->target_host, connect_info->target_port,
-                 backend->addr, backend->hostname);
-    /* Create the CONNECT request */
-    nbytes = apr_snprintf(buffer, sizeof(buffer),
-                          "CONNECT %s:%d HTTP/1.0" CRLF,
-                          connect_info->target_host, connect_info->target_port);
-    /* Add proxy authorization from the configuration, or initial
-     * request if necessary */
-    if (connect_info->proxy_auth != NULL) {
-        nbytes += apr_snprintf(buffer + nbytes, sizeof(buffer) - nbytes,
-                               "Proxy-Authorization: %s" CRLF,
-                               connect_info->proxy_auth);
+    if (!x->started) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s, APLOGNO(00948)
+                     "CONNECT: sending the CONNECT request for %s:%d "
+                     "to the remote proxy %pI (%s)",
+                     connect_info->target_host, connect_info->target_port,
+                     backend->addr, backend->hostname);
+        /* Create the CONNECT request */
+        nbytes = apr_snprintf(buffer, sizeof(x->buffer),
+                              "CONNECT %s:%d HTTP/1.0" CRLF,
+                              connect_info->target_host,
+                              connect_info->target_port);
+        /* Add proxy authorization from the configuration, or initial
+         * request if necessary */
+        if (connect_info->proxy_auth != NULL) {
+            nbytes += apr_snprintf(buffer + nbytes, sizeof(x->buffer) - nbytes,
+                                   "Proxy-Authorization: %s" CRLF,
+                                   connect_info->proxy_auth);
+        }
+        /* Set a reasonable agent and send everything */
+        nbytes += apr_snprintf(buffer + nbytes, sizeof(x->buffer) - nbytes,
+                               "Proxy-agent: %s" CRLF CRLF,
+                               ap_get_server_banner());
+        ap_xlate_proto_to_ascii(buffer, nbytes);
+        x->len = nbytes;
+        x->sent = 0;
+        x->started = 1;
     }
-    /* Set a reasonable agent and send everything */
-    nbytes += apr_snprintf(buffer + nbytes, sizeof(buffer) - nbytes,
-                           "Proxy-agent: %s" CRLF CRLF,
-                           ap_get_server_banner());
-    ap_xlate_proto_to_ascii(buffer, nbytes);
-    apr_socket_send(backend->sock, buffer, &nbytes);
-
-    /* Receive the whole CONNECT response */
-    left = sizeof(buffer) - 1;
-    /* Read until we find the end of the headers or run out of buffer */
-    do {
-        nbytes = left;
-        status = apr_socket_recv(backend->sock, buffer + len, &nbytes);
-        len += nbytes;
-        left -= nbytes;
-        buffer[len] = '\0';
-        if (strstr(buffer + len - nbytes, CRLF_ASCII CRLF_ASCII) != NULL) {
-            ap_xlate_proto_from_ascii(buffer, len);
-            complete = 1;
+    while (!x->receiving) {
+        nbytes = x->len - x->sent;
+        status = apr_socket_send(backend->sock, buffer + x->sent, &nbytes);
+        x->sent += nbytes;
+        if (x->sent == x->len) {
+            x->receiving = 1;
+            x->len = 0;
             break;
         }
-    } while (status == APR_SUCCESS && left > 0);
-    /* Drain what's left */
-    if (!complete) {
-        nbytes = sizeof(drain_buffer) - 1;
-        while (status == APR_SUCCESS && nbytes) {
-            status = apr_socket_recv(backend->sock, drain_buffer, &nbytes);
-            drain_buffer[nbytes] = '\0';
-            nbytes = sizeof(drain_buffer) - 1;
-            if (strstr(drain_buffer, CRLF_ASCII CRLF_ASCII) != NULL) {
-                break;
-            }
+        if (status != APR_SUCCESS) {
+            *events = APR_POLLOUT;
+            return status;
         }
     }
 
-    /* Check for HTTP_OK response status */
-    if (status == APR_SUCCESS) {
+    /* Receive the whole CONNECT response: read until we find the end of the
+     * headers or run out of buffer, then drain what's left of them.
+     */
+    for (;;) {
+        if (!x->draining) {
+            nbytes = sizeof(x->buffer) - 1 - x->len;
+            status = apr_socket_recv(backend->sock, buffer + x->len, &nbytes);
+            if (nbytes) {
+                apr_size_t from = x->len >= 3 ? x->len - 3 : 0;
+                x->len += nbytes;
+                buffer[x->len] = '\0';
+                if (strstr(buffer + from, CRLF_ASCII CRLF_ASCII) != NULL) {
+                    ap_xlate_proto_from_ascii(buffer, x->len);
+                    break;
+                }
+                if (x->len == sizeof(x->buffer) - 1) {
+                    x->draining = 1;
+                    memcpy(x->tail, buffer + x->len - 3, 3);
+                    x->tail_len = 3;
+                }
+            }
+        }
+        else {
+            char drain_buffer[HUGE_STRING_LEN];
+            nbytes = sizeof(drain_buffer) - 1 - 3;
+            status = apr_socket_recv(backend->sock, drain_buffer + 3, &nbytes);
+            if (nbytes) {
+                /* The end of the headers may straddle two reads */
+                memcpy(drain_buffer + 3 - x->tail_len, x->tail, x->tail_len);
+                drain_buffer[3 + nbytes] = '\0';
+                if (strstr(drain_buffer + 3 - x->tail_len,
+                           CRLF_ASCII CRLF_ASCII) != NULL) {
+                    break;
+                }
+                x->tail_len = nbytes < 3 ? nbytes : 3;
+                memcpy(x->tail, drain_buffer + 3 + nbytes - x->tail_len,
+                       x->tail_len);
+            }
+        }
+        if (status != APR_SUCCESS) {
+            *events = APR_POLLIN;
+            return status;
+        }
+    }
+
+    /* Check for HTTP_OK response status (a reply that can't be parsed goes
+     * on, as it always did)
+     */
+    status = APR_SUCCESS;
+    {
         unsigned int major, minor;
         /* Only scan for three character status code */
         char code_str[4];
@@ -3825,6 +4275,24 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                                             proxy_worker *worker,
                                             server_rec *s)
 {
+    return ap_proxy_connect_backend_ex(proxy_function, conn, worker, s, NULL);
+}
+
+PROXY_DECLARE(void) ap_proxy_connect_backend_cancel(ap_proxy_connect_state *state)
+{
+    if (state->sock) {
+        apr_socket_close(state->sock);
+        state->sock = NULL;
+    }
+    state->exchange = NULL;
+}
+
+PROXY_DECLARE(int) ap_proxy_connect_backend_ex(const char *proxy_function,
+                                               proxy_conn_rec *conn,
+                                               proxy_worker *worker,
+                                               server_rec *s,
+                                               ap_proxy_connect_state *state)
+{
     apr_status_t rv;
     int loglevel;
     remote_connect_info *connect_info = conn->forward;
@@ -3832,11 +4300,45 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
     /* the local address to use for the outgoing connection */
     apr_sockaddr_t *local_addr;
     apr_socket_t *newsock;
+    apr_interval_time_t conn_timeout, sock_timeout;
+    proxy_connect_exchange local_exchange, *exchange;
+    apr_int16_t events = 0;
     void *sconf = s->module_config;
     int address_reusable = worker->s->is_address_reusable;
     int did_dns_lookup = 0;
     proxy_server_conf *conf =
         (proxy_server_conf *) ap_get_module_config(sconf, &proxy_module);
+
+    if (state && state->sock) {
+        /* Complete the connect in progress (we returned SUSPENDED), or fail
+         * it as the caller asked, then go on from connect_done like any
+         * connect (the next address on failure). The same for the CONNECT
+         * exchange with a forward proxy, from connect_exchange.
+         */
+        newsock = state->sock;
+        backend_addr = state->addr;
+        did_dns_lookup = state->did_dns_lookup;
+        conn_timeout = sock_timeout = state->timeout;
+        state->sock = NULL;
+        rv = state->status;
+        if (state->exchange) {
+            conn->sock = newsock;
+            goto connect_exchange;
+        }
+        if (rv == APR_SUCCESS) {
+            rv = apr_socket_connect(newsock, backend_addr);
+        }
+        goto connect_done;
+    }
+    if (state && conn->uds_path) {
+        /* Blocking connect for Unix domain sockets: the connect completes
+         * right away unless the backend's backlog is full, and a nonblocking
+         * connect can't portably be waited for then (e.g. on Linux it fails
+         * with EAGAIN, nothing in progress, and polling the socket returns at
+         * once), so only the blocking connect waits for room in the backlog.
+         */
+        state = NULL;
+    }
 
     rv = ap_proxy_check_connection(proxy_function, conn, s, 0, 0);
     if (rv == APR_EINVAL) {
@@ -3927,19 +4429,22 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
                              "Failed to set");
             }
 
-            /* Set a timeout for connecting to the backend on the socket */
+            /* The timeout for connecting to the backend: set on the socket
+             * when blocking, otherwise given to the caller to wait with.
+             */
             if (worker->s->conn_timeout_set) {
-                apr_socket_timeout_set(newsock, worker->s->conn_timeout);
+                conn_timeout = worker->s->conn_timeout;
             }
             else if (worker->s->timeout_set) {
-                apr_socket_timeout_set(newsock, worker->s->timeout);
+                conn_timeout = worker->s->timeout;
             }
             else if (conf->timeout_set) {
-                apr_socket_timeout_set(newsock, conf->timeout);
+                conn_timeout = conf->timeout;
             }
             else {
-                apr_socket_timeout_set(newsock, s->timeout);
+                conn_timeout = s->timeout;
             }
+            apr_socket_timeout_set(newsock, state ? 0 : conn_timeout);
             /* Set a keepalive option */
             if (worker->s->keepalive) {
                 if ((rv = apr_socket_opt_set(newsock,
@@ -3968,6 +4473,26 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
 
             /* make the connection out of the socket */
             rv = apr_socket_connect(newsock, backend_addr);
+
+connect_done:
+            if (state && (APR_STATUS_IS_EINPROGRESS(rv)
+#ifdef EALREADY
+                          || rv == APR_FROM_OS_ERROR(EALREADY)
+#endif
+                          )) {
+                /* The connect is in progress: the caller waits for it */
+                state->sock = newsock;
+                state->events = APR_POLLOUT;
+                state->addr = backend_addr;
+                state->did_dns_lookup = did_dns_lookup;
+                state->timeout = conn_timeout;
+                state->status = APR_SUCCESS;
+                ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
+                             "%s: connecting to %pI (%s:%hu) in progress",
+                             proxy_function, backend_addr,
+                             conn->hostname, conn->port);
+                return SUSPENDED;
+            }
 
             /* if an error occurred, loop round and try again */
             if (rv != APR_SUCCESS) {
@@ -4017,14 +4542,15 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
 
         /* Set a timeout on the socket */
         if (worker->s->timeout_set) {
-            apr_socket_timeout_set(newsock, worker->s->timeout);
+            sock_timeout = worker->s->timeout;
         }
         else if (conf->timeout_set) {
-            apr_socket_timeout_set(newsock, conf->timeout);
+            sock_timeout = conf->timeout;
         }
         else {
-             apr_socket_timeout_set(newsock, s->timeout);
+            sock_timeout = s->timeout;
         }
+        apr_socket_timeout_set(newsock, sock_timeout);
 
         conn->sock = newsock;
 
@@ -4033,7 +4559,49 @@ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
          * sending our actual HTTPS requests.
          */
         if (connect_info) {
-            rv = send_http_connect(conn, s);
+connect_exchange:
+            /* Nonblocking when asked (state): the caller waits for each step
+             * of the exchange with the socket's timeout, which otherwise
+             * applies to the blocking I/O.
+             */
+            if (state) {
+                if (!state->exchange) {
+                    state->exchange = apr_pcalloc(conn->scpool,
+                                                  sizeof(proxy_connect_exchange));
+                }
+                exchange = state->exchange;
+            }
+            else {
+                memset(&local_exchange, 0, sizeof(local_exchange));
+                exchange = &local_exchange;
+            }
+            if (rv == APR_SUCCESS) {
+                if (state) {
+                    apr_socket_timeout_set(newsock, 0);
+                }
+                rv = send_http_connect(conn, s, exchange, &events);
+            }
+            if (state && APR_STATUS_IS_EAGAIN(rv)) {
+                /* The exchange is in progress: the caller waits for it */
+                conn->sock = NULL;
+                state->sock = newsock;
+                state->events = events;
+                state->addr = backend_addr;
+                state->did_dns_lookup = did_dns_lookup;
+                state->timeout = sock_timeout;
+                state->status = APR_SUCCESS;
+                ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
+                             "%s: CONNECT to %s:%hu through %pI (%s:%hu) "
+                             "in progress", proxy_function,
+                             connect_info->target_host,
+                             connect_info->target_port, backend_addr,
+                             conn->hostname, conn->port);
+                return SUSPENDED;
+            }
+            if (state) {
+                state->exchange = NULL;
+                apr_socket_timeout_set(newsock, sock_timeout);
+            }
             /* If an error occurred, loop round and try again */
             if (rv != APR_SUCCESS) {
                 conn->sock = NULL;
@@ -5028,24 +5596,71 @@ PROXY_DECLARE(int) ap_proxy_spool_input(request_rec *r,
                                         apr_off_t *bytes_spooled,
                                         apr_off_t max_mem_spool)
 {
+    ap_proxy_spool_state state;
+
+    memset(&state, 0, sizeof(state));
+    return ap_proxy_spool_input_ex(r, backend, input_brigade, bytes_spooled,
+                                   max_mem_spool, APR_BLOCK_READ, &state);
+}
+
+PROXY_DECLARE(int) ap_proxy_spool_input_ex(request_rec *r,
+                                           proxy_conn_rec *backend,
+                                           apr_bucket_brigade *input_brigade,
+                                           apr_off_t *bytes_spooled,
+                                           apr_off_t max_mem_spool,
+                                           apr_read_type_e block,
+                                           ap_proxy_spool_state *state)
+{
     apr_pool_t *p = r->pool;
     int seen_eos = 0, rv = OK;
     apr_status_t status = APR_SUCCESS;
     apr_bucket_alloc_t *bucket_alloc = input_brigade->bucket_alloc;
     apr_bucket_brigade *body_brigade;
     apr_bucket *e;
-    apr_off_t bytes, fsize = 0;
-    apr_file_t *tmpfile = NULL;
+    apr_off_t bytes, fsize = state->fsize;
+    apr_file_t *tmpfile = state->tmpfile;
 
-    *bytes_spooled = 0;
-    body_brigade = apr_brigade_create(p, bucket_alloc);
+    *bytes_spooled = state->bytes_spooled;
+    if (!state->body_brigade) {
+        state->body_brigade = apr_brigade_create(p, bucket_alloc);
+    }
+    body_brigade = state->body_brigade;
 
     do {
         if (APR_BRIGADE_EMPTY(input_brigade)) {
-            rv = ap_proxy_read_input(r, backend, input_brigade,
-                                     HUGE_STRING_LEN);
-            if (rv != OK) {
-                return rv;
+            if (block == APR_NONBLOCK_READ || !backend) {
+                /* Nonblocking, or no backend connection yet: read from the
+                 * client directly.
+                 */
+                status = ap_get_brigade(r->input_filters, input_brigade,
+                                        AP_MODE_READBYTES, block,
+                                        HUGE_STRING_LEN);
+                if (block == APR_NONBLOCK_READ
+                    && (APR_STATUS_IS_EAGAIN(status)
+                        || (status == APR_SUCCESS && APR_BRIGADE_EMPTY(input_brigade)))) {
+                    /* Nothing to read yet: the caller will call again */
+                    apr_brigade_cleanup(input_brigade);
+                    state->tmpfile = tmpfile;
+                    state->fsize = fsize;
+                    state->bytes_spooled = *bytes_spooled;
+                    return SUSPENDED;
+                }
+                if (status != APR_SUCCESS) {
+                    conn_rec *c = r->connection;
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, APLOGNO()
+                                  "spool request body failed from %s (%s)",
+                                  c->client_ip,
+                                  c->remote_host ? c->remote_host : "");
+                    return ap_map_http_request_error(status,
+                                                     HTTP_BAD_REQUEST);
+                }
+            }
+            else {
+                rv = ap_proxy_read_input(r, backend, input_brigade,
+                                         HUGE_STRING_LEN);
+                if (rv != OK) {
+                    return rv;
+                }
             }
         }
 
@@ -5269,6 +5884,11 @@ PROXY_DECLARE(apr_status_t) ap_proxy_buckets_lifetime_transform(request_rec *r,
  */
 #define PROXY_TRANSFER_MAX_READS 10000
 
+static int proxy_tunnel_forward(proxy_tunnel_rec *tunnel,
+                                conn_rec *c_i, conn_rec *c_o,
+                                apr_bucket_brigade *bb);
+static int proxy_tunnel_input(proxy_tunnel_rec *tunnel, conn_rec *c_i);
+
 static apr_status_t proxy_transfer(request_rec *r,
                                    conn_rec *c_i,
                                    conn_rec *c_o,
@@ -5279,7 +5899,8 @@ static apr_status_t proxy_transfer(request_rec *r,
                                    int flags,
                                    apr_off_t *bytes_in,
                                    apr_off_t *bytes_out,
-                                   proxy_tunnel_rec *tunnel)
+                                   proxy_tunnel_rec *tunnel,
+                                   int *read_eagain)
 {
     apr_status_t rv;
     int flush_each = 0;
@@ -5299,50 +5920,79 @@ static apr_status_t proxy_transfer(request_rec *r,
     }
 
     for (;;) {
-        apr_brigade_cleanup(bb_i);
-        rv = ap_get_brigade(c_i->input_filters, bb_i, AP_MODE_READBYTES,
-                            APR_NONBLOCK_READ, bsize);
-        if (rv != APR_SUCCESS) {
-            if (!APR_STATUS_IS_EAGAIN(rv) && !APR_STATUS_IS_EOF(rv)) {
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO(03308)
-                              "proxy_transfer: can't get data from %s", name);
-                if (rv == APR_INCOMPLETE) {
-                    /* Don't return APR_INCOMPLETE, it'd mean "should yield"
-                     * for the caller, while it means "incomplete body" here
-                     * from ap_http_filter(), which is an error.
-                     */
-                    rv = APR_EGENERAL;
+        int again = (tunnel) ? proxy_tunnel_input(tunnel, c_i) : 0;
+        if (again < 0) {
+            /* Paused by a hold: nothing read until it's over */
+            rv = APR_SUCCESS;
+            break;
+        }
+        if (again) {
+            /* The direction's hold is over: its hooks are called again with
+             * an empty brigade, the holder producing what it held
+             */
+            len = 0;
+        }
+        else {
+            apr_brigade_cleanup(bb_i);
+            rv = ap_get_brigade(c_i->input_filters, bb_i, AP_MODE_READBYTES,
+                                APR_NONBLOCK_READ, bsize);
+            if (rv != APR_SUCCESS) {
+                if (read_eagain && APR_STATUS_IS_EAGAIN(rv)) {
+                    *read_eagain = 1;
                 }
+                if (!APR_STATUS_IS_EAGAIN(rv) && !APR_STATUS_IS_EOF(rv)) {
+                    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, rv, r, APLOGNO(03308)
+                                  "proxy_transfer: can't get data from %s",
+                                  name);
+                    if (rv == APR_INCOMPLETE) {
+                        /* Don't return APR_INCOMPLETE, it'd mean "should
+                         * yield" for the caller, while it means "incomplete
+                         * body" here from ap_http_filter(), which is an
+                         * error.
+                         */
+                        rv = APR_EGENERAL;
+                    }
+                }
+                break;
             }
-            break;
-        }
-        if (c_o->aborted) {
-            rv = APR_EPIPE;
-            break;
-        }
-        if (APR_BRIGADE_EMPTY(bb_i)) {
-            break;
-        }
+            if (c_o->aborted) {
+                rv = APR_EPIPE;
+                break;
+            }
+            if (APR_BRIGADE_EMPTY(bb_i)) {
+                /* How the core input filter reports EAGAIN */
+                if (read_eagain) {
+                    *read_eagain = 1;
+                }
+                break;
+            }
 
-        len = -1;
-        apr_brigade_length(bb_i, 0, &len);
-        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
-                      "proxy_transfer: got %" APR_OFF_T_FMT " bytes "
-                      "from %s", len, name);
-        if (bytes_in && len > 0) {
-            *bytes_in += len;
-        }
+            len = -1;
+            apr_brigade_length(bb_i, 0, &len);
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "proxy_transfer: got %" APR_OFF_T_FMT " bytes "
+                          "from %s", len, name);
+            if (bytes_in && len > 0) {
+                *bytes_in += len;
+            }
 
-        rv = ap_proxy_buckets_lifetime_transform(r, bb_i, bb_o);
-        if (rv != APR_SUCCESS) {
-            break;
+            rv = ap_proxy_buckets_lifetime_transform(r, bb_i, bb_o);
+            if (rv != APR_SUCCESS) {
+                break;
+            }
         }
 
         if (tunnel) {
-            int rc = proxy_run_tunnel_forward(tunnel, c_i, c_o, bb_o);
+            int rc = proxy_tunnel_forward(tunnel, c_i, c_o, bb_o);
+            if (rc == SUSPENDED) {
+                /* A hook holds the direction: nothing more is read from c_i
+                 * until the hold is over
+                 */
+                rv = APR_SUCCESS;
+                break;
+            }
             if (rc != OK && rc != DONE) {
                 if (!ap_is_HTTP_ERROR(rc)) {
-                    /* SUSPENDED is not allowed for now */
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10295)
                                   "proxy: %s: invalid status %d returned by "
                                   "tunnel forward hooks", tunnel->scheme, rc);
@@ -5426,6 +6076,17 @@ static apr_status_t proxy_transfer(request_rec *r,
             rv = APR_SUCCESS;
             break;
         }
+
+        /* Don't read again if the core knows its socket is emptied (no
+         * filter holding data above it), the read would get EAGAIN: the
+         * caller waits for the next input as after an EAGAIN read.
+         */
+        if (read_eagain && ap_core_input_drained(c_i)) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "proxy_transfer: %s drained", name);
+            *read_eagain = 1;
+            break;
+        }
     }
 
     /* bb_o first to avoid protential dangling buckets (transient) */
@@ -5462,12 +6123,14 @@ PROXY_DECLARE(apr_status_t) ap_proxy_transfer_between_connections(
 {
     apr_off_t bytes_out = 0;
     apr_status_t rv = proxy_transfer(r, c_i, c_o, bb_i, bb_o, name, bsize,
-                                     flags, NULL, &bytes_out, NULL);
+                                     flags, NULL, &bytes_out, NULL, NULL);
     if (sent && bytes_out > 0) {
         *sent = 1;
     }
     return rv;
 }
+
+struct proxy_tunnel_async;
 
 struct proxy_tunnel_conn {
     /* the other side of the tunnel */
@@ -5482,9 +6145,216 @@ struct proxy_tunnel_conn {
     apr_off_t bytes_in,
               bytes_out;
 
+    /* the asynchronous tunnel's state (ap_proxy_tunnel_run_ex()), NULL when
+     * tunneling synchronously */
+    struct proxy_tunnel_async *ta;
+
+    /* a forward hook's hold of the direction from this side (its input,
+     * ap_proxy_tunnel_hold()): the context whose wait releases it, and the
+     * outcome of the last hold (ap_proxy_tunnel_hold_status()) */
+    ap_request_waitctx_t *hold_ctx;
+    apr_status_t hold_status;
+    /* a delegated hold's holder (ap_request_hold_delegate()) */
+    ap_request_holder_t holder;
+
+    /* the last activity of the direction from this side (its input read,
+     * its output to the other side written), its idle clock: stopped while
+     * the direction is paused by a hold, restarted at the hold's end */
+    apr_time_t active_at;
+
     unsigned int down_in:1,
-                 down_out:1;
+                 down_out:1,
+                 /* the last read/flush ended on EAGAIN (nothing left to read
+                  * or no room to write, until the next poll event) */
+                 in_eagain:1,
+                 out_eagain:1,
+                 /* the hooks of this side's direction run */
+                 forwarding:1,
+                 /* the direction is held (nothing read from this side, nor
+                  * from the other one with hold_both), until the hold is
+                  * over: then its hooks are called again (hold_over) */
+                 held:1,
+                 hold_both:1,
+                 hold_over:1,
+                 /* held by a delegated hold (no context) */
+                 hold_delegated:1;
 };
+
+/* The side of the tunnel a connection is, or NULL */
+static proxy_tunnel_conn_t *proxy_tunnel_side(const proxy_tunnel_rec *tunnel,
+                                              const conn_rec *c)
+{
+    if (c == tunnel->client->c) {
+        return tunnel->client;
+    }
+    if (c == tunnel->origin->c) {
+        return tunnel->origin;
+    }
+    return NULL;
+}
+
+/* Whether a side's input is not to be read: its direction held, or the
+ * other one held with AP_PROXY_TUNNEL_HOLD_BOTH
+ */
+static int proxy_tunnel_paused(const proxy_tunnel_conn_t *tc)
+{
+    return (tc->held || (tc->other->held && tc->other->hold_both));
+}
+
+/* How long the tunnel can wait for its sides before it ends idle (negative
+ * for no end, zero once reached): each direction has its own idle clock,
+ * and the tunnel ends once every direction not paused by a hold has been
+ * idle for the timeout (a paused direction's clock is stopped, restarted
+ * at the hold's end, the other one's restarted at the hold's start), never
+ * while both are paused. A direction over (its input's EOF read) doesn't
+ * count while the other one is held: the hold's bound applies then.
+ */
+static apr_interval_time_t proxy_tunnel_idle_wait(const proxy_tunnel_rec *tunnel,
+                                                  apr_interval_time_t timeout)
+{
+    const proxy_tunnel_conn_t *tcs[2];
+    apr_time_t end = 0, now;
+    int i;
+
+    if (timeout < 0) {
+        return -1;
+    }
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        if (proxy_tunnel_paused(tcs[i])
+            || (tcs[i]->down_in && tcs[i]->other->held)) {
+            continue;
+        }
+        if (tcs[i]->active_at + timeout > end) {
+            end = tcs[i]->active_at + timeout;
+        }
+    }
+    if (!end) {
+        return -1;
+    }
+    now = apr_time_now();
+    return (end > now) ? end - now : 0;
+}
+
+/* A direction's hold starts: the idle clock of the other direction, if
+ * not paused too, restarts, so that it ends the tunnel only if quiet for
+ * the idle timeout during the hold
+ */
+static void proxy_tunnel_hold_started(proxy_tunnel_conn_t *tc)
+{
+    if (!tc->hold_both) {
+        tc->other->active_at = apr_time_now();
+    }
+}
+
+/* A direction's hold ends: the idle clocks of the directions it paused
+ * restart
+ */
+static void proxy_tunnel_hold_ended(proxy_tunnel_conn_t *tc)
+{
+    apr_time_t now = apr_time_now();
+
+    tc->active_at = now;
+    if (tc->hold_both) {
+        tc->other->active_at = now;
+    }
+}
+
+/* What proxy_transfer() does next for a direction: call its hooks again
+ * (once) if its hold is over (1), read nothing if its input is paused by a
+ * hold (-1), else read its input (0)
+ */
+static int proxy_tunnel_input(proxy_tunnel_rec *tunnel, conn_rec *c_i)
+{
+    proxy_tunnel_conn_t *tc = proxy_tunnel_side(tunnel, c_i);
+
+    if (!tc) {
+        return 0;
+    }
+    if (tc->hold_over) {
+        tc->hold_over = 0;
+        return 1;
+    }
+    return (proxy_tunnel_paused(tc)) ? -1 : 0;
+}
+
+/* Give up a direction's hold not over: its wait canceled, or its delegated
+ * hold withdrawn if its work didn't start (else the release finds it given
+ * up)
+ */
+static void proxy_tunnel_hold_cancel(proxy_tunnel_conn_t *tc)
+{
+    if (tc->held) {
+        proxy_tunnel_hold_ended(tc);
+    }
+    if (tc->held && tc->hold_ctx) {
+        (void)ap_request_wait_cancel(tc->hold_ctx);
+    }
+    if (tc->held && tc->hold_delegated) {
+        (void)ap_request_hold_withdraw(&tc->holder);
+    }
+    tc->hold_ctx = NULL;
+    tc->held = tc->hold_both = tc->hold_over = tc->hold_delegated = 0;
+}
+
+/* Run the forward hooks of a direction: SUSPENDED once a hook holds it
+ * (ap_proxy_tunnel_hold()), bb empty, else the hooks' status
+ */
+static int proxy_tunnel_forward(proxy_tunnel_rec *tunnel,
+                                conn_rec *c_i, conn_rec *c_o,
+                                apr_bucket_brigade *bb)
+{
+    request_rec *r = tunnel->r;
+    proxy_tunnel_conn_t *tc = proxy_tunnel_side(tunnel, c_i);
+    int rc;
+
+    tc->forwarding = 1;
+    rc = proxy_run_tunnel_forward(tunnel, c_i, c_o, bb);
+    tc->forwarding = 0;
+
+    if (rc == SUSPENDED) {
+        if (!tc->held) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "proxy: %s: invalid status %d returned by "
+                          "tunnel forward hooks (no hold)", tunnel->scheme, rc);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (!APR_BRIGADE_EMPTY(bb)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "proxy: %s: tunnel forward hook held the %s's "
+                          "direction with data left to forward",
+                          tunnel->scheme, tc->name);
+            proxy_tunnel_hold_cancel(tc);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (tc->hold_delegated
+            && ap_request_hold_withdraw(&tc->holder) == APR_SUCCESS) {
+            /* Nothing would release the hold */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                          "proxy: %s: tunnel forward hook held the %s's "
+                          "direction without starting the work its hold "
+                          "is delegated to", tunnel->scheme, tc->name);
+            proxy_tunnel_hold_cancel(tc);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                      "proxy: %s: %s's direction held by a forward hook%s%s",
+                      tunnel->scheme, tc->name,
+                      (tc->hold_delegated) ? " (delegated)" : "",
+                      (tc->hold_both) ? " (both paused)" : "");
+        return SUSPENDED;
+    }
+    if (tc->held) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
+                      "proxy: %s: tunnel forward hook held the %s's "
+                      "direction without returning SUSPENDED (%d)",
+                      tunnel->scheme, tc->name, rc);
+        proxy_tunnel_hold_cancel(tc);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    return rc;
+}
 
 PROXY_DECLARE(apr_off_t) ap_proxy_tunnel_conn_bytes_in(
                                 const proxy_tunnel_conn_t *tc)
@@ -5508,12 +6378,10 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **ptunnel,
 
     *ptunnel = NULL;
 
+    /* The pollset is created by ap_proxy_tunnel_run() only, for tunneling
+     * driven by the MPM (ap_proxy_tunnel_step()) not to need one.
+     */
     tunnel = apr_pcalloc(r->pool, sizeof(*tunnel));
-
-    rv = apr_pollset_create(&tunnel->pollset, 2, r->pool, APR_POLLSET_NOCOPY);
-    if (rv != APR_SUCCESS) {
-        return rv;
-    }
 
     tunnel->r = r;
     tunnel->scheme = apr_pstrdup(r->pool, scheme);
@@ -5583,10 +6451,6 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **ptunnel,
          * Repeat until both sides are down */
         tunnel->client->pfd->reqevents = APR_POLLOUT | APR_POLLERR;
         tunnel->origin->pfd->reqevents = APR_POLLOUT | APR_POLLERR;
-        if ((rv = apr_pollset_add(tunnel->pollset, tunnel->origin->pfd)) ||
-            (rv = apr_pollset_add(tunnel->pollset, tunnel->client->pfd))) {
-            return rv;
-        }
     }
     else if (tunnel->client->pfd->desc_type == APR_POLL_FILE) {
         /* Input is a PIPE fd, the poll strategy is:
@@ -5597,18 +6461,12 @@ PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_create(proxy_tunnel_rec **ptunnel,
         tunnel->client->pfd->reqevents = 0;
         tunnel->origin->pfd->reqevents = APR_POLLIN | APR_POLLHUP |
                                          APR_POLLOUT | APR_POLLERR;
-        if ((rv = apr_pollset_add(tunnel->pollset, tunnel->origin->pfd))) {
-            return rv;
-        }
     }
     else {
         /* input is already closed, unsual, but we know nothing about
          * the tunneled protocol. */
         tunnel->client->down_in = 1;
         tunnel->origin->pfd->reqevents = APR_POLLIN | APR_POLLHUP;
-        if ((rv = apr_pollset_add(tunnel->pollset, tunnel->origin->pfd))) {
-            return rv;
-        }
     }
 
     *ptunnel = tunnel;
@@ -5733,6 +6591,10 @@ PROXY_DECLARE(void) ap_proxy_set_busy_count(proxy_worker *worker, apr_size_t to)
 #endif
 }
 
+/* Add (or below remove) events to (from) a pfd of the tunnel, in its pollset
+ * if any (ap_proxy_tunnel_run()), otherwise in its reqevents only, for the
+ * caller of ap_proxy_tunnel_step() to wait for them.
+ */
 static void add_pollset(apr_pollset_t *pollset, apr_pollfd_t *pfd,
                         apr_int16_t events)
 {
@@ -5740,6 +6602,13 @@ static void add_pollset(apr_pollset_t *pollset, apr_pollfd_t *pfd,
 
     AP_DEBUG_ASSERT((pfd->reqevents & events) == 0);
 
+    if (!pollset) {
+        if (events & APR_POLLIN) {
+            events |= APR_POLLHUP;
+        }
+        pfd->reqevents |= events | APR_POLLERR;
+        return;
+    }
     if (pfd->reqevents) {
         rv = apr_pollset_remove(pollset, pfd);
         if (rv != APR_SUCCESS) {
@@ -5764,6 +6633,18 @@ static void del_pollset(apr_pollset_t *pollset, apr_pollfd_t *pfd,
 
     AP_DEBUG_ASSERT((pfd->reqevents & events) != 0);
 
+    if (!pollset) {
+        if (events & APR_POLLIN) {
+            events |= APR_POLLHUP;
+        }
+        if (pfd->reqevents & ~(events | APR_POLLERR)) {
+            pfd->reqevents &= ~events;
+        }
+        else {
+            pfd->reqevents = 0;
+        }
+        return;
+    }
     rv = apr_pollset_remove(pollset, pfd);
     if (rv != APR_SUCCESS) {
         AP_DEBUG_ASSERT(0);
@@ -5790,7 +6671,9 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
                                  proxy_tunnel_conn_t *in)
 {
     proxy_tunnel_conn_t *out = in->other;
+    apr_off_t bytes_in = in->bytes_in, bytes_out = out->bytes_out;
     apr_status_t rv;
+    int read_eagain = 0;
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, tunnel->r,
                   "proxy: %s: %s input ready",
@@ -5803,13 +6686,19 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
                         AP_PROXY_TRANSFER_YIELD_PENDING |
                         AP_PROXY_TRANSFER_YIELD_MAX_READS,
                         &in->bytes_in, &out->bytes_out,
-                        tunnel);
+                        tunnel, &read_eagain);
+    in->in_eagain = read_eagain;
+    if (in->bytes_in != bytes_in || out->bytes_out != bytes_out
+        || APR_STATUS_IS_EOF(rv)) {
+        in->active_at = apr_time_now(); /* the direction's activity */
+    }
     if (rv != APR_SUCCESS) {
         if (APR_STATUS_IS_INCOMPLETE(rv)) {
             /* Pause POLLIN while waiting for POLLOUT on the other
              * side, hence avoid filling the output filters even
              * more to avoid blocking there.
              */
+            out->out_eagain = 0; /* not flushed until EAGAIN yet */
             ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, tunnel->r,
                           "proxy: %s: %s wait writable",
                           tunnel->scheme, out->name);
@@ -5857,21 +6746,185 @@ static int proxy_tunnel_transfer(proxy_tunnel_rec *tunnel,
     return OK;
 }
 
+/* Process the events of one side of the tunnel: flush its pending output if
+ * writable, transfer its input to the other side if readable (and possibly
+ * shut either direction down), updating what each side waits for. Events
+ * polled at a time (polled, zero when only tried) are the activity of their
+ * directions then. Returns OK to go on, or the tunnel's final status (DONE
+ * when it's over).
+ */
+static int proxy_tunnel_events(proxy_tunnel_rec *tunnel,
+                               proxy_tunnel_conn_t *tc,
+                               apr_int16_t rtnevents,
+                               apr_time_t polled)
+{
+    request_rec *r = tunnel->r;
+    apr_pollset_t *pollset = tunnel->pollset;
+    const char *scheme = tunnel->scheme;
+    int rc;
+
+    if (!(rtnevents & (APR_POLLIN  | APR_POLLOUT |
+                       APR_POLLHUP | APR_POLLERR))) {
+        /* this catches POLLNVAL etc.. */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10220)
+                      "proxy: %s: polling events error (%x)",
+                      scheme, rtnevents);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    /* We want to write if we asked for POLLOUT and got:
+     * - POLLOUT: the socket is ready for write;
+     * - !POLLIN: the socket is in error state (POLLERR) so we let
+     *   the user know by failing the write and log, OR the socket
+     *   is shutdown for read already (POLLHUP) so we have to
+     *   shutdown for write.
+     */
+    if ((tc->pfd->reqevents & APR_POLLOUT)
+            && ((rtnevents & APR_POLLOUT)
+                || !(tc->pfd->reqevents & APR_POLLIN)
+                || !(rtnevents & (APR_POLLIN | APR_POLLHUP)))) {
+        proxy_tunnel_conn_t *out = tc, *in = tc->other;
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
+                      "proxy: %s: %s output ready",
+                      scheme, out->name);
+        if (polled) {
+            in->active_at = polled; /* the direction writing to out */
+        }
+
+        rc = ap_check_output_pending(out->c);
+        if (rc == AGAIN) {
+            /* Keep polling (OUT only), the pending data written until
+             * EAGAIN.
+             */
+            out->out_eagain = 1;
+            return OK;
+        }
+        if (rc != OK) {
+            /* Real failure, bail out */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10221)
+                          "proxy: %s: %s flushing failed (%i)",
+                          scheme, out->name, rc);
+            return HTTP_BAD_GATEWAY;
+        }
+
+        /* No more pending data. If the other side is not readable
+         * anymore it's time to shutdown for write (this direction
+         * is over). Otherwise back to normal business.
+         */
+        del_pollset(pollset, out->pfd, APR_POLLOUT);
+        if (in->down_in) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                          "proxy: %s: %s write shutdown",
+                          scheme, out->name);
+            apr_socket_shutdown(out->pfd->desc.s, 1);
+            out->down_out = 1;
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                          "proxy: %s: %s resume writable",
+                          scheme, out->name);
+            add_pollset(pollset, in->pfd, APR_POLLIN);
+
+            /* Flush any pending input data now, we don't know when
+             * the next POLLIN will trigger and retaining data might
+             * deadlock the underlying protocol. We don't check for
+             * pending data first with ap_check_input_pending() since
+             * the read from proxy_tunnel_transfer() is nonblocking
+             * anyway and returning OK if there's no data. Not while the
+             * input is paused by a hold (read once it's over).
+             */
+            if (!proxy_tunnel_paused(in)) {
+                rc = proxy_tunnel_transfer(tunnel, in);
+                if (rc != OK) {
+                    return rc;
+                }
+            }
+        }
+    }
+
+    /* We want to read if we asked for POLLIN|HUP and got:
+     * - POLLIN|HUP: the socket is ready for read or EOF (POLLHUP);
+     * - !POLLOUT: the socket is in error state (POLLERR) so we let
+     *   the user know by failing the read and log.
+     */
+    if ((tc->pfd->reqevents & APR_POLLIN) && !proxy_tunnel_paused(tc)
+            && ((rtnevents & (APR_POLLIN | APR_POLLHUP))
+                || !(rtnevents & APR_POLLOUT))) {
+        if (polled) {
+            tc->active_at = polled;
+        }
+        rc = proxy_tunnel_transfer(tunnel, tc);
+        if (rc != OK) {
+            return rc;
+        }
+    }
+
+    return OK;
+}
+
+/* Create the tunnel's pollset with what each side waits for (first call of
+ * ap_proxy_tunnel_run(), see ap_proxy_tunnel_create()).
+ */
+static apr_status_t proxy_tunnel_pollset(proxy_tunnel_rec *tunnel)
+{
+    proxy_tunnel_conn_t *tcs[2];
+    apr_status_t rv;
+    int i;
+
+    rv = apr_pollset_create(&tunnel->pollset, 2, tunnel->r->pool,
+                            APR_POLLSET_NOCOPY);
+    if (rv != APR_SUCCESS) {
+        tunnel->pollset = NULL;
+        return rv;
+    }
+    tcs[0] = tunnel->origin;
+    tcs[1] = tunnel->client;
+    for (i = 0; i < 2; i++) {
+        if (tcs[i]->pfd->reqevents && tcs[i]->pfd->desc_type != APR_NO_DESC) {
+            rv = apr_pollset_add(tunnel->pollset, tcs[i]->pfd);
+            if (rv != APR_SUCCESS) {
+                return rv;
+            }
+        }
+    }
+    return APR_SUCCESS;
+}
+
 PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
 {
     int status = OK, rc;
     request_rec *r = tunnel->r;
-    apr_pollset_t *pollset = tunnel->pollset;
+    apr_pollset_t *pollset;
     proxy_tunnel_conn_t *client = tunnel->client,
                         *origin = tunnel->origin;
     apr_interval_time_t timeout = tunnel->timeout >= 0 ? tunnel->timeout : -1;
+    apr_interval_time_t wait;
     const char *scheme = tunnel->scheme;
     apr_status_t rv;
+    apr_time_t now;
+
+    if (!tunnel->pollset && (rv = proxy_tunnel_pollset(tunnel))) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "proxy: %s: can't create the tunnel's pollset", scheme);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+    pollset = tunnel->pollset;
+
+    /* The pollset is level-triggered: what's left to read on a side, its
+     * end of file included, is reported again by the next poll, so a short
+     * read of the side's socket empties it (no read again for EAGAIN).
+     */
+    ap_core_input_short_drains(client->c, 1);
+    ap_core_input_short_drains(origin->c, 1);
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(10212)
                   "proxy: %s: tunnel running (timeout %lf)",
                   scheme, timeout >= 0 ? (double)timeout / APR_USEC_PER_SEC
                                        : (double)-1.0);
+
+    /* The directions' idle clocks start now */
+    client->active_at = origin->active_at = apr_time_now();
 
     /* Loop until both directions of the connection are closed,
      * or a failure occurs.
@@ -5883,8 +6936,12 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
                       "proxy: %s: polling (client=%hx, origin=%hx)",
                       scheme, client->pfd->reqevents, origin->pfd->reqevents);
+        /* Until every direction is idle for the timeout (zero once that's
+         * reached: what's ready still counts)
+         */
+        wait = proxy_tunnel_idle_wait(tunnel, timeout);
         do {
-            rv = apr_pollset_poll(pollset, timeout, &nresults, &results);
+            rv = apr_pollset_poll(pollset, wait, &nresults, &results);
         } while (APR_STATUS_IS_EINTR(rv));
 
         if (rv != APR_SUCCESS) {
@@ -5906,6 +6963,7 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r, APLOGNO(10215)
                       "proxy: %s: woken up, %i result(s)", scheme, nresults);
+        now = apr_time_now();
 
         for (i = 0; i < nresults; i++) {
             const apr_pollfd_t *pfd = &results[i];
@@ -5924,93 +6982,10 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
                 goto done;
             }
 
-            if (!(pfd->rtnevents & (APR_POLLIN  | APR_POLLOUT |
-                                    APR_POLLHUP | APR_POLLERR))) {
-                /* this catches POLLNVAL etc.. */
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10220)
-                              "proxy: %s: polling events error (%x)",
-                              scheme, pfd->rtnevents);
-                status = HTTP_INTERNAL_SERVER_ERROR;
+            rc = proxy_tunnel_events(tunnel, tc, pfd->rtnevents, now);
+            if (rc != OK) {
+                status = rc;
                 goto done;
-            }
-
-            /* We want to write if we asked for POLLOUT and got:
-             * - POLLOUT: the socket is ready for write;
-             * - !POLLIN: the socket is in error state (POLLERR) so we let
-             *   the user know by failing the write and log, OR the socket
-             *   is shutdown for read already (POLLHUP) so we have to
-             *   shutdown for write.
-             */
-            if ((tc->pfd->reqevents & APR_POLLOUT)
-                    && ((pfd->rtnevents & APR_POLLOUT)
-                        || !(tc->pfd->reqevents & APR_POLLIN)
-                        || !(pfd->rtnevents & (APR_POLLIN | APR_POLLHUP)))) {
-                proxy_tunnel_conn_t *out = tc, *in = tc->other;
-
-                ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
-                              "proxy: %s: %s output ready",
-                              scheme, out->name);
-
-                rc = ap_filter_output_pending(out->c);
-                if (rc == OK) {
-                    /* Keep polling out (only) */
-                    continue;
-                }
-                if (rc != DECLINED) {
-                    /* Real failure, bail out */
-                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10221)
-                                  "proxy: %s: %s flushing failed (%i)",
-                                  scheme, out->name, rc);
-                    status = rc;
-                    goto done;
-                }
-
-                /* No more pending data. If the other side is not readable
-                 * anymore it's time to shutdown for write (this direction
-                 * is over). Otherwise back to normal business.
-                 */
-                del_pollset(pollset, out->pfd, APR_POLLOUT);
-                if (in->down_in) {
-                    ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
-                                  "proxy: %s: %s write shutdown",
-                                  scheme, out->name);
-                    apr_socket_shutdown(out->pfd->desc.s, 1);
-                    out->down_out = 1;
-                }
-                else {
-                    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
-                                  "proxy: %s: %s resume writable",
-                                  scheme, out->name);
-                    add_pollset(pollset, in->pfd, APR_POLLIN);
-
-                    /* Flush any pending input data now, we don't know when
-                     * the next POLLIN will trigger and retaining data might
-                     * deadlock the underlying protocol. We don't check for
-                     * pending data first with ap_filter_input_pending() since
-                     * the read from proxy_tunnel_transfer() is nonblocking
-                     * anyway and returning OK if there's no data.
-                     */
-                    rc = proxy_tunnel_transfer(tunnel, in);
-                    if (rc != OK) {
-                        status = rc;
-                        goto done;
-                    }
-                }
-            }
-
-            /* We want to read if we asked for POLLIN|HUP and got:
-             * - POLLIN|HUP: the socket is ready for read or EOF (POLLHUP);
-             * - !POLLOUT: the socket is in error state (POLLERR) so we let
-             *   the user know by failing the read and log.
-             */
-            if ((tc->pfd->reqevents & APR_POLLIN)
-                    && ((pfd->rtnevents & (APR_POLLIN | APR_POLLHUP))
-                        || !(pfd->rtnevents & APR_POLLOUT))) {
-                rc = proxy_tunnel_transfer(tunnel, tc);
-                if (rc != OK) {
-                    status = rc;
-                    goto done;
-                }
             }
         }
     } while (!client->down_out || !origin->down_out);
@@ -6018,11 +6993,943 @@ PROXY_DECLARE(int) ap_proxy_tunnel_run(proxy_tunnel_rec *tunnel)
 done:
     ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO(10223)
                   "proxy: %s: tunneling returns (%i)", scheme, status);
+    ap_core_input_short_drains(client->c, 0);
+    ap_core_input_short_drains(origin->c, 0);
     if (client->bytes_out > 0) {
         tunnel->replied = 1;
     }
     if (status == DONE) {
         status = OK;
+    }
+    return status;
+}
+
+PROXY_DECLARE(int) ap_proxy_tunnel_step(proxy_tunnel_rec *tunnel,
+                                        const apr_array_header_t *ready)
+{
+    request_rec *r = tunnel->r;
+    proxy_tunnel_conn_t *tcs[2];
+    int status = OK, i, j;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (;;) {
+        /* What the caller polled is activity, what's tried counts if it
+         * moves data
+         */
+        apr_time_t polled = (ready) ? apr_time_now() : 0;
+        int pending = 0;
+
+        for (i = 0; i < 2; i++) {
+            proxy_tunnel_conn_t *tc = tcs[i];
+            apr_int16_t events = 0;
+
+            if (!tc->pfd->reqevents || tc->pfd->desc_type != APR_POLL_SOCKET) {
+                continue;
+            }
+            if (ready) {
+                /* What the caller polled ready */
+                for (j = 0; j < ready->nelts; j++) {
+                    const apr_pollfd_t *pfd = &APR_ARRAY_IDX(ready, j,
+                                                             apr_pollfd_t);
+                    if (pfd->desc_type == APR_POLL_SOCKET
+                        && pfd->desc.s == tc->pfd->desc.s) {
+                        events = pfd->rtnevents;
+                        break;
+                    }
+                }
+            }
+            else {
+                /* Try what it waits for, without blocking */
+                events = tc->pfd->reqevents & (APR_POLLIN | APR_POLLOUT);
+            }
+            if (!events) {
+                continue;
+            }
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
+                          "proxy: %s: step: %s: %hx/%hx", tunnel->scheme,
+                          tc->name, events, tc->pfd->reqevents);
+            status = proxy_tunnel_events(tunnel, tc, events, polled);
+            if (status != OK) {
+                goto done;
+            }
+        }
+        if (tunnel->client->down_out && tunnel->origin->down_out) {
+            goto done;
+        }
+
+        /* Data held by the input filters (e.g. what TLS decrypted already)
+         * is not reported by any poll: process it now rather than waiting.
+         * Only readable input counts (not what a filter keeps until more
+         * comes from the network, ap_filter_pending_more()), so this
+         * doesn't spin.
+         */
+        for (i = 0; i < 2; i++) {
+            if ((tcs[i]->pfd->reqevents & APR_POLLIN)
+                && !proxy_tunnel_paused(tcs[i])
+                && ap_check_input_pending(tcs[i]->c) == AGAIN) {
+                pending = 1;
+            }
+        }
+        if (!pending) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r,
+                          "proxy: %s: step: waiting (client=%hx, origin=%hx)",
+                          tunnel->scheme, tunnel->client->pfd->reqevents,
+                          tunnel->origin->pfd->reqevents);
+            if (tunnel->client->bytes_out > 0) {
+                tunnel->replied = 1; /* for a timeout while waiting */
+            }
+            return SUSPENDED;
+        }
+        ready = NULL;
+    }
+
+done:
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r, APLOGNO()
+                  "proxy: %s: tunneling step returns (%i)",
+                  tunnel->scheme, status);
+    if (tunnel->client->bytes_out > 0) {
+        tunnel->replied = 1;
+    }
+    if (status == DONE) {
+        status = OK;
+    }
+    return status;
+}
+
+PROXY_DECLARE(void) ap_proxy_handler_done(request_rec *r, int status)
+{
+    /* Let mod_proxy's handler continue as if the scheme handler had returned
+     * this status: it may fail over to another balancer member (suspending
+     * again), and runs the post_request hooks once the request is done.
+     */
+    status = ap_proxy_handler_resume(r, status);
+    if (status == SUSPENDED) {
+        return;
+    }
+
+    /* Then the handler chain, as if proxy_handler() had returned status:
+     * with DECLINED the next handlers run, otherwise the request ends.
+     */
+    ap_request_resume_suspended(r, status);
+}
+
+PROXY_DECLARE(int) ap_proxy_request_can_suspend(request_rec *r)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+
+    return (dconf->async_delay >= 0 && ap_request_can_suspend(r));
+}
+
+/* The state of a tunnel run by ap_proxy_tunnel_run_ex() */
+typedef struct proxy_tunnel_async {
+    proxy_tunnel_rec *tunnel;
+    ap_request_waitctx_t *ctxs[2]; /* the client's and the origin's (the
+                                     * core's waits), NULL once released */
+    apr_interval_time_t timeout;
+    ap_proxy_tunnel_done_fn *done;
+    void *baton;
+    ap_request_waitctx_t *waiting; /* a context of the tunnel's pending
+                                     * wait, if any */
+    ap_request_waitctx_t *timer;   /* the delegated holds' deadline, made
+                                     * on first need */
+} proxy_tunnel_async_t;
+
+/* Give up the holds of the tunnel's directions, the tunnel ending or going
+ * on synchronously: their waits canceled, the hooks no longer called for
+ * them (unless again by the synchronous tunnel)
+ */
+static void proxy_tunnel_async_detach(proxy_tunnel_async_t *ta)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+
+    proxy_tunnel_hold_cancel(tunnel->client);
+    proxy_tunnel_hold_cancel(tunnel->origin);
+    tunnel->client->ta = tunnel->origin->ta = NULL;
+}
+
+/* The tunnel's sockets are kept registered in the MPM across its waits
+ * (both live as long as the tunnel), until their contexts are released
+ * here: before they are given up, i.e. before the done callback (which
+ * releases the backend connection) or tunneling synchronously.
+ */
+static void proxy_tunnel_async_release(proxy_tunnel_async_t *ta)
+{
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        if (ta->ctxs[i]) {
+            ap_request_waitctx_release(ta->ctxs[i]);
+            ta->ctxs[i] = NULL;
+        }
+    }
+    if (ta->timer) {
+        ap_request_waitctx_release(ta->timer);
+        ta->timer = NULL;
+    }
+    ta->waiting = NULL;
+}
+
+/* Cancel the tunnel's own wait if pending */
+static void proxy_tunnel_async_cancel(proxy_tunnel_async_t *ta)
+{
+    if (ta->waiting) {
+        (void)ap_request_wait_cancel(ta->waiting);
+        ta->waiting = NULL;
+    }
+}
+
+/* The end of the asynchronous tunnel: its holds given up, its contexts
+ * released, then the done callback
+ */
+static void proxy_tunnel_async_finish(proxy_tunnel_async_t *ta, int status)
+{
+    proxy_tunnel_async_detach(ta);
+    proxy_tunnel_async_release(ta);
+    ta->done(ta->tunnel, status, ta->baton);
+}
+
+static void proxy_tunnel_async_continuation(request_rec *r,
+                                            apr_status_t status,
+                                            void *baton);
+
+/* Whether each side waits for POLLIN/POLLOUT only after its last read/flush
+ * ended on EAGAIN (AP_REQUEST_WAIT_DRAINED), not after a yield.
+ */
+static int proxy_tunnel_drained(proxy_tunnel_rec *tunnel)
+{
+    const proxy_tunnel_conn_t *tcs[2];
+    int i;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        if (((tcs[i]->pfd->reqevents & APR_POLLIN) && !tcs[i]->in_eagain
+             && !proxy_tunnel_paused(tcs[i]))
+            || ((tcs[i]->pfd->reqevents & APR_POLLOUT)
+                && !tcs[i]->out_eagain)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The tunnel's pfds with the events found ready by the last wait (the
+ * contexts' ready directions), for ap_proxy_tunnel_step().
+ */
+static apr_array_header_t *proxy_tunnel_async_ready(proxy_tunnel_async_t *ta)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    proxy_tunnel_conn_t *tcs[2];
+    int i;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        apr_pollfd_t *pfd = tcs[i]->pfd;
+        unsigned int ready = ap_request_waitctx_ready(ta->ctxs[i]);
+
+        pfd->rtnevents = 0;
+        if ((ready & AP_WAIT_IN) && (pfd->reqevents & APR_POLLIN)
+            && !proxy_tunnel_paused(tcs[i])) {
+            pfd->rtnevents |= APR_POLLIN;
+        }
+        if ((ready & AP_WAIT_OUT) && (pfd->reqevents & APR_POLLOUT)) {
+            pfd->rtnevents |= APR_POLLOUT;
+        }
+    }
+    return tunnel->pfds;
+}
+
+/* Wait for what the tunnel's sides need (their pfds' reqevents, but the
+ * input of a held direction), with the core's waits on the client's and
+ * the origin's contexts at once, until the tunnel ends idle (idle, from
+ * proxy_tunnel_idle_wait(): the directions' own clocks, a held one's
+ * stopped, the holds bounded by their own waits). Returns SUSPENDED with
+ * nothing to wait for if a hold's wait is pending.
+ */
+static int proxy_tunnel_async_wait(proxy_tunnel_async_t *ta,
+                                   apr_interval_time_t idle)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    proxy_tunnel_conn_t *tcs[2];
+    ap_request_waitctx_t *ctxs[3];
+    unsigned int directions[3];
+    int i, n = 0, held;
+    int rc;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    held = (tcs[0]->held || tcs[1]->held);
+    for (i = 0; i < 2; i++) {
+        const apr_pollfd_t *pfd = tcs[i]->pfd;
+        unsigned int d = 0;
+
+        if ((pfd->reqevents & APR_POLLIN) && !proxy_tunnel_paused(tcs[i])) {
+            d |= AP_WAIT_IN;
+        }
+        if (pfd->reqevents & APR_POLLOUT) {
+            d |= AP_WAIT_OUT;
+        }
+        if (d) {
+            /* The timeout is how long the tunnel can stay idle */
+            ta->ctxs[i]->timeout = idle;
+            ta->ctxs[i]->delay = 0;
+            ctxs[n] = ta->ctxs[i];
+            directions[n] = d;
+            n++;
+        }
+    }
+    if (idle > 0 && !n && held) {
+        /* Nothing of the sides to wait for but the holds' waits, a
+         * direction still counting for the idle end: that end on a timer
+         */
+        if (!ta->timer) {
+            ta->timer = ap_request_waitctx_timer(tunnel->r, tunnel->r->pool);
+        }
+        ta->timer->timeout = idle;
+        ctxs[n] = ta->timer;
+        directions[n] = AP_WAIT_IN;
+        n++;
+    }
+    if (!n) {
+        /* Nothing to wait for but the holds' waits, if any */
+        return (held) ? SUSPENDED : DECLINED;
+    }
+    rc = ap_request_wait_any(ctxs, n, directions,
+                             proxy_tunnel_drained(tunnel)
+                             ? AP_REQUEST_WAIT_DRAINED : 0,
+                             proxy_tunnel_async_continuation, ta);
+    ta->waiting = (rc == SUSPENDED) ? ctxs[0] : NULL;
+    return rc;
+}
+
+/* The asynchronous tunnel falls back to synchronous: the held directions'
+ * hooks are called again (their waits canceled) with APR_ENOTIMPL to
+ * finish their work blocking. Returns OK, or the tunnel's final status.
+ */
+static int proxy_tunnel_async_fallback(proxy_tunnel_async_t *ta)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    proxy_tunnel_conn_t *tcs[2];
+    int held[2], i, rc;
+
+    tcs[0] = tunnel->client;
+    tcs[1] = tunnel->origin;
+    for (i = 0; i < 2; i++) {
+        held[i] = tcs[i]->held;
+        if (held[i] && tcs[i]->hold_delegated) {
+            /* Its work can't be finished blocking */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, tunnel->r, APLOGNO()
+                          "proxy: %s: can't tunnel synchronously while the "
+                          "work of the %s's direction's delegated hold runs",
+                          tunnel->scheme, tcs[i]->name);
+            proxy_tunnel_async_detach(ta);
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+    }
+    proxy_tunnel_async_detach(ta);
+    for (i = 0; i < 2; i++) {
+        if (held[i]) {
+            tcs[i]->hold_status = APR_ENOTIMPL;
+            tcs[i]->hold_over = 1;
+            rc = proxy_tunnel_transfer(tunnel, tcs[i]);
+            if (rc != OK) {
+                return rc;
+            }
+        }
+    }
+    return OK;
+}
+
+/* Step the tunnel with what's ready, then wait in the MPM for what it needs,
+ * or when the MPM can't wait tunnel synchronously from now on. Returns
+ * SUSPENDED, or the tunnel's status once done.
+ */
+static int proxy_tunnel_async_pump(proxy_tunnel_async_t *ta,
+                                   const apr_array_header_t *ready)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    request_rec *r = tunnel->r;
+    apr_interval_time_t idle;
+    int status;
+
+    for (;;) {
+        status = ap_proxy_tunnel_step(tunnel, ready);
+        if (status != SUSPENDED) {
+            return status;
+        }
+
+        idle = proxy_tunnel_idle_wait(tunnel, ta->timeout);
+        if (idle == 0) {
+            /* Every direction not held idle for the timeout */
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "proxy: %s: tunnel idle (async)", tunnel->scheme);
+            return HTTP_GATEWAY_TIME_OUT;
+        }
+        status = proxy_tunnel_async_wait(ta, idle);
+        if (status == SUSPENDED) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                          "proxy: %s: tunnel: waiting (async)%s",
+                          tunnel->scheme, (ta->waiting) ? "" : " (held)");
+            return SUSPENDED;
+        }
+        if (status != OK) {
+            break;
+        }
+        /* Ready already in the connections' filters (pending input or no
+         * pending output anymore): step again with that.
+         */
+        ready = proxy_tunnel_async_ready(ta);
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                  "proxy: %s: can't tunnel asynchronously", tunnel->scheme);
+
+    status = proxy_tunnel_async_fallback(ta);
+    proxy_tunnel_async_release(ta);
+    if (status != OK) {
+        return (status == DONE) ? OK : status;
+    }
+    tunnel->timeout = ta->timeout;
+    return ap_proxy_tunnel_run(tunnel);
+}
+
+/* Go on with the tunnel after a direction's hold is over: the tunnel's own
+ * wait (carried while the hold lasted) is canceled, the direction's hooks
+ * called again, and the tunnel stepped with whatever each side waits for
+ * (so no readiness of the canceled wait is lost) until it waits again or
+ * ends.
+ */
+static void proxy_tunnel_async_resume(proxy_tunnel_async_t *ta,
+                                      proxy_tunnel_conn_t *tc)
+{
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    int status;
+
+    proxy_tunnel_async_cancel(ta);
+    tc->hold_over = 1;
+    status = proxy_tunnel_transfer(tunnel, tc);
+    if (status == OK) {
+        status = proxy_tunnel_async_pump(ta, NULL);
+        if (status == SUSPENDED) {
+            return; /* continued later */
+        }
+    }
+    else if (status == DONE) {
+        status = OK;
+    }
+    proxy_tunnel_async_finish(ta, status);
+}
+
+/* The continuation of a direction's hold on a context: the hold is over
+ * (ready, or its timeout reached), the hook called again. After an MPM
+ * failure the hook is called once, then the tunnel ends.
+ */
+static void proxy_tunnel_hold_continuation(request_rec *r,
+                                           apr_status_t rv,
+                                           void *baton)
+{
+    proxy_tunnel_conn_t *tc = baton;
+    proxy_tunnel_async_t *ta = tc->ta;
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+
+    AP_DEBUG_ASSERT(tunnel->r == r && tc->held);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, rv, r,
+                  "proxy: %s: %s's direction hold over", tunnel->scheme,
+                  tc->name);
+    proxy_tunnel_hold_ended(tc);
+    tc->hold_status = rv;
+    tc->hold_ctx = NULL;
+    tc->held = tc->hold_both = 0;
+    if (rv == APR_SUCCESS || APR_STATUS_IS_TIMEUP(rv)) {
+        proxy_tunnel_async_resume(ta, tc);
+        return;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                  "proxy: %s: tunneling failed (async hold)", tunnel->scheme);
+    proxy_tunnel_async_cancel(ta);
+    tc->hold_over = 1;
+    (void)proxy_tunnel_transfer(tunnel, tc);
+    proxy_tunnel_async_finish(ta, HTTP_INTERNAL_SERVER_ERROR);
+}
+
+/* The release of a direction's delegated hold: its work ended, the hook
+ * called again (its work's completion function recorded the outcome), or
+ * undone if the work ended at once (the hook goes on in its call). Nothing
+ * if the hold was given up meanwhile (the tunnel ended).
+ */
+static void proxy_tunnel_hold_release(ap_request_holder_t *holder,
+                                      ap_request_hold_end_e how)
+{
+    proxy_tunnel_conn_t *tc = holder->baton;
+
+    if (!tc->held || !tc->hold_delegated) {
+        return;
+    }
+    proxy_tunnel_hold_ended(tc);
+    tc->hold_status = APR_SUCCESS;
+    tc->held = tc->hold_both = tc->hold_delegated = 0;
+    if (how == AP_REQUEST_HOLD_UNDONE || !tc->ta) {
+        return;
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, holder->r,
+                  "proxy: %s: %s's direction delegated hold over",
+                  tc->ta->tunnel->scheme, tc->name);
+    proxy_tunnel_async_resume(tc->ta, tc);
+}
+
+/* The continuation of the tunnel's waits: step the tunnel again until it's
+ * over, then call the done callback.
+ */
+static void proxy_tunnel_async_continuation(request_rec *r,
+                                            apr_status_t rv,
+                                            void *baton)
+{
+    proxy_tunnel_async_t *ta = baton;
+    proxy_tunnel_rec *tunnel = ta->tunnel;
+    int status;
+
+    AP_DEBUG_ASSERT(tunnel->r == r);
+    ta->waiting = NULL;
+    if (rv == APR_SUCCESS) {
+        status = proxy_tunnel_async_pump(ta, proxy_tunnel_async_ready(ta));
+        if (status == SUSPENDED) {
+            return; /* continued later */
+        }
+    }
+    else if (APR_STATUS_IS_TIMEUP(rv)) {
+        status = HTTP_GATEWAY_TIME_OUT;
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "proxy: %s: tunneling failed (async)", tunnel->scheme);
+        status = HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    proxy_tunnel_async_finish(ta, status);
+}
+
+PROXY_DECLARE(int) ap_proxy_tunnel_run_ex(proxy_tunnel_rec *tunnel,
+                                          apr_interval_time_t timeout,
+                                          ap_proxy_tunnel_done_fn *done,
+                                          void *baton)
+{
+    request_rec *r = tunnel->r;
+    proxy_tunnel_async_t *ta;
+    int status;
+
+    /* Not asynchronous if not asked (!done), nor if the request can't be
+     * suspended, nor for a subrequest (it can't take the client's socket
+     * over from its main request), nor if the client's side isn't the
+     * request's connection's socket (the core's client context).
+     */
+    if (!done || !ap_request_can_suspend(r) || r->main
+        || tunnel->client->pfd->desc_type != APR_POLL_SOCKET
+        || tunnel->client->pfd->desc.s != ap_get_conn_socket(r->connection)) {
+        tunnel->timeout = timeout;
+        return ap_proxy_tunnel_run(tunnel);
+    }
+
+    ta = apr_pcalloc(r->pool, sizeof(*ta));
+    ta->tunnel = tunnel;
+    ta->timeout = timeout;
+    ta->done = done;
+    ta->baton = baton;
+    ta->ctxs[0] = ap_request_waitctx_client(r);
+    ta->ctxs[1] = ap_request_waitctx_conn(r, r->pool, tunnel->origin->c);
+    tunnel->client->ta = tunnel->origin->ta = ta;
+    tunnel->client->holder.r = tunnel->origin->holder.r = r;
+    tunnel->client->holder.name = "the tunnel's client forward hook";
+    tunnel->origin->holder.name = "the tunnel's origin forward hook";
+    tunnel->client->holder.release = proxy_tunnel_hold_release;
+    tunnel->origin->holder.release = proxy_tunnel_hold_release;
+    tunnel->client->holder.baton = tunnel->client;
+    tunnel->origin->holder.baton = tunnel->origin;
+    /* The bound of a delegated hold's work having none: the tunnel's idle
+     * timeout, or the server's Timeout if the tunnel has none
+     */
+    tunnel->client->holder.timeout = (timeout > 0) ? timeout
+                                                   : r->server->timeout;
+    tunnel->origin->holder.timeout = tunnel->client->holder.timeout;
+    /* The directions' idle clocks start now */
+    tunnel->client->active_at = tunnel->origin->active_at = apr_time_now();
+    status = proxy_tunnel_async_pump(ta, NULL);
+    if (status != SUSPENDED) {
+        /* Over already: nothing of the tunnel left pending */
+        proxy_tunnel_async_detach(ta);
+        proxy_tunnel_async_release(ta);
+    }
+    return status;
+}
+
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold(proxy_tunnel_rec *tunnel,
+                                                 conn_rec *c_i,
+                                                 ap_request_waitctx_t *ctx,
+                                                 unsigned int direction,
+                                                 unsigned int flags)
+{
+    request_rec *r = tunnel->r;
+    proxy_tunnel_conn_t *tc = proxy_tunnel_side(tunnel, c_i);
+    proxy_tunnel_async_t *ta;
+    apr_status_t rv;
+    int rc;
+
+    if (!tc || !tc->forwarding) {
+        return APR_EINVAL;
+    }
+    if ((flags & AP_PROXY_TUNNEL_HOLD_DELEGATED)
+        ? ctx != NULL : (!ctx || ctx->r != r)) {
+        return APR_EINVAL;
+    }
+    ta = tc->ta;
+    if (!ta) {
+        return APR_ENOTIMPL;
+    }
+    if (ctx && (ctx == ta->ctxs[0] || ctx == ta->ctxs[1])) {
+        return APR_EINVAL;
+    }
+    if (tc->held) {
+        return APR_EBUSY;
+    }
+
+    if (!ctx) {
+        /* Released by the end of the work the hook starts next, bounded by
+         * its own timeout, or the holder's if it has none
+         */
+        rv = ap_request_hold_delegate(&tc->holder);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+        tc->hold_status = APR_SUCCESS;
+        tc->held = tc->hold_delegated = 1;
+        tc->hold_both = !!(flags & AP_PROXY_TUNNEL_HOLD_BOTH);
+        proxy_tunnel_hold_started(tc);
+        return APR_SUCCESS;
+    }
+
+    /* Every hold is bounded: the tunnel's idle timeout (or the server's
+     * Timeout) for a context giving none
+     */
+    if (ctx->timeout < 0 && ctx->timeout != AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT) {
+        ctx->timeout = (ta->timeout >= 0) ? ta->timeout
+                                          : AP_REQUEST_WAITCTX_TIMEOUT_DEFAULT;
+    }
+    rc = ap_request_wait(ctx, direction, 0, proxy_tunnel_hold_continuation,
+                         tc);
+    if (rc == OK) {
+        return APR_EAGAIN;
+    }
+    if (rc != SUSPENDED) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "proxy: %s: can't hold the %s's direction: its wait "
+                      "is refused", tunnel->scheme, tc->name);
+        return APR_ENOTIMPL;
+    }
+    tc->hold_ctx = ctx;
+    tc->hold_status = APR_SUCCESS;
+    tc->held = 1;
+    tc->hold_both = !!(flags & AP_PROXY_TUNNEL_HOLD_BOTH);
+    proxy_tunnel_hold_started(tc);
+    return APR_SUCCESS;
+}
+
+PROXY_DECLARE(apr_status_t) ap_proxy_tunnel_hold_status(const proxy_tunnel_rec *tunnel,
+                                                        const conn_rec *c_i)
+{
+    const proxy_tunnel_conn_t *tc = proxy_tunnel_side(tunnel, c_i);
+
+    if (!tc) {
+        return APR_EINVAL;
+    }
+    return tc->hold_status;
+}
+
+PROXY_DECLARE(int) ap_proxy_wait(request_rec *r, proxy_conn_rec *conn,
+                                 ap_proxy_direction_e direction,
+                                 unsigned int flags,
+                                 apr_interval_time_t timeout,
+                                 ap_proxy_wait_continuation_fn *fn,
+                                 void *baton)
+{
+    proxy_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
+                                                 &proxy_module);
+    ap_request_waitctx_t *ctx;
+    ap_wait_direction_e wait;
+
+    if (!ap_proxy_request_can_suspend(r)) {
+        return DECLINED;
+    }
+
+    /* The client's context is the request's, shared with other modules:
+     * its fields are set for each wait, like the backend's.
+     */
+    switch (direction) {
+    case AP_PROXY_CLIENT_IN:
+    case AP_PROXY_CLIENT_OUT:
+        ctx = ap_request_waitctx_client(r);
+        break;
+    default:
+        ctx = proxy_backend_wait_ctx(r, conn);
+        if (!ctx) {
+            return DECLINED;
+        }
+        break;
+    }
+    ctx->timeout = timeout;
+    ctx->delay = dconf->async_delay;
+    wait = (direction == AP_PROXY_CLIENT_IN
+            || direction == AP_PROXY_BACKEND_IN) ? AP_WAIT_IN : AP_WAIT_OUT;
+    return ap_request_wait(ctx, wait,
+                           (flags & AP_PROXY_WAIT_DRAINED)
+                           ? AP_REQUEST_WAIT_DRAINED : 0,
+                           fn, baton);
+}
+
+/* A request waiting for a backend connection from an exhausted pool
+ * (ap_proxy_acquire_connection_async()), with what it needs to run the
+ * scheme handler again.
+ */
+typedef struct proxy_acquire_wait {
+    ap_proxy_conn_pool_waiter *waiter;
+    ap_mpm_notifier_t *notifier;  /* The MPM's notifier, re-armed per wait */
+    ap_request_waitctx_t *ctx;   /* its context (the core's wait), if any */
+    int waits;                    /* the waits so far */
+    ap_proxy_scheme_handler_fn *handler;
+    proxy_worker *worker;
+    proxy_server_conf *conf;
+    char *url;
+    const char *proxyname;
+    apr_port_t proxyport;
+} proxy_acquire_wait_t;
+
+/* Called by the pool when a connection is released for the waiter (from any
+ * thread, under the pool's lock): notify the wait in the MPM.
+ */
+static void proxy_acquire_released(void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+
+    ap_mpm_notify(aw->notifier);
+}
+
+/* r->pool's cleanup of a request that waited for a pooled connection: the
+ * core drops a request's waits without calling their continuations (e.g. a
+ * subrequest's at its main request's end, or every wait when r->pool goes),
+ * so take the waiter out of the pool's queue, or give back the connection it
+ * was notified for, before the waiter and its notifier go with r->pool. The
+ * pool's lock makes sure no notification of the waiter is still running once
+ * this returns. Canceling is a no-op for a waiter neither queued nor notified
+ * (e.g. canceled already by the continuation).
+ */
+static apr_status_t proxy_acquire_cleanup(void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+
+    if (aw->worker && aw->worker->cp) {
+        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
+    }
+    return APR_SUCCESS;
+}
+
+/* The continuation of ap_proxy_acquire_connection_async(), called when a
+ * connection was released to the pool (or on timeout or error): run the
+ * scheme handler again, which acquires from the start.
+ */
+static void proxy_acquire_continuation(request_rec *r, apr_status_t rv,
+                                       void *baton)
+{
+    proxy_acquire_wait_t *aw = baton;
+    int status;
+
+    if (rv != APR_SUCCESS) {
+        ap_proxy_cancel_conn_pool_waiter(aw->worker, aw->waiter);
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "proxy: %s waiting for a connection to (%s:%d) "
+                      "(async)",
+                      APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "error",
+                      aw->worker->s->hostname_ex, (int)aw->worker->s->port);
+        ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
+        return;
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: connection to (%s:%d) available (async)",
+                  aw->worker->s->hostname_ex, (int)aw->worker->s->port);
+    status = aw->handler(r, aw->worker, aw->conf, aw->url,
+                         aw->proxyname, aw->proxyport);
+    if (status == SUSPENDED) {
+        return; /* waiting again (for the pool, or in a later step) */
+    }
+    ap_proxy_handler_done(r, status);
+}
+
+/* The request is gone (its pool cleaned up) without releasing the connection
+ * it holds, e.g. suspended when its connection is killed or the child exits:
+ * close the connection and give it back to the worker, unless the worker's
+ * connection pool is being destroyed (worker->cp NULL). Closing is required,
+ * the connection's filters use the client connection's bucket allocator, that
+ * goes with it.
+ */
+static apr_status_t proxy_held_cleanup(void *baton)
+{
+    struct proxy_req_async *ra = baton;
+    proxy_conn_rec *conn = ra->held;
+
+    ra->held_cleanup = 0;
+    if (!conn) {
+        return APR_SUCCESS;
+    }
+    ra->held = NULL;
+    conn->holder = NULL;
+    if (conn->worker->cp && !conn->inreslist) {
+        ap_log_perror(APLOG_MARK, APLOG_DEBUG, 0, conn->pool, APLOGNO()
+                      "proxy: releasing the connection to (%s:%d) held by a "
+                      "request gone without releasing it",
+                      conn->worker->s->hostname_ex,
+                      (int)conn->worker->s->port);
+        conn->close = 1;
+        connection_cleanup(conn);
+    }
+    return APR_SUCCESS;
+}
+
+PROXY_DECLARE(void) ap_proxy_hold_connection(request_rec *r,
+                                             proxy_conn_rec *conn)
+{
+    struct proxy_req_async *ra = ap_proxy_req_async(r);
+
+    ra->held = conn;
+    conn->holder = ra;
+    if (!ra->held_cleanup) {
+        apr_pool_cleanup_register(r->pool, ra, proxy_held_cleanup,
+                                  apr_pool_cleanup_null);
+        ra->held_cleanup = 1;
+    }
+}
+
+static int proxy_acquire_async(const char *proxy_function,
+                               proxy_conn_rec **conn,
+                               request_rec *r,
+                               ap_proxy_scheme_handler_fn *handler,
+                               proxy_worker *worker,
+                               proxy_server_conf *conf,
+                               char *url,
+                               const char *proxyname,
+                               apr_port_t proxyport)
+{
+    struct proxy_req_async *ra;
+    proxy_acquire_wait_t *aw;
+    apr_status_t rv;
+    int status;
+
+    if (!ap_proxy_request_can_suspend(r)) {
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+
+    /* Reuse this request's waiter, if any (not queued anymore) */
+    ra = ap_proxy_req_async(r);
+    aw = ra->acquire;
+    if (!aw) {
+        aw = apr_pcalloc(r->pool, sizeof(*aw));
+        aw->waiter = ap_proxy_conn_pool_waiter_make(r->pool,
+                                                    proxy_acquire_released,
+                                                    aw);
+        ra->acquire = aw;
+    }
+    aw->handler = handler;
+    aw->worker = worker;
+    aw->conf = conf;
+    aw->url = url;
+    aw->proxyname = proxyname;
+    aw->proxyport = proxyport;
+
+    /* The request's notifier, created once (in r->pool, as its context) and
+     * re-armed for each next wait, before the waiter is queued: a connection
+     * released before the wait is armed completes it once armed, while a
+     * notification left by a previous wait is dropped by the re-arm. Nothing
+     * is allocated per wait.
+     */
+    if (!aw->notifier) {
+        rv = ap_mpm_notifier_create(&aw->notifier, r->connection, r->pool);
+        if (rv != APR_SUCCESS) {
+            aw->notifier = NULL;
+        }
+        else {
+            /* Registered after the notifier's creation, so that it runs
+             * before the notifier's own cleanups (if any)
+             */
+            apr_pool_cleanup_register(r->pool, aw, proxy_acquire_cleanup,
+                                      apr_pool_cleanup_null);
+        }
+    }
+    else {
+        rv = ap_mpm_notifier_rearm(aw->notifier);
+        if (rv == APR_EBUSY) {
+            /* Its previous wait is still in flight: a bug, don't wait twice */
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                          "proxy: can't re-arm the notifier waiting for a "
+                          "connection to (%s:%d), its wait is in flight: "
+                          "blocking", worker->s->hostname_ex,
+                          (int)worker->s->port);
+        }
+        else if (rv == APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                          "proxy: notifier re-armed after %d wait(s)",
+                          aw->waits);
+        }
+    }
+    if (rv != APR_SUCCESS) {
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+
+    status = ap_proxy_acquire_connection_ex(proxy_function, conn, worker,
+                                            r->server, aw->waiter);
+    if (status != SUSPENDED) {
+        return status;
+    }
+
+    /* The context waits again once its notifier is re-armed */
+    if (!aw->ctx) {
+        aw->ctx = ap_request_waitctx_notifier(r, r->pool, aw->notifier);
+    }
+    aw->ctx->timeout = (worker->s->acquire_set) ? worker->s->acquire
+                                                : r->server->timeout;
+    status = ap_request_wait(aw->ctx, AP_WAIT_IN, 0,
+                             proxy_acquire_continuation, aw);
+    if (status != SUSPENDED) {
+        /* Can't wait asynchronously (a notifier is never ready before the
+         * wait): block
+         */
+        ap_proxy_cancel_conn_pool_waiter(worker, aw->waiter);
+        return ap_proxy_acquire_connection(proxy_function, conn, worker,
+                                           r->server);
+    }
+    aw->waits++;
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "proxy: waiting for a connection to (%s:%d) (async, "
+                  "wait %d)", worker->s->hostname_ex, (int)worker->s->port,
+                  aw->waits);
+    return SUSPENDED;
+}
+
+PROXY_DECLARE(int) ap_proxy_acquire_connection_async(const char *proxy_function,
+                                                     proxy_conn_rec **conn,
+                                                     request_rec *r,
+                                                     ap_proxy_scheme_handler_fn *handler,
+                                                     proxy_worker *worker,
+                                                     proxy_server_conf *conf,
+                                                     char *url,
+                                                     const char *proxyname,
+                                                     apr_port_t proxyport)
+{
+    int status = proxy_acquire_async(proxy_function, conn, r, handler, worker,
+                                     conf, url, proxyname, proxyport);
+    if (status == OK) {
+        ap_proxy_hold_connection(r, *conn);
     }
     return status;
 }

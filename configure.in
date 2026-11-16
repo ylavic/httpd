@@ -456,6 +456,7 @@ AC_CHECK_HEADERS( \
 string.h \
 limits.h \
 unistd.h \
+time.h \
 sys/socket.h \
 pwd.h \
 grp.h \
@@ -519,6 +520,7 @@ getpwnam \
 getgrnam \
 initgroups \
 bindprocessor \
+clock_gettime \
 prctl \
 procctl \
 pthread_getthreadid_np \
@@ -544,6 +546,22 @@ if test $ac_cv_func_gettid = no; then
   if test "$ap_cv_gettid" = "yes"; then
       AC_DEFINE(HAVE_SYS_GETTID, 1, [Define if you have gettid() via syscall()])
   fi
+fi
+
+dnl The CPUs a process can run on (Linux, FreeBSD 13.1+, DragonFly)
+AC_CACHE_CHECK([for sched_getaffinity() and CPU_COUNT()], ap_cv_sched_getaffinity,
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([[#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <sched.h>]],
+[[cpu_set_t set;
+CPU_ZERO(&set);
+if (sched_getaffinity(0, sizeof(set), &set) != 0) return 1;
+return CPU_COUNT(&set) > 0 ? 0 : 1;]])],
+  [ap_cv_sched_getaffinity=yes], [ap_cv_sched_getaffinity=no])])
+if test "$ap_cv_sched_getaffinity" = "yes"; then
+    AC_DEFINE(HAVE_SCHED_GETAFFINITY, 1,
+              [Define if sched_getaffinity() and CPU_COUNT() are usable])
 fi
 
 case ${host}X${ac_cv_func_gettid}X${ap_cv_gettid} in

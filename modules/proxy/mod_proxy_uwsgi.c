@@ -300,17 +300,10 @@ static request_rec *make_fake_req(conn_rec *c, request_rec *r)
 }
 
 static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
-                          proxy_server_conf * conf)
+                          proxy_server_conf * conf, apr_status_t wait_rv)
 {
-
-    char buffer[HUGE_STRING_LEN];
     const char *buf;
-    char *value;
-    char keepchar;
-    int len;
     int backend_broke = 0;
-    int status_start;
-    int status_end;
     int finish = 0;
     conn_rec *c = r->connection;
     apr_off_t readbytes;
@@ -320,6 +313,10 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     apr_bucket_brigade *pass_bb;
     apr_bucket_brigade *bb;
     proxy_dir_conf *dconf;
+    ap_h1_head_opts_t opts;
+    ap_h1_head_parser_t *parser;
+    ap_h1_head_t *head;
+    int rc;
 
     request_rec *rp = make_fake_req(backend->connection, r);
     rp->proxyreq = PROXYREQ_RESPONSE;
@@ -327,83 +324,44 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     bb = apr_brigade_create(r->pool, c->bucket_alloc);
     pass_bb = apr_brigade_create(r->pool, c->bucket_alloc);
 
-    len = ap_getline(buffer, sizeof(buffer), rp, 1);
-    if (len <= 0) {
-        /* invalid or empty */
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-    backend->worker->s->read += len;
-    if ((apr_size_t)len >= sizeof(buffer)) {
-        /* too long */
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* Position of http status code */
-    if (apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
-        status_start = 9;
-    }
-    else if (apr_date_checkmask(buffer, "HTTP/# ###*")) {
-        status_start = 7;
-    }
-    else {
-        /* not HTTP */
-        return HTTP_BAD_GATEWAY;
-    }
-    status_end = status_start + 3;
-
-    keepchar = buffer[status_end];
-    buffer[status_end] = '\0';
-    r->status = atoi(&buffer[status_start]);
-
-    if (keepchar != '\0') {
-        buffer[status_end] = keepchar;
-    }
-    else {
-        /* 2616 requires the space in Status-Line; the origin
-         * server may have sent one but ap_rgetline will
-         * have stripped it. */
-        buffer[status_end] = ' ';
-        buffer[status_end + 1] = '\0';
-    }
-    r->status_line = apr_pstrdup(r->pool, &buffer[status_start]);
-
-    /* parse headers */
-    while ((len = ap_getline(buffer, sizeof(buffer), rp, 1)) > 0) {
-        if ((apr_size_t)len >= sizeof(buffer)) {
-            /* too long */
-            len = -1;
-            break;
+    /* Read the response head with the rules and limits of
+     * ap_proxy_h1_head_opts(), the status line's protocol being the
+     * request's too (SERVER_PROTOCOL may be echoed)
+     */
+    ap_proxy_h1_head_opts(&opts, r, backend->worker, AP_H1_HEAD_RESPONSE);
+    opts.echo_protocol = r->protocol;
+    parser = ap_h1_head_parser_create(r->pool, r, &opts);
+    rc = ap_h1_head_parse(parser, rp->input_filters, APR_BLOCK_READ, &head);
+    if (rc != OK) {
+        apr_status_t prv = ap_h1_head_parser_status(parser);
+        if (!head && APR_STATUS_IS_TIMEUP(prv)
+            && (wait_rv == APR_SUCCESS || APR_STATUS_IS_TIMEUP(wait_rv))) {
+            /* No status line within the timeout: a gateway timeout, as
+             * mod_proxy_http's
+             */
+            return HTTP_GATEWAY_TIME_OUT;
         }
-        value = strchr(buffer, ':');
-        if (!value) {
-            /* invalid header */
-            len = -1;
-            break;
+        if (!head && !APR_STATUS_IS_EINVAL(prv)) {
+            /* No status line: the backend closed or failed before its end
+             * (or the wait for it was interrupted, not timed out), or it is
+             * too long
+             */
+            return HTTP_INTERNAL_SERVER_ERROR;
         }
-        *value++ = '\0';
-        if (*ap_scan_http_token(buffer)) {
-            /* invalid name */
-            len = -1;
-            break;
-        }
-        while (apr_isspace(*value))
-            ++value;
-        ap_cstr_stripws(value);
-        if (*ap_scan_http_field_content(value)) {
-            /* invalid value */
-            len = -1;
-            break;
-        }
-        apr_table_add(r->headers_out, buffer, value);
-    }
-    if (len < 0) {
-        /* Reset headers, but not to NULL because things below the chain expect
-         * this to be non NULL e.g. the ap_content_length_filter.
+        /* A malformed status line or headers, or the headers not read in
+         * full (the parsing logged why)
          */
-        r->headers_out = apr_table_make(r->pool, 1);
         return HTTP_BAD_GATEWAY;
     }
-    
+    backend->worker->s->read += head->length;
+
+    r->status = head->u.rsp.status;
+    /* 2616 requires the space in Status-Line, even without a reason */
+    r->status_line = apr_psprintf(r->pool, "%03d %s", r->status,
+                                  head->u.rsp.reason);
+    r->headers_out = apr_table_overlay(r->pool, r->headers_out,
+                                       head->headers);
+
     /* Per PEP 3333, WSGI applications must not generate hop-by-hop
     * headers. Remove any such headers received from the backend.
     */
@@ -524,6 +482,65 @@ static int uwsgi_response(request_rec *r, proxy_conn_rec * backend,
     return OK;
 }
 
+/* Once the wait for the response failed: let reading it fail at once, as it
+ * would have failed after waiting in the blocking path, with APR_TIMEUP (a
+ * timeout of 1us, since 0 would give EAGAIN), hence the same log. The status
+ * is the same for a wait that timed out only (uwsgi_response()).
+ * Data arriving between the end of the wait and here is read as usual
+ * though, the response then succeeds. Returns whether it changed the
+ * timeout, the one to restore then in *timeout.
+ */
+static int uwsgi_fail_at_once(request_rec *r,
+                              proxy_conn_rec *backend,
+                              apr_interval_time_t *timeout)
+{
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = r->pool;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = backend->sock;
+    pfd.reqevents = APR_POLLIN;
+    if (apr_poll(&pfd, 1, &nready, 0) == APR_SUCCESS) {
+        return 0;
+    }
+    apr_socket_timeout_get(backend->sock, timeout);
+    apr_socket_timeout_set(backend->sock, 1);
+    return 1;
+}
+
+/*
+ * The continuation of uwsgi_handler() once the backend's response is
+ * readable (or the wait for it failed): read and pass the response, release
+ * the backend and finish the request.
+ */
+static void uwsgi_response_continuation(request_rec *r, apr_status_t rv, void *baton)
+{
+    proxy_conn_rec *backend = baton;
+    proxy_server_conf *conf = ap_get_module_config(r->server->module_config,
+                                                   &proxy_module);
+    apr_interval_time_t timeout = 0;
+    int status, restore = 0;
+
+    if (rv != APR_SUCCESS) {
+        /* The response's read logs a timeout only, so say why here */
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "%s waiting for the response of %s:%u",
+                      APR_STATUS_IS_TIMEUP(rv) ? "timeout" : "interrupted",
+                      backend->hostname, backend->port);
+        restore = uwsgi_fail_at_once(r, backend, &timeout);
+    }
+    status = uwsgi_response(r, backend, conf, rv);
+    if (restore) {
+        apr_socket_timeout_set(backend->sock, timeout);
+    }
+
+    backend->close = 1; /* always close the socket */
+    ap_proxy_release_connection(UWSGI_SCHEME, backend, r->server);
+    ap_proxy_handler_done(r, status);
+}
+
 static int uwsgi_handler(request_rec *r, proxy_worker * worker,
                          proxy_server_conf * conf, char *url,
                          const char *proxyname, apr_port_t proxyport)
@@ -534,11 +551,24 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     char server_portstr[32];
     char *u_path_info;
     apr_uri_t *uri;
+    apr_interval_time_t timeout;
 
     if (ap_cstr_casecmpn(url, UWSGI_SCHEME "://", sizeof(UWSGI_SCHEME) + 2)) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "declining URL %s", url);
         return DECLINED;
     }
+
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released (so url
+     * is unescaped below, after).
+     */
+    status = ap_proxy_acquire_connection_async(UWSGI_SCHEME, &backend, r,
+                                               uwsgi_handler, worker, conf,
+                                               url, proxyname, proxyport);
+    if (status != OK) {
+        goto cleanup;
+    }
+    backend->is_ssl = 0;
 
     uri = apr_palloc(r->pool, sizeof(*uri));
 
@@ -550,7 +580,8 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     else if (ap_unescape_url(u_path_info) != OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10100)
                       "unable to decode uwsgi uri: %s", url);
-        return HTTP_INTERNAL_SERVER_ERROR;
+        status = HTTP_INTERNAL_SERVER_ERROR;
+        goto cleanup;
     }
     else {
         /* Remove duplicate slashes at the beginning of PATH_INFO */
@@ -559,14 +590,6 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
         }
     }
     apr_table_add(r->subprocess_env, "PATH_INFO", u_path_info);
-
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(UWSGI_SCHEME, &backend, worker,
-                                         r->server);
-    if (status != OK) {
-        goto cleanup;
-    }
-    backend->is_ssl = 0;
 
     /* Step One: Determine Who To Connect To */
     status = ap_proxy_determine_connection(p, r, conf, worker, backend,
@@ -596,10 +619,19 @@ static int uwsgi_handler(request_rec *r, proxy_worker * worker,
     /* Step Four: Process the Request */
     if (((status = ap_setup_client_block(r, REQUEST_CHUNKED_ERROR)) != OK)
         || ((status = uwsgi_send_headers(r, backend)) != OK)
-        || ((status = uwsgi_send_body(r, backend)) != OK)
-        || ((status = uwsgi_response(r, backend, conf)) != OK)) {
+        || ((status = uwsgi_send_body(r, backend)) != OK)) {
         goto cleanup;
     }
+
+    /* Wait for the response without holding the thread if possible, then
+     * uwsgi_response_continuation() continues.
+     */
+    apr_socket_timeout_get(backend->sock, &timeout);
+    if (ap_proxy_wait(r, backend, AP_PROXY_BACKEND_IN, 0, timeout,
+                      uwsgi_response_continuation, backend) == SUSPENDED) {
+        return SUSPENDED;
+    }
+    status = uwsgi_response(r, backend, conf, APR_SUCCESS);
 
   cleanup:
     if (backend) {

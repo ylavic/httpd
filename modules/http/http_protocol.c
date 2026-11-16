@@ -1848,3 +1848,34 @@ AP_DECLARE(int) ap_h1_tokenize_request_line(
     }
     return 1;
 }
+
+AP_DECLARE(void) ap_h1_head_opts_init_(ap_h1_head_opts_t *opts,
+                                       request_rec *r,
+                                       ap_h1_head_kind_e kind,
+                                       unsigned int flags,
+                                       int module_index)
+{
+    memset(opts, 0, sizeof(*opts));
+    opts->kind = kind;
+    opts->module_index = module_index;
+    if (flags & AP_H1_HEAD_OPT_BACKEND) {
+        opts->flags = AP_H1_HEAD_OPT_BACKEND | AP_H1_HEAD_OPT_STRICT;
+        opts->limit_start_line = DEFAULT_LIMIT_REQUEST_LINE;
+        opts->limit_field = DEFAULT_LIMIT_REQUEST_FIELDSIZE;
+        opts->limit_fields = DEFAULT_LIMIT_REQUEST_FIELDS;
+        opts->max_blank_lines = 1; /* a stray CRLF */
+    }
+    else {
+        core_server_config *conf =
+            ap_get_core_module_config(r->server->module_config);
+
+        opts->flags = AP_H1_HEAD_OPT_MERGE;
+        if (conf->http_conformance != AP_HTTP_CONFORMANCE_UNSAFE) {
+            opts->flags |= AP_H1_HEAD_OPT_STRICT;
+        }
+        opts->limit_start_line = r->server->limit_req_line;
+        opts->limit_field = r->server->limit_req_fieldsize;
+        opts->limit_fields = r->server->limit_req_fields;
+        opts->max_blank_lines = DEFAULT_LIMIT_BLANK_LINES;
+    }
+}

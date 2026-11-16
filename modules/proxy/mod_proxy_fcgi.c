@@ -298,24 +298,22 @@ static apr_status_t get_data(proxy_conn_rec *conn,
     return rv;
 }
 
-static apr_status_t get_data_full(proxy_conn_rec *conn,
-                                  char *buffer,
-                                  apr_size_t buflen)
+/* get_data() without blocking: APR_EAGAIN if the backend has nothing to read
+ * (the socket's timeout is zero for the read).
+ */
+static apr_status_t get_data_nonblock(proxy_conn_rec *conn,
+                                      char *buffer,
+                                      apr_size_t *buflen)
 {
-    apr_size_t readlen;
-    apr_size_t cumulative_len = 0;
+    apr_interval_time_t timeout;
     apr_status_t rv;
 
-    do {
-        readlen = buflen - cumulative_len;
-        rv = get_data(conn, buffer + cumulative_len, &readlen);
-        if (rv != APR_SUCCESS) {
-            return rv;
-        }
-        cumulative_len += readlen;
-    } while (cumulative_len < buflen);
+    apr_socket_timeout_get(conn->sock, &timeout);
+    apr_socket_timeout_set(conn->sock, 0);
+    rv = get_data(conn, buffer, buflen);
+    apr_socket_timeout_set(conn->sock, timeout);
 
-    return APR_SUCCESS;
+    return rv;
 }
 
 static apr_status_t send_begin_request(proxy_conn_rec *conn,
@@ -593,52 +591,163 @@ static int handle_headers(request_rec *r, int *state,
     return 0;
 }
 
-static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
-                             request_rec *r, apr_pool_t *setaside_pool,
-                             apr_uint16_t request_id, const char **err,
-                             int *bad_request, int *has_responded,
-                             apr_bucket_brigade *input_brigade)
-{
+#define FCGI_SCHEME "FCGI"
+
+/* The state of a request's dispatch(), in r->pool, kept while waiting for the
+ * backend or the client asynchronously (ap_proxy_wait()).
+ */
+typedef struct {
+    request_rec *r;
+    proxy_conn_rec *conn;
+    proxy_dir_conf *conf;
+    const char *server_portstr;
+    apr_pool_t *setaside_pool;
+    apr_bucket_brigade *input_brigade;
     apr_bucket_brigade *ib, *ob;
-    int seen_end_of_headers = 0, done = 0, ignore_body = 0;
+    apr_pollfd_t pfd;
+    apr_pollfd_t *flushpoll;
+    char *iobuf;
+    apr_size_t iobuf_size;
+    apr_uint16_t request_id;
+    int header_state;
+    int script_error_status;
+    const char *err;
+    /* The record being read (nonblocking, in steps) */
+    unsigned char rec_header[AP_FCGI_HEADER_LEN];
+    apr_size_t rec_header_len; /* read of the header so far */
+    apr_uint16_t rec_clen;     /* content left to read */
+    unsigned char rec_plen;    /* padding left to read */
+    unsigned char rec_type;
+    unsigned int seen_end_of_headers :1,
+                 ignore_body         :1,
+                 bad_request         :1,
+                 has_responded       :1,
+                 flushing            :1, /* the client's output to drain */
+                 mayflush            :1; /* response data passed */
+} fcgi_req_t;
+
+static fcgi_req_t *fcgi_req_make(request_rec *r, proxy_conn_rec *conn,
+                                 proxy_dir_conf *conf,
+                                 const char *server_portstr,
+                                 apr_pool_t *setaside_pool,
+                                 apr_uint16_t request_id,
+                                 apr_bucket_brigade *input_brigade)
+{
+    conn_rec *c = r->connection;
+    fcgi_req_t *req;
+
+    req = apr_pcalloc(r->pool, sizeof(*req));
+    req->r = r;
+    req->conn = conn;
+    req->conf = conf;
+    req->server_portstr = apr_pstrdup(r->pool, server_portstr);
+    req->setaside_pool = setaside_pool;
+    req->request_id = request_id;
+    req->input_brigade = input_brigade;
+    req->header_state = HDR_STATE_READING_HEADERS;
+    req->script_error_status = HTTP_OK;
+
+    /* Not on the stack, the response may be read from continuations */
+    req->iobuf_size = AP_IOBUFSIZE;
+    if (conn->worker->s->io_buffer_size_set) {
+        req->iobuf_size = conn->worker->s->io_buffer_size;
+    }
+    req->iobuf = apr_palloc(r->pool, req->iobuf_size);
+
+    req->pfd.desc_type = APR_POLL_SOCKET;
+    req->pfd.desc.s = conn->sock;
+    req->pfd.p = r->pool;
+    req->pfd.reqevents = APR_POLLIN | APR_POLLOUT;
+
+    if (conn->worker->s->flush_packets == flush_auto) {
+        req->flushpoll = apr_pcalloc(r->pool, sizeof(apr_pollfd_t));
+        req->flushpoll->reqevents = APR_POLLIN;
+        req->flushpoll->desc_type = APR_POLL_SOCKET;
+        req->flushpoll->desc.s = conn->sock;
+    }
+
+    req->ib = apr_brigade_create(r->pool, c->bucket_alloc);
+    req->ob = apr_brigade_create(r->pool, c->bucket_alloc);
+
+    return req;
+}
+
+/* The end of dispatch(), with the status it finished with: the status of the
+ * request.
+ */
+static int dispatch_end(fcgi_req_t *req, apr_status_t rv)
+{
+    request_rec *r = req->r;
+    proxy_conn_rec *conn = req->conn;
+
+    apr_brigade_destroy(req->ib);
+    apr_brigade_destroy(req->ob);
+
+    if (req->script_error_status != HTTP_OK) {
+        ap_die(req->script_error_status, r); /* send ErrorDocument */
+        req->has_responded = 1;
+    }
+
+    if (rv != APR_SUCCESS) {
+        /* If the client aborted the connection during retrieval or (partially)
+         * sending the response, don't return a HTTP_SERVICE_UNAVAILABLE, since
+         * this is not a backend problem. */
+        if (r->connection->aborted) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
+                          "The client aborted the connection.");
+            conn->close = 1;
+            return OK;
+        }
+
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01075)
+                      "Error dispatching request to %s: %s%s%s",
+                      req->server_portstr,
+                      req->err ? "(" : "",
+                      req->err ? req->err : "",
+                      req->err ? ")" : "");
+        conn->close = 1;
+        if (req->has_responded) {
+            return AP_FILTER_ERROR;
+        }
+        if (req->bad_request) {
+            return ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
+        }
+        if (APR_STATUS_IS_TIMEUP(rv)) {
+            return HTTP_GATEWAY_TIME_OUT;
+        }
+        return HTTP_SERVICE_UNAVAILABLE;
+    }
+
+    return OK;
+}
+
+static void dispatch_continuation(request_rec *r, apr_status_t status, void *baton);
+
+/* Send the request body and handle the backend's records until the end of the
+ * response. Once the body is sent, the waits for the backend happen
+ * asynchronously when possible: dispatch() returns SUSPENDED then, and
+ * dispatch_continuation() continues. Otherwise it returns the status of the
+ * request.
+ */
+static int dispatch(fcgi_req_t *req)
+{
+    request_rec *r = req->r;
+    proxy_conn_rec *conn = req->conn;
+    proxy_dir_conf *conf = req->conf;
+    apr_pool_t *setaside_pool = req->setaside_pool;
+    apr_uint16_t request_id = req->request_id;
+    apr_bucket_brigade *input_brigade = req->input_brigade;
+    apr_bucket_brigade *ib = req->ib, *ob = req->ob;
+    apr_pollfd_t *flushpoll = req->flushpoll;
+    char *iobuf = req->iobuf;
+    apr_size_t iobuf_size = req->iobuf_size;
+    int done = 0;
     apr_status_t rv = APR_SUCCESS;
-    int script_error_status = HTTP_OK;
     conn_rec *c = r->connection;
     struct iovec vec[2];
     ap_fcgi_header header;
     unsigned char farray[AP_FCGI_HEADER_LEN];
-    apr_pollfd_t pfd;
-    apr_pollfd_t *flushpoll = NULL;
     apr_int32_t flushpoll_fd;
-    int header_state = HDR_STATE_READING_HEADERS;
-    char stack_iobuf[AP_IOBUFSIZE];
-    apr_size_t iobuf_size = AP_IOBUFSIZE;
-    char *iobuf = stack_iobuf;
-
-    *err = NULL;
-    if (conn->worker->s->io_buffer_size_set) {
-        iobuf_size = conn->worker->s->io_buffer_size;
-        /* Allocate a buffer if the configured size is larger than the
-         * stack buffer, otherwise use the stack buffer. */
-        if (iobuf_size > AP_IOBUFSIZE) {
-            iobuf = apr_palloc(r->pool, iobuf_size);
-        }
-    }
-
-    pfd.desc_type = APR_POLL_SOCKET;
-    pfd.desc.s = conn->sock;
-    pfd.p = r->pool;
-    pfd.reqevents = APR_POLLIN | APR_POLLOUT;
-
-    if (conn->worker->s->flush_packets == flush_auto) {
-        flushpoll = apr_pcalloc(r->pool, sizeof(apr_pollfd_t));
-        flushpoll->reqevents = APR_POLLIN;
-        flushpoll->desc_type = APR_POLL_SOCKET;
-        flushpoll->desc.s = conn->sock;
-    }
-
-    ib = apr_brigade_create(r->pool, c->bucket_alloc);
-    ob = apr_brigade_create(r->pool, c->bucket_alloc);
 
     while (! done) {
         apr_interval_time_t timeout;
@@ -649,16 +758,54 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
          * cause timeout errors. */
         apr_socket_timeout_get(conn->sock, &timeout);
 
-        rv = apr_poll(&pfd, 1, &n, timeout);
-        if (rv != APR_SUCCESS) {
-            if (APR_STATUS_IS_EINTR(rv)) {
-                continue;
+        /* A flush of the response (flushpackets) left output pending: wait
+         * for the client to take it before reading on, without holding the
+         * thread if possible, else block (FLUSH).
+         */
+        if (req->flushing) {
+            int rc = ap_check_output_pending(c);
+            if (rc == AGAIN) {
+                rc = ap_proxy_wait(r, conn, AP_PROXY_CLIENT_OUT, 0,
+                                   r->server->timeout,
+                                   dispatch_continuation, req);
+                if (rc == SUSPENDED) {
+                    return SUSPENDED;
+                }
+                if (rc == OK) {
+                    continue; /* writable within ProxyAsyncDelay */
+                }
+                APR_BRIGADE_INSERT_TAIL(ob, apr_bucket_flush_create(c->bucket_alloc));
+                rc = (ap_pass_brigade(r->output_filters, ob) == APR_SUCCESS
+                      && !c->aborted) ? OK : DONE;
+                apr_brigade_cleanup(ob);
             }
-            *err = "polling";
-            break;
+            req->flushing = 0;
+            if (rc != OK) {
+                req->err = "flushing to the client";
+                rv = APR_ECONNABORTED;
+                break;
+            }
         }
 
-        if (pfd.rtnevents & APR_POLLOUT) {
+        /* Once the request is sent, read the response (or more of it)
+         * without polling first: the reads don't block, the backend is
+         * waited for when it has nothing to read (below).
+         */
+        if (req->pfd.reqevents == APR_POLLIN) {
+            req->pfd.rtnevents = APR_POLLIN;
+        }
+        else {
+            rv = apr_poll(&req->pfd, 1, &n, timeout);
+            if (rv != APR_SUCCESS) {
+                if (APR_STATUS_IS_EINTR(rv)) {
+                    continue;
+                }
+                req->err = "polling";
+                break;
+            }
+        }
+
+        if (req->pfd.rtnevents & APR_POLLOUT) {
             apr_size_t to_send, writebuflen;
             int last_stdin = 0;
             char *iobuf_cursor;
@@ -684,8 +831,8 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
                 }
             }
             if (rv != APR_SUCCESS) {
-                *err = "reading input brigade";
-                *bad_request = 1;
+                req->err = "reading input brigade";
+                req->bad_request = 1;
                 break;
             }
 
@@ -700,7 +847,7 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
             apr_brigade_cleanup(ib);
 
             if (rv != APR_SUCCESS) {
-                *err = "flattening brigade";
+                req->err = "flattening brigade";
                 break;
             }
 
@@ -728,7 +875,7 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
 
                 rv = send_data(conn, vec, nvec, &len);
                 if (rv != APR_SUCCESS) {
-                    *err = "sending stdin";
+                    req->err = "sending stdin";
                     break;
                 }
 
@@ -740,7 +887,7 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
             }
 
             if (last_stdin) {
-                pfd.reqevents = APR_POLLIN; /* Done with input data */
+                req->pfd.reqevents = APR_POLLIN; /* Done with input data */
 
                 /* signal EOF (empty FCGI_STDIN) */
                 ap_fcgi_fill_in_header(&header, AP_FCGI_STDIN, request_id,
@@ -752,83 +899,115 @@ static apr_status_t dispatch(proxy_conn_rec *conn, proxy_dir_conf *conf,
 
                 rv = send_data(conn, vec, 1, &len);
                 if (rv != APR_SUCCESS) {
-                    *err = "sending empty stdin";
+                    req->err = "sending empty stdin";
                     break;
                 }
             }
         }
 
-        if (pfd.rtnevents & APR_POLLIN) {
-            apr_size_t readbuflen;
-            apr_uint16_t clen, rid;
+        if (req->pfd.rtnevents & APR_POLLIN) {
+            apr_size_t readbuflen = 0;
+            apr_uint16_t rid;
             apr_bucket *b;
-            unsigned char plen;
-            unsigned char type, version;
-            int mayflush = 0;
+            unsigned char version;
+            int handle = 0;
 
-            /* First, we grab the header... */
-            rv = get_data_full(conn, (char *) farray, AP_FCGI_HEADER_LEN);
-            if (rv != APR_SUCCESS) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01067)
-                              "Failed to read FastCGI header");
-                break;
-            }
-
-            ap_log_rdata(APLOG_MARK, APLOG_TRACE8, r, "FastCGI header",
-                         farray, AP_FCGI_HEADER_LEN, 0);
-
-            ap_fcgi_header_fields_from_array(&version, &type, &rid,
-                                             &clen, &plen, farray);
-
-            if (version != AP_FCGI_VERSION_1) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01068)
-                              "Got bogus version %d", (int)version);
-                rv = APR_EINVAL;
-                break;
-            }
-
-            if (rid != request_id) {
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01069)
-                              "Got bogus rid %d, expected %d",
-                              rid, request_id);
-                rv = APR_EINVAL;
-                break;
-            }
-
-recv_again:
-            if (clen > iobuf_size) {
-                readbuflen = iobuf_size;
-            } else {
-                readbuflen = clen;
-            }
-
-            /* Now get the actual data.  Yes it sucks to do this in a second
-             * recv call, this will eventually change when we move to real
-             * nonblocking recv calls. */
-            if (readbuflen != 0) {
-                rv = get_data(conn, iobuf, &readbuflen);
+            /* A record is read in steps, its state kept in req between
+             * them: the header, the content (by iobuf_size at most), then
+             * the padding, without blocking. A read finding nothing
+             * (EAGAIN) waits for the backend (below), then goes on.
+             */
+            if (req->rec_header_len < AP_FCGI_HEADER_LEN) {
+                len = AP_FCGI_HEADER_LEN - req->rec_header_len;
+                rv = get_data_nonblock(conn,
+                                       (char *)req->rec_header
+                                       + req->rec_header_len,
+                                       &len);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
                 if (rv != APR_SUCCESS) {
-                    *err = "reading response body";
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01067)
+                                  "Failed to read FastCGI header");
                     break;
                 }
+                req->rec_header_len += len;
+                if (req->rec_header_len < AP_FCGI_HEADER_LEN) {
+                    continue;
+                }
+
+                ap_log_rdata(APLOG_MARK, APLOG_TRACE8, r, "FastCGI header",
+                             req->rec_header, AP_FCGI_HEADER_LEN, 0);
+
+                ap_fcgi_header_fields_from_array(&version, &req->rec_type,
+                                                 &rid, &req->rec_clen,
+                                                 &req->rec_plen,
+                                                 req->rec_header);
+
+                if (version != AP_FCGI_VERSION_1) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01068)
+                                  "Got bogus version %d", (int)version);
+                    rv = APR_EINVAL;
+                    break;
+                }
+
+                if (rid != request_id) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01069)
+                                  "Got bogus rid %d, expected %d",
+                                  rid, request_id);
+                    rv = APR_EINVAL;
+                    break;
+                }
+
+                if (req->rec_type != AP_FCGI_STDOUT
+                    && req->rec_type != AP_FCGI_STDERR
+                    && req->rec_type != AP_FCGI_END_REQUEST) {
+                    ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01072)
+                                  "Got bogus record %d", (int)req->rec_type);
+                }
+
+                /* A record without content is handled once (the end of
+                 * the response for STDOUT).
+                 */
+                handle = (req->rec_clen == 0);
             }
 
-            switch (type) {
+            if (req->rec_clen) {
+                readbuflen = req->rec_clen;
+                if (readbuflen > iobuf_size) {
+                    readbuflen = iobuf_size;
+                }
+                rv = get_data_nonblock(conn, iobuf, &readbuflen);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
+                if (rv != APR_SUCCESS) {
+                    req->err = "reading response body";
+                    break;
+                }
+                req->rec_clen -= (apr_uint16_t)readbuflen;
+                handle = 1;
+            }
+
+            if (!handle) {
+                goto read_padding; /* the content was handled already */
+            }
+            switch (req->rec_type) {
             case AP_FCGI_STDOUT:
-                if (clen != 0) {
+                if (readbuflen != 0) {
                     b = apr_bucket_transient_create(iobuf,
                                                     readbuflen,
                                                     c->bucket_alloc);
 
                     APR_BRIGADE_INSERT_TAIL(ob, b);
 
-                    if (! seen_end_of_headers) {
-                        int st = handle_headers(r, &header_state,
+                    if (! req->seen_end_of_headers) {
+                        int st = handle_headers(r, &req->header_state,
                                                 iobuf, readbuflen);
 
                         if (st == 1) {
                             int status;
-                            seen_end_of_headers = 1;
+                            req->seen_end_of_headers = 1;
 
                             status = ap_scan_script_header_err_brigade_ex(r, ob,
                                 NULL, APLOG_MODULE_INDEX);
@@ -848,11 +1027,11 @@ recv_again:
                                 tmp_b = apr_bucket_eos_create(c->bucket_alloc);
                                 APR_BRIGADE_INSERT_TAIL(ob, tmp_b);
 
-                                *has_responded = 1;
+                                req->has_responded = 1;
                                 r->status = status;
                                 rv = ap_pass_brigade(r->output_filters, ob);
                                 if (rv != APR_SUCCESS) {
-                                    *err = "passing headers brigade to output filters";
+                                    req->err = "passing headers brigade to output filters";
                                     break;
                                 }
                                 else if (status == HTTP_NOT_MODIFIED
@@ -867,7 +1046,7 @@ recv_again:
                                      * ignored (and the EOS bucket has already
                                      * been sent) we want to avoid subsequent
                                      * bogus reads. */
-                                    ignore_body = 1;
+                                    req->ignore_body = 1;
                                 }
                                 else {
                                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01070)
@@ -882,7 +1061,7 @@ recv_again:
                                  * set script_error_status to discard
                                  * everything after the headers
                                  */
-                                script_error_status = r->status;
+                                req->script_error_status = r->status;
                                 /*
                                  * prevent ap_die() from treating this as a
                                  * recursive error, initially:
@@ -890,18 +1069,18 @@ recv_again:
                                 r->status = HTTP_OK;
                             }
 
-                            if (script_error_status == HTTP_OK
-                                && !APR_BRIGADE_EMPTY(ob) && !ignore_body) {
+                            if (req->script_error_status == HTTP_OK
+                                && !APR_BRIGADE_EMPTY(ob) && !req->ignore_body) {
                                 /* Send the part of the body that we read while
                                  * reading the headers.
                                  */
-                                *has_responded = 1;
+                                req->has_responded = 1;
                                 rv = ap_pass_brigade(r->output_filters, ob);
                                 if (rv != APR_SUCCESS) {
-                                    *err = "passing brigade to output filters";
+                                    req->err = "passing brigade to output filters";
                                     break;
                                 }
-                                mayflush = 1;
+                                req->mayflush = 1;
                             }
                             apr_brigade_cleanup(ob);
 
@@ -921,35 +1100,28 @@ recv_again:
                          * but that could be a huge amount of data; so we pass
                          * along smaller chunks
                          */
-                        if (script_error_status == HTTP_OK && !ignore_body) {
-                            *has_responded = 1;
+                        if (req->script_error_status == HTTP_OK && !req->ignore_body) {
+                            req->has_responded = 1;
                             rv = ap_pass_brigade(r->output_filters, ob);
                             if (rv != APR_SUCCESS) {
-                                *err = "passing brigade to output filters";
+                                req->err = "passing brigade to output filters";
                                 break;
                             }
-                            mayflush = 1;
+                            req->mayflush = 1;
                         }
                         apr_brigade_cleanup(ob);
-                    }
-
-                    /* If we didn't read all the data, go back and get the
-                     * rest of it. */
-                    if (clen > readbuflen) {
-                        clen -= readbuflen;
-                        goto recv_again;
                     }
                 } else {
                     /* XXX what if we haven't seen end of the headers yet? */
 
-                    if (script_error_status == HTTP_OK) {
+                    if (req->script_error_status == HTTP_OK) {
                         b = apr_bucket_eos_create(c->bucket_alloc);
                         APR_BRIGADE_INSERT_TAIL(ob, b);
 
-                        *has_responded = 1;
+                        req->has_responded = 1;
                         rv = ap_pass_brigade(r->output_filters, ob);
                         if (rv != APR_SUCCESS) {
-                            *err = "passing brigade to output filters";
+                            req->err = "passing brigade to output filters";
                             break;
                         }
                     }
@@ -960,65 +1132,132 @@ recv_again:
 
             case AP_FCGI_STDERR:
                 /* TODO: Should probably clean up this logging a bit... */
-                if (clen) {
+                if (readbuflen) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01071)
                                   "Got error '%.*s'", (int)readbuflen, iobuf);
                 }
-
-                if (clen > readbuflen) {
-                    clen -= readbuflen;
-                    goto recv_again;
-                }
                 break;
 
-            case AP_FCGI_END_REQUEST:
-                done = 1;
-                break;
-
-            default:
-                ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01072)
-                              "Got bogus record %d", type);
+            default: /* END_REQUEST, a bogus record */
                 break;
             }
             /* Leave on above switch's inner error. */
             if (rv != APR_SUCCESS) {
                 break;
             }
+            if (req->rec_clen) {
+                continue; /* more content to read */
+            }
 
-            if (plen) {
-                rv = get_data_full(conn, iobuf, plen);
+read_padding:
+            if (req->rec_plen) {
+                len = req->rec_plen;
+                rv = get_data_nonblock(conn, iobuf, &len);
+                if (APR_STATUS_IS_EAGAIN(rv)) {
+                    goto read_again;
+                }
                 if (rv != APR_SUCCESS) {
                     ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02537)
                                   "Error occurred reading padding");
                     break;
                 }
+                req->rec_plen -= (unsigned char)len;
+                if (req->rec_plen) {
+                    continue;
+                }
             }
 
-            if (mayflush && ((conn->worker->s->flush_packets == flush_on) ||
-                             ((conn->worker->s->flush_packets == flush_auto) && 
-                              (apr_poll(flushpoll, 1, &flushpoll_fd,
-                               conn->worker->s->flush_wait) == APR_TIMEUP)))) {
-                apr_bucket* flush_b = apr_bucket_flush_create(r->connection->bucket_alloc);
+            /* The record is read, the next one follows */
+            req->rec_header_len = 0;
+            if (req->rec_type == AP_FCGI_END_REQUEST) {
+                done = 1;
+            }
+
+            if (req->mayflush
+                && (conn->worker->s->flush_packets == flush_on
+                    || (conn->worker->s->flush_packets == flush_auto
+                        && apr_poll(flushpoll, 1, &flushpoll_fd,
+                                    conn->worker->s->flush_wait)
+                           == APR_TIMEUP))) {
+                /* Don't block on the client (WC): the output left pending
+                 * is waited for before reading on (above).
+                 */
+                apr_bucket* flush_b = ap_bucket_wc_create(r->connection->bucket_alloc);
                 APR_BRIGADE_INSERT_TAIL(ob, flush_b);
                 rv = ap_pass_brigade(r->output_filters, ob);
                 if (rv != APR_SUCCESS) {
-                    *err = "passing headers brigade to output filters";
+                    req->err = "passing headers brigade to output filters";
                     break;
                 }
-                mayflush = 0;
+                req->flushing = 1;
+            }
+            req->mayflush = 0;
+        }
+        continue;
+
+read_again:
+        /* The backend has nothing to read for now. While the request body
+         * is sent, the next poll waits for either side. Once it's sent, wait
+         * for the backend without holding the thread if possible (drained,
+         * the read failed with EAGAIN), else poll it.
+         */
+        rv = APR_SUCCESS;
+        if (req->pfd.reqevents == APR_POLLIN) {
+            int rc = ap_proxy_wait(r, conn, AP_PROXY_BACKEND_IN,
+                                   AP_PROXY_WAIT_DRAINED, timeout,
+                                   dispatch_continuation, req);
+            if (rc == SUSPENDED) {
+                return SUSPENDED;
+            }
+            if (rc != OK) {
+                rv = apr_poll(&req->pfd, 1, &n, timeout);
+                if (rv != APR_SUCCESS) {
+                    if (APR_STATUS_IS_EINTR(rv)) {
+                        rv = APR_SUCCESS;
+                        continue;
+                    }
+                    req->err = "reading response body";
+                    break;
+                }
             }
         }
     }
 
-    apr_brigade_destroy(ib);
-    apr_brigade_destroy(ob);
+    return dispatch_end(req, rv);
+}
 
-    if (script_error_status != HTTP_OK) {
-        ap_die(script_error_status, r); /* send ErrorDocument */
-        *has_responded = 1;
+/* The continuation of dispatch() once the backend is readable or the client
+ * writable (or the wait failed): continue dispatching, then unless suspended
+ * again release the backend and finish the request.
+ */
+static void dispatch_continuation(request_rec *r, apr_status_t status, void *baton)
+{
+    fcgi_req_t *req = baton;
+    int rc;
+
+    if (status == APR_SUCCESS) {
+        rc = dispatch(req);
+        if (rc == SUSPENDED) {
+            return;
+        }
+    }
+    else if (req->flushing) {
+        /* The client didn't take the response in time: as a blocking write
+         * failing, the connection is aborted.
+         */
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, APLOGNO()
+                      "FCGI: writing the response to the client failed "
+                      "(async)");
+        r->connection->aborted = 1;
+        rc = dispatch_end(req, APR_ECONNABORTED);
+    }
+    else {
+        req->err = "reading response body";
+        rc = dispatch_end(req, status);
     }
 
-    return rv;
+    ap_proxy_release_connection(FCGI_SCHEME, req->conn, r->server);
+    ap_proxy_handler_done(r, rc);
 }
 
 /*
@@ -1040,9 +1279,6 @@ static int fcgi_do_request(apr_pool_t *p, request_rec *r,
     apr_uint16_t request_id = 1;
     apr_status_t rv;
     apr_pool_t *temp_pool;
-    const char *err;
-    int bad_request = 0,
-        has_responded = 0;
 
     /* Step 1: Send AP_FCGI_BEGIN_REQUEST */
     rv = send_begin_request(conn, request_id);
@@ -1066,43 +1302,9 @@ static int fcgi_do_request(apr_pool_t *p, request_rec *r,
     }
 
     /* Step 3: Read records from the back end server and handle them. */
-    rv = dispatch(conn, conf, r, temp_pool, request_id,
-                  &err, &bad_request, &has_responded,
-                  input_brigade);
-    if (rv != APR_SUCCESS) {
-        /* If the client aborted the connection during retrieval or (partially)
-         * sending the response, don't return a HTTP_SERVICE_UNAVAILABLE, since
-         * this is not a backend problem. */
-        if (r->connection->aborted) {
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE1, rv, r,
-                          "The client aborted the connection.");
-            conn->close = 1;
-            return OK;
-        }
-
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(01075)
-                      "Error dispatching request to %s: %s%s%s",
-                      server_portstr,
-                      err ? "(" : "",
-                      err ? err : "",
-                      err ? ")" : "");
-        conn->close = 1;
-        if (has_responded) {
-            return AP_FILTER_ERROR;
-        }
-        if (bad_request) {
-            return ap_map_http_request_error(rv, HTTP_BAD_REQUEST);
-        }
-        if (APR_STATUS_IS_TIMEUP(rv)) {
-            return HTTP_GATEWAY_TIME_OUT;
-        }
-        return HTTP_SERVICE_UNAVAILABLE;
-    }
-
-    return OK;
+    return dispatch(fcgi_req_make(r, conn, conf, server_portstr, temp_pool,
+                                  request_id, input_brigade));
 }
-
-#define FCGI_SCHEME "FCGI"
 
 #define MAX_MEM_SPOOL 16384
 
@@ -1139,9 +1341,13 @@ static int proxy_fcgi_handler(request_rec *r, proxy_worker *worker,
 
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01078) "serving URL %s", url);
 
-    /* Create space for state information */
-    status = ap_proxy_acquire_connection(FCGI_SCHEME, &backend, worker,
-                                         r->server);
+    /* Create space for state information. On SUSPENDED we wait for a
+     * connection, and the handler runs again once one is released.
+     */
+    status = ap_proxy_acquire_connection_async(FCGI_SCHEME, &backend, r,
+                                               proxy_fcgi_handler, worker,
+                                               conf, url, proxyname,
+                                               proxyport);
     if (status != OK) {
         if (backend) {
             backend->close = 1;
@@ -1282,6 +1488,10 @@ static int proxy_fcgi_handler(request_rec *r, proxy_worker *worker,
     /* Step Three: Process the Request */
     status = fcgi_do_request(p, r, backend, origin, dconf, uri, url,
                              server_portstr, input_brigade);
+    if (status == SUSPENDED) {
+        /* dispatch_continuation() continues, and releases the backend */
+        return SUSPENDED;
+    }
 
 cleanup:
     ap_proxy_release_connection(FCGI_SCHEME, backend, r->server);

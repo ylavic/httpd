@@ -430,58 +430,72 @@ AP_DECLARE_HOOK(int, drop_privileges, (apr_pool_t * pchild, server_rec * s))
  */
 AP_DECLARE_HOOK(int, mpm_query, (int query_code, int *result, apr_status_t *rv))
 
-/**
- * register the specified callback
- * @ingroup hooks
- */
-AP_DECLARE_HOOK(apr_status_t, mpm_register_timed_callback,
-                (apr_time_t t, ap_mpm_callback_fn_t *cbfn, void *baton))
-
-/**
- * register the specified callback
- * @ingroup hooks
- */
-AP_DECLARE_HOOK(apr_status_t, mpm_register_poll_callback,
-                (apr_pool_t *p, const apr_array_header_t *pds,
-                 ap_mpm_callback_fn_t *cbfn, void *baton))
-
-/* register the specified callback, with timeout 
- * @ingroup hooks
- *
- */
-AP_DECLARE_HOOK(apr_status_t, mpm_register_poll_callback_timeout,
-                (apr_pool_t *p, const apr_array_header_t *pds,
-                ap_mpm_callback_fn_t *cbfn, ap_mpm_callback_fn_t *tofn,
-                void *baton, apr_time_t timeout))
-
 /** Resume the suspended connection 
  * @ingroup hooks
  */
 AP_DECLARE_HOOK(apr_status_t, mpm_resume_suspended, (conn_rec*))
+
+/** Suspend a request until some pfds are ready (see ap_mpm_register_wait())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_register_wait,
+                (conn_rec *c, apr_pool_t *p, const apr_array_header_t *pfds,
+                 apr_interval_time_t timeout, ap_mpm_notifier_t *notifier,
+                 const unsigned int *pfds_flags, ap_mpm_continuation_fn_t *fn,
+                 void *baton))
+
+/** Declare the timeouts of the waits (see ap_mpm_register_timeouts())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_register_timeouts,
+                (const apr_array_header_t *timeouts))
+
+/** Release a kept descriptor (see ap_mpm_release_pfd())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_release_pfd, (const apr_pollfd_t *pfd))
+
+/** Create a notifier for a wait (see ap_mpm_notifier_create())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_create,
+                (ap_mpm_notifier_t **notifier, conn_rec *c, apr_pool_t *p))
+
+/** Notify a wait (see ap_mpm_notify())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(int, mpm_notify, (ap_mpm_notifier_t *notifier))
+
+/** Re-arm a notifier for another wait (see ap_mpm_notifier_rearm())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_rearm,
+                (ap_mpm_notifier_t *notifier))
+
+/** Attach a notifier to a parent (see ap_mpm_notifier_attach())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_attach,
+                (ap_mpm_notifier_t *notifier, ap_mpm_notifier_t *parent))
+
+/** Whether a notifier was notified (see ap_mpm_notifier_notified()):
+ * APR_SUCCESS if so, APR_EAGAIN if not
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_notified,
+                (ap_mpm_notifier_t *notifier))
+
+/** Detach a notifier from its parent (see ap_mpm_notifier_detach())
+ * @ingroup hooks
+ */
+AP_DECLARE_HOOK(apr_status_t, mpm_notifier_detach,
+                (ap_mpm_notifier_t *notifier))
 
 /**
  * Get MPM name (e.g., "prefork" or "event")
  * @ingroup hooks
  */
 AP_DECLARE_HOOK(const char *,mpm_get_name,(void))
-
-/**
- * Hook called to determine whether we should stay within the write completion
- * phase.
- * @param c The current connection
- * @return OK if write completion should continue, DECLINED if write completion
- * should end gracefully, or a positive error if we should begin to linger.
- * @ingroup hooks
- */
-AP_DECLARE_HOOK(int, output_pending, (conn_rec *c))
-
-/**
- * Hook called to determine whether any data is pending in the input filters.
- * @param c The current connection
- * @return OK if we can read without blocking, DECLINED if a read would block.
- * @ingroup hooks
- */
-AP_DECLARE_HOOK(int, input_pending, (conn_rec *c))
 
 /**
  * Notification that connection handling is suspending (disassociating from the

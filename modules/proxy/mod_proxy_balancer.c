@@ -335,6 +335,9 @@ static proxy_worker *find_session_route(proxy_balancer *balancer,
         return NULL;
 }
 
+/* Elect the best worker for the request (the lbmethod's), NULL if none is
+ * usable.
+ */
 static proxy_worker *find_best_worker(proxy_balancer *balancer,
                                       request_rec *r)
 {
@@ -363,6 +366,17 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
     }
 #endif
 
+    return candidate;
+}
+
+/* Elect the best worker for the request, retrying for up to the balancer's
+ * timeout if none is usable, NULL if none was.
+ */
+static proxy_worker *find_best_worker_retry(proxy_balancer *balancer,
+                                            request_rec *r)
+{
+    proxy_worker *candidate = find_best_worker(balancer, r);
+
     if (candidate == NULL) {
         /* All the workers are in error state or disabled.
          * If the balancer has a timeout sleep for a while
@@ -370,19 +384,20 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
          * that some other thread will release a connection.
          * By default the timeout is not set, and the server
          * returns SERVER_BUSY.
+         * The timeout is read once, balancer->s being shared (other
+         * threads, other children and the balancer-manager): never
+         * written here.
          */
-        if (balancer->s->timeout) {
+        apr_interval_time_t timeout = balancer->s->timeout;
+
+        if (timeout) {
             /* XXX: This can perhaps be build using some
              * smarter mechanism, like tread_cond.
              * But since the statuses can came from
              * different children, use the provided algo.
              */
-            apr_interval_time_t timeout = balancer->s->timeout;
             apr_interval_time_t step, tval = 0;
-            /* Set the timeout to 0 so that we don't
-             * end in infinite loop
-             */
-            balancer->s->timeout = 0;
+
             step = timeout / 100;
             while (tval < timeout) {
                 apr_sleep(step);
@@ -391,13 +406,93 @@ static proxy_worker *find_best_worker(proxy_balancer *balancer,
                     break;
                 tval += step;
             }
-            /* restore the timeout */
-            balancer->s->timeout = timeout;
         }
     }
 
     return candidate;
+}
 
+/* A request retrying to find a usable worker until the balancer's timeout,
+ * waiting in the MPM between the attempts (balancer_wait()), in the
+ * request's request_config (not r->pool's userdata, which an internally
+ * redirected request shares).
+ */
+typedef struct {
+    proxy_balancer *balancer;
+    apr_time_t deadline;
+    ap_request_waitctx_t *timer; /* the core's wait between the attempts */
+    unsigned int retrying :1; /* waiting, the next pre_request is a retry */
+} balancer_wait_t;
+
+/* The continuation of balancer_wait(), at the end of the wait
+ * between two attempts: let mod_proxy run the pre_request hooks again, to
+ * retry.
+ */
+static void balancer_wait_continuation(request_rec *r, apr_status_t rv,
+                                       void *baton)
+{
+    balancer_wait_t *bw = baton;
+
+    if (rv != APR_SUCCESS) {
+        bw->retrying = 0;
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO()
+                      "%s: waiting for a usable worker interrupted "
+                      "(async)", bw->balancer->s->name);
+        ap_proxy_handler_done(r, HTTP_SERVICE_UNAVAILABLE);
+        return;
+    }
+    ap_proxy_handler_done(r, OK);
+}
+
+/* No usable worker was found for a balancer with a timeout: wait before
+ * retrying, as find_best_worker_retry() would sleep, but on a timer of the
+ * core's request waits (ap_request_wait()). The first attempt (!retry) sets
+ * the deadline. Returns SUSPENDED while waiting (the pre_request hook too),
+ * else the worker found by sleeping as find_best_worker_retry() if the wait
+ * is declined, or NULL once the timeout has elapsed.
+ */
+static int balancer_wait(proxy_balancer *balancer, request_rec *r, int retry,
+                         proxy_worker **runtime)
+{
+    balancer_wait_t *bw = NULL;
+    apr_interval_time_t timeout = balancer->s->timeout;
+    apr_interval_time_t step = timeout / 100;
+    apr_time_t now = apr_time_now();
+    int rc;
+
+    bw = ap_get_module_config(r->request_config, &proxy_balancer_module);
+    if (!bw) {
+        bw = apr_pcalloc(r->pool, sizeof(*bw));
+        bw->timer = ap_request_waitctx_timer(r, r->pool);
+        ap_set_module_config(r->request_config, &proxy_balancer_module, bw);
+    }
+    bw->balancer = balancer;
+    if (!retry) {
+        bw->deadline = now + timeout;
+    }
+    *runtime = NULL;
+    if (now >= bw->deadline) {
+        return OK; /* timed out */
+    }
+    if (step > bw->deadline - now) {
+        step = bw->deadline - now;
+    }
+
+    bw->timer->timeout = step;
+    rc = ap_request_wait(bw->timer, AP_WAIT_IN, 0, balancer_wait_continuation,
+                         bw);
+    if (rc != SUSPENDED) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO()
+                      "%s: can't wait for a usable worker asynchronously",
+                      balancer->s->name);
+        *runtime = find_best_worker_retry(balancer, r);
+        return OK;
+    }
+    bw->retrying = 1;
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE5, 0, r,
+                  "%s: waiting for a usable worker (async)",
+                  balancer->s->name);
+    return SUSPENDED;
 }
 
 static int balancer_fixup(request_rec *r, proxy_worker *worker, char **url)
@@ -466,6 +561,8 @@ static int proxy_balancer_pre_request(proxy_worker **worker,
     proxy_worker *runtime;
     char *route = NULL;
     const char *sticky = NULL;
+    balancer_wait_t *bw = NULL;
+    int retry = 0;
     apr_status_t rv;
 
     *worker = NULL;
@@ -478,6 +575,17 @@ static int proxy_balancer_pre_request(proxy_worker **worker,
         (ap_cstr_casecmpn(*url, BALANCER_PREFIX, sizeof(BALANCER_PREFIX) - 1)
          || !(*balancer = ap_proxy_get_balancer(r->pool, conf, *url, 1))))
         return DECLINED;
+
+    /* Retrying after waiting for a usable worker
+     * (balancer_wait()): steps 2 to 4 were done by the first
+     * attempt.
+     */
+    bw = ap_get_module_config(r->request_config, &proxy_balancer_module);
+    if (bw && bw->retrying && bw->balancer == *balancer) {
+        bw->retrying = 0;
+        retry = 1;
+        goto find_best;
+    }
 
     /* Step 2: Lock the LoadBalancer
      * XXX: perhaps we need the process lock here
@@ -568,7 +676,19 @@ static int proxy_balancer_pre_request(proxy_worker **worker,
     }
 #endif
     if (!*worker) {
-        runtime = find_best_worker(*balancer, r);
+        int can_wait;
+find_best:
+        /* With a timeout, wait in the MPM between the attempts if possible,
+         * rather than sleeping.
+         */
+        can_wait = ((*balancer)->s->timeout
+                    && ap_proxy_request_can_suspend(r));
+        runtime = can_wait ? find_best_worker(*balancer, r)
+                           : find_best_worker_retry(*balancer, r);
+        if (!runtime && can_wait
+            && balancer_wait(*balancer, r, retry, &runtime) == SUSPENDED) {
+            return SUSPENDED;
+        }
         if (!runtime) {
             if ((*balancer)->workers->nelts) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01170)

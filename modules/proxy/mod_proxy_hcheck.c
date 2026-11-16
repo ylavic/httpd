@@ -43,7 +43,6 @@ module AP_MODULE_DECLARE_DATA proxy_hcheck_module;
  * be well behaved (it may be broken, or compromised), and a check runs in a
  * long-lived thread and pool of the watchdog child.
  */
-#define HC_MAX_HEADER_FIELDS    100              /* response header fields */
 #define HC_MAX_BODY             (1024 * 1024)    /* body kept for a condition */
 
 typedef struct {
@@ -809,79 +808,80 @@ static int hc_time_left(apr_socket_t *sock, apr_time_t deadline)
     return 1;
 }
 
-static int hc_read_headers(request_rec *r, apr_socket_t *sock,
-                           apr_time_t deadline)
+/*
+ * Wait for the backend to be readable, within the check's overall deadline.
+ * Returns 0 if it is not readable in time (or the poll failed).
+ */
+static int hc_wait_readable(apr_socket_t *sock, apr_pool_t *p,
+                            apr_time_t deadline)
 {
-    char buffer[HUGE_STRING_LEN];
-    int len, fields = 0;
+    apr_pollfd_t pfd;
+    apr_int32_t nready = 0;
+    apr_status_t rv;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.p = p;
+    pfd.desc_type = APR_POLL_SOCKET;
+    pfd.desc.s = sock;
+    pfd.reqevents = APR_POLLIN;
+    do {
+        apr_interval_time_t left = deadline - apr_time_now();
+
+        if (left <= 0) {
+            return 0;
+        }
+        rv = apr_poll(&pfd, 1, &nready, left);
+    } while (APR_STATUS_IS_EINTR(rv));
+
+    return (rv == APR_SUCCESS && nready > 0);
+}
+
+/*
+ * Read the response head with the rules and limits of ap_proxy_h1_head_opts()
+ * (the server's ProxyHttpProtocolOptions and ProxyLimitResponse*, or the
+ * worker's keys), without blocking so that it ends at the check's deadline.
+ */
+static int hc_read_headers(request_rec *r, proxy_worker *worker,
+                           apr_socket_t *sock, apr_time_t deadline)
+{
+    ap_h1_head_opts_t opts;
+    ap_h1_head_parser_t *parser;
+    ap_h1_head_t *head;
+    const apr_array_header_t *arr;
+    const apr_table_entry_t *elts;
     const char *ct;
+    int rc, i;
 
-    if (!hc_time_left(sock, deadline)) {
-        return !OK;
-    }
-    len = ap_getline(buffer, sizeof(buffer), r, 1);
-    if (len <= 0) {
-        return !OK;
-    }
-    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, APLOGNO(03254)
-                 "%.*s", len, buffer);
-    /* for the below, see ap_proxy_http_process_response() */
-    if (apr_date_checkmask(buffer, "HTTP/#.# ###*")) {
-        int major;
-        char keepchar;
-        int proxy_status = OK;
-        const char *proxy_status_line = NULL;
-
-        major = buffer[5] - '0';
-        if ((major != 1) || (len >= sizeof(buffer)-1)) {
+    ap_proxy_h1_head_opts(&opts, r, worker, AP_H1_HEAD_RESPONSE);
+    parser = ap_h1_head_parser_create(r->pool, r, &opts);
+    while ((rc = ap_h1_head_parse(parser, r->proto_input_filters,
+                                  APR_NONBLOCK_READ, &head)) == AGAIN) {
+        if (!hc_wait_readable(sock, r->pool, deadline)) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, APLOGNO()
+                         "Health check response head not complete in time");
             return !OK;
         }
-
-        keepchar = buffer[12];
-        buffer[12] = '\0';
-        proxy_status = atoi(&buffer[9]);
-        if (keepchar != '\0') {
-            buffer[12] = keepchar;
-        } else {
-            buffer[12] = ' ';
-            buffer[13] = '\0';
-        }
-        proxy_status_line = apr_pstrdup(r->pool, &buffer[9]);
-        r->status = proxy_status;
-        r->status_line = proxy_status_line;
-    } else {
+    }
+    if (head) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, APLOGNO(03254)
+                     "%s", head->start_line);
+    }
+    if (rc != OK) {
+        /* EOF, an error, or a malformed head (the parsing logged why) */
         return !OK;
     }
 
-    /* OK, 1st line is OK... scarf in the headers */
-    while (hc_time_left(sock, deadline)
-           && (len = ap_getline(buffer, sizeof(buffer), r, 1)) > 0) {
-        char *value;
-
-        if (++fields > HC_MAX_HEADER_FIELDS || len >= sizeof(buffer) - 1) {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, r->server, APLOGNO(10639)
-                         "Health check response has too many header fields "
-                         "or a header line that is too long");
-            return !OK;
-        }
-        ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, r->server, "%.*s",
-                     len, buffer);
-        if (!(value = strchr(buffer, ':'))) {
-            return !OK;
-        }
-        *value = '\0';
-        ++value;
-        while (apr_isspace(*value))
-            ++value;            /* Skip to start of value   */
-        ap_cstr_stripws(value);
-        apr_table_add(r->headers_out, buffer, value);
+    r->status = head->u.rsp.status;
+    r->status_line = apr_psprintf(r->pool, "%03d %s", r->status,
+                                  head->u.rsp.reason);
+    arr = apr_table_elts(head->headers);
+    elts = (const apr_table_entry_t *)arr->elts;
+    for (i = 0; i < arr->nelts; i++) {
+        ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, r->server, "%s: %s",
+                     elts[i].key, elts[i].val);
     }
-    if (len != 0) {
-        /* EOF, an error, or out of time before the blank line that ends the
-         * headers: the response is truncated, not a (healthy) one without
-         * more headers. */
-        return !OK;
-    }
+    r->headers_out = apr_table_overlay(r->pool, r->headers_out,
+                                       head->headers);
 
     /* Set the Content-Type for the request if set */
     if ((ct = apr_table_get(r->headers_out, "Content-Type")) != NULL)
@@ -1004,11 +1004,17 @@ static apr_status_t hc_check_http(baton_t *baton, apr_thread_t *thread)
     if ((status = hc_send(r, wctx->req, bb)) != OK) {
         goto done;
     }
-    if ((status = hc_read_headers(r, backend->sock, deadline)) != OK) {
+    if ((status = hc_read_headers(r, worker, backend->sock,
+                                  deadline)) != OK) {
         goto done;
     }
     if (!r->header_only) {
         apr_table_t *saved_headers_in = r->headers_in;
+        ap_h1_head_opts_t trailers_opts;
+
+        /* A chunked body's trailers are read with the head's rules */
+        ap_proxy_h1_head_opts(&trailers_opts, r, worker, AP_H1_HEAD_TRAILERS);
+        ap_h1_set_trailers_opts(r, &trailers_opts);
         r->headers_in = apr_table_copy(r->pool, r->headers_out);
         ap_proxy_pre_http_request(backend->connection, r);
         status = hc_read_body(r, bb, backend->sock, deadline,

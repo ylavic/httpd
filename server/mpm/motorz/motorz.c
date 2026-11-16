@@ -1200,8 +1200,8 @@ static apr_status_t motorz_io_process(motorz_conn_t *scon)
             scon->cs.state = CONN_STATE_PROCESSING;
         }
 
-read_request:
         if (scon->cs.state == CONN_STATE_PROCESSING) {
+ process_connection:
             ap_log_error(APLOG_MARK, APLOG_TRACE7, 0, ap_server_conf,
                          APLOGNO(03328) "motorz_io_process(): processing");
             if (!c->aborted) {
@@ -1286,8 +1286,8 @@ read_request:
 
             ap_update_child_status(scon->sbh, SERVER_BUSY_WRITE, NULL);
 
-            pending = ap_run_output_pending(c);
-            if (pending == OK) {
+            pending = ap_check_output_pending(c);
+            if (pending == AGAIN) {
                 /* Still in WRITE_COMPLETION_STATE: set a write timeout and let
                  * the poll thread wait for writeability. Arm pollset + timer
                  * atomically and do not touch scon afterwards (it may be freed
@@ -1310,17 +1310,21 @@ read_request:
                 }
                 return APR_SUCCESS;
             }
-            if (pending != DECLINED
-                    || c->keepalive != AP_CONN_KEEPALIVE
-                    || c->aborted) {
-                scon->cs.state = CONN_STATE_LINGER;
+            if (pending == OK) {
+                /* Some data to process immediately? */
+                pending = (c->keepalive == AP_CONN_KEEPALIVE
+                           ? ap_check_input_pending(c)
+                           : DONE);
+                if (pending == AGAIN) {
+                    scon->cs.state = CONN_STATE_PROCESSING;
+                    goto process_connection;
+                }
             }
-            else if (ap_run_input_pending(c) == OK) {
-                scon->cs.state = CONN_STATE_PROCESSING;
-                goto read_request;
+            if (pending == OK) {
+                scon->cs.state = CONN_STATE_KEEPALIVE;
             }
             else {
-                scon->cs.state = CONN_STATE_KEEPALIVE;
+                scon->cs.state = CONN_STATE_LINGER;
             }
         }
 

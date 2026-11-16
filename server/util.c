@@ -2741,6 +2741,18 @@ AP_DECLARE(apr_status_t) ap_timeout_parameter_parse(
         CHECK_OVERFLOW(tout, apr_time_sec(APR_INT64_MAX));
         check = apr_time_from_sec(tout);
         break;
+        /* Time is in microseconds */
+    case 'u':
+    case 'U':
+        switch (*(++time_str)) {
+        case 's':
+        case 'S':
+            check = tout;
+            break;
+        default:
+            return APR_EGENERAL;
+        }
+        break;
         /* Time is in hours */
     case 'h':
     case 'H':
