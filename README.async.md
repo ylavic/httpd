@@ -233,7 +233,8 @@ by its wait's timeout or else by `Timeout`.
   idle. A suspended request holds no worker and never counts as demand. A module that blocks holds a
   worker, and the MPM can only infer that from CPU usage (see [8.2](#82-blocking-sections)).
 - **At a graceful stop**, suspended requests finish normally, bounded by their timeouts. An
-  immediate stop closes them: their pools are destroyed and the continuations aren't called.
+  immediate stop doesn't call their continuations or destroy their pools in a forked child: the
+  child is exiting, and the pools go with the process.
 
 ## 3. The MPM API
 
