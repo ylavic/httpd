@@ -539,19 +539,21 @@ once</description>
 
 <directivesynopsis>
 <name>MaxClientConnections</name>
-<description>How many client connections to hold at once, with
-MaxRequestWorkers auto</description>
+<description>How many client connections to hold at once</description>
 <syntax>MaxClientConnections <var>number</var></syntax>
 <default>See usage for details</default>
 <contextlist><context>server config</context></contextlist>
 <compatibility>Available in Apache HTTP Server 2.5.1 and later</compatibility>
 
 <usage>
-    <p>With <code><directive module="mpm_common">MaxRequestWorkers</directive>
-    auto</code>, the number of simultaneous client connections the server
-    holds, active or idle (e.g. keep-alive): the child processes are derived
-    from it (see <directive module="mpm_common">MaxRequestWorkers</directive>),
-    and each of them stops accepting new connections beyond its share of
+    <p>The number of simultaneous client connections the server holds,
+    active or idle (e.g. keep-alive). With <code><directive
+    module="mpm_common">MaxRequestWorkers</directive> auto</code> the child
+    processes are derived from it (see <directive
+    module="mpm_common">MaxRequestWorkers</directive>); otherwise they are
+    <directive module="mpm_common">MaxRequestWorkers</directive> divided by
+    <directive module="mpm_common">ThreadsPerChild</directive>. Each of them
+    stops accepting new connections beyond its share of
     <var>number</var> (the number divided by the children, plus 10% since
     the system spreads the new connections only roughly evenly between
     them), accepting again below 90% of it. The new connections wait in
@@ -562,7 +564,8 @@ MaxRequestWorkers auto</description>
     its lingering connections are closed rather than waiting for their
     clients to close.</p>
 
-    <p>The default is what the limit of open files of the server allows (its
+    <p>With <code>MaxRequestWorkers auto</code> the default is what the limit
+    of open files of the server allows (its
     soft limit, e.g. <code>ulimit -n</code>): up to (the limit - 64 - the
     listening sockets) / 2 connections per child, times the fewest children
     (enough for their threads to cover the CPUs: half as many as the CPUs
@@ -571,8 +574,16 @@ MaxRequestWorkers auto</description>
     module="mpm_common">ListenCoresBucketsRatio</directive>). A notice tells when the soft limit is well below the hard one, which
     the server doesn't raise by itself.</p>
 
-    <p>Without <code>MaxRequestWorkers auto</code> it has no effect, and a
-    warning tells so at startup.</p>
+    <p>With <directive module="mpm_common">MaxRequestWorkers</directive> set,
+    the default is <directive module="mpm_common">MaxRequestWorkers</directive>
+    x (1 + <directive>AsyncAdmissionBacklogPerThread</directive>): the
+    threads of a child and the backlog of their work (425 connections per
+    child with 25 threads and the default backlog), or what the limit of open
+    files allows if lower. Unlike a set number, this default has no 10% slack:
+    a child's limit is the number of connections it runs or queues at once,
+    which <module>mod_proxy</module> takes as the default of the size of its
+    connections pools (see the <code>max</code> parameter of <directive
+    module="mod_proxy">ProxyPass</directive>).</p>
 
     <p>Not to be confused with <directive module="mpm_common"
     >MaxConnectionsPerChild</directive>, the number of connections a child
