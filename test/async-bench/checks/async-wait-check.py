@@ -98,6 +98,9 @@ MaxRequestWorkers {threads}
 MinSpareThreads 1
 MaxSpareThreads {threads}
 AsyncAdmissionBacklogPerThread {admission_backlog}
+# The waits are checked here, not the connections' limit (in fixed mode a
+# child takes its threads x (1 + backlog) by default)
+MaxClientConnections 1000
 Timeout {timeout}
 KeepAliveTimeout 5
 GracefulShutdownTimeout 3
