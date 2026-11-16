@@ -81,7 +81,7 @@ Waits (see [README.async.md](../../../README.async.md) for the module's view):
 - **wait**: what a suspended connection waits for: some descriptors, at most one notifier and a
   timeout, the first to fire completing it. The MPM keeps one wait per connection (`struct
   user_wait`), reused by all its waits.
-- **pending wait**: a wait registered but not armed yet, because a thread still runs the connection.
+- **registered wait**: a wait registered but not armed yet, because a thread still runs the connection.
 - **armed / claimed**: an armed wait can complete; the first thread to claim it (a compare and swap
   on its claim word) completes it, whatever fired.
 - **continuation**: the module's function that a worker runs once the wait completed, told why.
@@ -349,8 +349,8 @@ directly or through the core's request API, is in [README.async.md](../../../REA
 ### 5.1 Registration and arming
 
 A wait is registered from a handler (or a filter) of a running request, or from the continuation of
-the previous wait (event_register_wait()). Registering only records it as the connection's **pending
-wait**: a thread still runs the connection, and the wait must not complete under it. A connection
+the previous wait (event_register_wait()). Registering only records it as the connection's registered
+wait: a thread still runs the connection, and the wait must not complete under it. A connection
 has one wait at a time; a second registration, or one from another thread while the connection is
 suspended, is refused, and so is a wait that nothing could complete.
 
@@ -482,7 +482,7 @@ does it for a request's notifier wait contexts). `ap_mpm_notifier_detach()` ends
 ### 5.7 Races, and how they are avoided
 
 - **A continuation never runs while the registering code is on the stack**: the wait is armed only
-  once no thread runs the connection (pending, then armed).
+  once no thread runs the connection (registered, then armed).
 - **Arming against completing**: the claim word is set to armed first, under the wait's mutex, and
   the wait's cleanup takes the same mutex, so a wait completed while its arming is still going on
   (its timer expiring, the thread preempted) is disarmed only once it is armed entirely.
@@ -505,7 +505,7 @@ does it for a request's notifier wait contexts). `ap_mpm_notifier_detach()` ends
 
 The connections that wait without a thread (keep-alive, write completion, lingering close, suspended
 requests) cost a pool, a socket and a descriptor each. They are not limited by the threads, only by
-the descriptors (and in auto mode by `MaxClientConnections`). What the admission limits is the work
+the descriptors and `MaxClientConnections`. What the admission limits is the work
 waiting for a thread: the **new connections** waiting in the workers' queue.
 
 A new connection accepted is never dropped for waiting: it waits without a timeout until a worker
@@ -561,6 +561,11 @@ A child with idle workers takes more connections at no harm: gathering them batc
 
 ### 6.5 Other limits on accepting
 
+- `MaxClientConnections`: the child stops accepting beyond its share of the connections to hold,
+  plus 10% since the kernel spreads them only roughly evenly, and accepts again below 90% of it.
+  Without `MaxRequestWorkers auto`, it defaults to what a child runs or queues at once, the
+  workers and their backlog ([section 7.4](#74-what-the-mpm-tells-modules)), bounded by the
+  descriptors.
 - `MaxConnectionsPerChild`: the child stops gracefully once it accepted that many.
 - A shortage while accepting (descriptors, memory) stops the child gracefully, and the parent sees
   it as a sick child.
@@ -624,9 +629,8 @@ worker, and the MPM can only infer it from the CPU usage ([section
 - `ThreadLimit`: a worker per client of a child, at most 1024, for a fully blocking load.
 
 The parent then keeps that number of children running ([section 8.3](#83-children-maintenance)).
-With `MaxClientConnections`, each child accepts at most its share of them, plus 10% since the kernel
-spreads the connections only roughly evenly. The fair share ([section
-6.4](#64-the-fair-share-auto-mode)) is on.
+Each child accepts at most its share of the clients ([section 6.5](#65-other-limits-on-accepting)).
+The fair share ([section 6.4](#64-the-fair-share-auto-mode)) is on.
 
 ### 7.4 What the MPM tells modules
 
@@ -634,7 +638,8 @@ spreads the connections only roughly evenly. The fair share ([section
   locking when single-threaded).
 - `AP_MPMQ_MAX_CONNECTIONS`: what a child runs or queues at once: its threads up to `ThreadLimit`,
   plus the backstop of the admission. A sizing hint (e.g. for a connection pool), not a limit: the
-  suspended connections aren't bounded by it.
+  suspended connections aren't bounded by it. It is also the default of a child's share of
+  `MaxClientConnections` without `MaxRequestWorkers auto`.
 - `AP_MPMQ_CAN_REGISTER_WAIT`, `AP_MPMQ_CAN_SUSPEND`, `AP_MPMQ_CAN_WAITIO`: true.
 
 ### 7.5 The periodic stats
