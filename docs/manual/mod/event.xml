@@ -281,8 +281,12 @@ and <directive>AsyncWorkerPollers</directive>.</p>
             about how many overall processes are tolerated before impacting
             the system resources.
             </li>
-            <li>Force gracefully finishing processes to close their
-            connections in keep-alive state.</li>
+            <li>Keep the idle connections in keep-alive state of gracefully
+            finishing processes until their
+            <directive module="core">KeepAliveTimeout</directive>, so that
+            their clients don't have to reconnect for a request already on
+            its way; only the responses made while the process is stopping
+            end their connection.</li>
             <li>During graceful shutdown, if there are more running worker threads
             than open connections for a given process, terminate these threads to
             free resources faster (which may be needed for new processes).</li>
