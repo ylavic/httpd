@@ -6315,7 +6315,7 @@ static int proxy_tunnel_forward(proxy_tunnel_rec *tunnel,
 
     if (rc == SUSPENDED) {
         if (!tc->held) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(10295)
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO()
                           "proxy: %s: invalid status %d returned by "
                           "tunnel forward hooks (no hold)", tunnel->scheme, rc);
             return HTTP_INTERNAL_SERVER_ERROR;
